@@ -249,7 +249,7 @@ def list_participants(call_id: str):
     aid = _account_id()
     if aid and call.account_id != aid:
         return ("Forbidden\n", 403)
-    return jsonify([p.to_dict() for p in call.participants.values()])
+    return jsonify(call.list_participants())
 
 
 @api.route("/calls/<call_id>/commands", methods=["POST"])

@@ -208,11 +208,8 @@ class Handler(BaseHTTPRequestHandler):
             self._html(PAGE_HTML)
 
         elif path == "/join":
+            # TTS is triggered by the "joined" callback (see do_POST)
             iframe_url = create_webclient_slot(CALL_ID)
-            # Fire TTS welcome — it goes into the mixer; user hears it
-            # when they connect (or immediately if already connected)
-            threading.Thread(target=add_welcome_tts, args=(CALL_ID,),
-                             daemon=True).start()
             self._json({"iframe_url": iframe_url})
 
         elif path == "/transcript":

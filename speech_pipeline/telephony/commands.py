@@ -85,7 +85,7 @@ def _cmd_add_leg(call: call_state.Call, cmd: dict) -> None:
 
 
 def _cmd_tts(call: call_state.Call, cmd: dict) -> None:
-    """TTS: TTSProducer → conf.add_source (auto resample via pipe)."""
+    """TTS: fire-and-forget — runs in background, auto-cleanup."""
     from speech_pipeline.TTSProducer import TTSProducer
     from . import _shared
 
@@ -103,29 +103,33 @@ def _cmd_tts(call: call_state.Call, cmd: dict) -> None:
 
     call.register_participant(pid, type="tts", text=text[:80])
 
-    try:
-        voice_obj = registry.ensure_loaded(voice)
-        synth_config = registry.create_synthesis_config(voice_obj, {})
-        producer = TTSProducer(voice_obj, synth_config, text, sentence_silence=0.0)
-        src_id = call.mixer.add_source(producer)
+    def _run():
+        try:
+            voice_obj = registry.ensure_loaded(voice)
+            synth_config = registry.create_synthesis_config(voice_obj, {})
+            producer = TTSProducer(voice_obj, synth_config, text, sentence_silence=0.0)
+            src_id = call.mixer.add_source(producer)
 
-        # Wait for TTS source thread to finish (it runs in add_source)
-        src = call.mixer._sources.get(src_id)
-        if src and src.thread:
-            src.thread.join()
+            # add_source starts a pump thread — wait for it to finish
+            src = call.mixer._sources.get(src_id)
+            if src and src.thread:
+                src.thread.join()
 
-        call.mixer.remove_source(src_id)
-    except Exception as e:
-        _LOGGER.warning("TTS failed for call %s: %s", call.call_id, e)
-        _send_callback(call, callback, pid, "tts", "failed", error=str(e))
-    finally:
-        call.unregister_participant(pid)
+            call.mixer.remove_source(src_id)
+        except Exception as e:
+            _LOGGER.warning("TTS failed for call %s: %s", call.call_id, e)
+            _send_callback(call, callback, pid, "tts", "failed", error=str(e))
+            return
+        finally:
+            call.unregister_participant(pid)
 
-    _send_callback(call, callback, pid, "tts", "finished")
+        _send_callback(call, callback, pid, "tts", "finished")
+
+    threading.Thread(target=_run, daemon=True, name=f"tts-{pid}").start()
 
 
 def _cmd_play(call: call_state.Call, cmd: dict) -> None:
-    """Play audio: AudioReader → conf.add_source (auto resample via pipe)."""
+    """Play audio: fire-and-forget — runs in background, auto-cleanup."""
     from speech_pipeline.AudioReader import AudioReader
 
     url = cmd.get("url", "")
@@ -138,22 +142,26 @@ def _cmd_play(call: call_state.Call, cmd: dict) -> None:
 
     call.register_participant(pid, type="play", url=url)
 
-    try:
-        reader = AudioReader(url, target_sample_rate=call_state.MIXER_SAMPLE_RATE)
-        src_id = call.mixer.add_source(reader)
+    def _run():
+        try:
+            reader = AudioReader(url, target_sample_rate=call_state.MIXER_SAMPLE_RATE)
+            src_id = call.mixer.add_source(reader)
 
-        src = call.mixer._sources.get(src_id)
-        if src and src.thread:
-            src.thread.join()
+            src = call.mixer._sources.get(src_id)
+            if src and src.thread:
+                src.thread.join()
 
-        call.mixer.remove_source(src_id)
-    except Exception as e:
-        _LOGGER.warning("Play failed for call %s: %s", call.call_id, e)
-        _send_callback(call, callback, pid, "play", "failed", error=str(e))
-    finally:
-        call.unregister_participant(pid)
+            call.mixer.remove_source(src_id)
+        except Exception as e:
+            _LOGGER.warning("Play failed for call %s: %s", call.call_id, e)
+            _send_callback(call, callback, pid, "play", "failed", error=str(e))
+            return
+        finally:
+            call.unregister_participant(pid)
 
-    _send_callback(call, callback, pid, "play", "finished")
+        _send_callback(call, callback, pid, "play", "finished")
+
+    threading.Thread(target=_run, daemon=True, name=f"play-{pid}").start()
 
 
 def _cmd_hangup(call: call_state.Call, cmd: dict) -> None:

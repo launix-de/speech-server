@@ -1153,15 +1153,68 @@ def create_app(args: argparse.Namespace) -> Flask:
         except ImportError:
             pass
 
+        # After build, wire ConferenceLeg callbacks to subscriber events
+        def _wire_leg_callbacks(run_obj):
+            try:
+                from speech_pipeline.ConferenceLeg import ConferenceLeg
+                from speech_pipeline.telephony.webclient import get_webclient_session
+                from speech_pipeline.telephony import call_state as _cs, subscriber as _sub, commands as _cmd
+                import requests as _http
+
+                leg_count = sum(1 for s in run_obj.stages if isinstance(s, ConferenceLeg))
+                _LOGGER.info("_wire_leg_callbacks: %d legs in %d stages, dsl=%s",
+                             leg_count, len(run_obj.stages), dsl[:80])
+                for stage in run_obj.stages:
+                    if not isinstance(stage, ConferenceLeg):
+                        continue
+                    # Find the webclient session for this leg
+                    for sid_match in _re.findall(r'codec:(wc-[^\s|]+)', dsl):
+                        sess = get_webclient_session(sid_match)
+                        if not sess:
+                            continue
+                        call = _cs.get_call(sess["call_id"])
+                        if not call:
+                            continue
+                        sub = _sub.get(call.subscriber_id)
+                        if not sub:
+                            continue
+                        participant = call.get_participant(sess["session_id"])
+                        callback_path = participant.get("callback") if participant else None
+
+                        def _make_on_attached(sub_info, call_obj, cb_path, part_id):
+                            def _on_attached(leg):
+                                if not cb_path:
+                                    return
+                                url = sub_info["base_url"].rstrip("/") + "/" + cb_path.lstrip("/")
+                                try:
+                                    _http.post(url, json={
+                                        "callId": call_obj.call_id,
+                                        "command": "webclient",
+                                        "participantId": part_id,
+                                        "result": "joined",
+                                    }, headers={"Authorization": f"Bearer {sub_info['bearer_token']}"}, timeout=5)
+                                except Exception:
+                                    pass
+                            return _on_attached
+
+                        stage.on_attached = _make_on_attached(sub, call, callback_path, sess["session_id"])
+            except ImportError:
+                pass
+            except Exception as e:
+                _LOGGER.warning("_wire_leg_callbacks error: %s", e)
+
         try:
             if "pipe" in config:
                 run = builder.build(config["pipe"])
+                _wire_leg_callbacks(run)
                 lp.run = run
                 lp.state = "running"
                 _lp_register(lp)
                 run.run()
             elif "pipes" in config:
                 runs = builder.build_multi(config["pipes"])
+                for r in runs:
+                    _wire_leg_callbacks(r)
                 lp.run = runs[0] if runs else None
                 lp.state = "running"
                 _lp_register(lp)

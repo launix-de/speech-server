@@ -42,6 +42,8 @@ class ConferenceLeg(Stage):
         self._mixer = None
         self._src_id: Optional[str] = None
         self._out_q: Optional[queue.Queue] = None
+        self.on_attached = None   # callable, fired when leg is live
+        self.on_detached = None   # callable, fired when leg disconnects
 
     def attach(self, mixer) -> None:
         """Attach to a ConferenceMixer.  Called by the DSL builder."""
@@ -65,6 +67,12 @@ class ConferenceLeg(Stage):
         self._out_q = self._mixer.add_output(mute_source=self._src_id)
 
         _LOGGER.info("ConferenceLeg: attached (src=%s)", self._src_id)
+
+        if self.on_attached:
+            try:
+                self.on_attached(self)
+            except Exception as e:
+                _LOGGER.warning("ConferenceLeg on_attached error: %s", e)
 
         # Pump upstream → mixer input queue in a background thread
         pump_done = threading.Event()
@@ -107,6 +115,11 @@ class ConferenceLeg(Stage):
             self._mixer.remove_input(in_q)
             t.join(timeout=3)
             _LOGGER.info("ConferenceLeg: detached (src=%s)", self._src_id)
+            if self.on_detached:
+                try:
+                    self.on_detached(self)
+                except Exception as e:
+                    _LOGGER.warning("ConferenceLeg on_detached error: %s", e)
 
     def cancel(self) -> None:
         super().cancel()

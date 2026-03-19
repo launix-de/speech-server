@@ -222,28 +222,52 @@ def _cmd_hangup(call: call_state.Call, cmd: dict) -> None:
         call_state.delete_call(call.call_id)
 
 
-def _cmd_hold(call: call_state.Call, cmd: dict) -> None:
-    """Mute a leg by cancelling its RX pipeline.  Optionally play hold music."""
+def _cmd_transfer(call: call_state.Call, cmd: dict) -> None:
+    """Transfer a SIP leg or webclient to another conference.
+
+    Removes the participant from the current conference and adds it
+    to the target conference.  Works for both SIP legs and webclient
+    sessions.
+
+    Params:
+    - participant_id or leg_id: which participant to move
+    - target_call_id: the conference to move to
+    """
     from . import leg as leg_mod
 
-    leg_id = cmd.get("leg_id") or cmd.get("participant_id")
-    if leg_id:
-        leg = leg_mod.get_leg(leg_id)
-        if leg and leg._rx_pipeline:
-            leg._rx_pipeline.cancel()  # stops SIP→mixer flow
-    music = cmd.get("music")
-    if music:
-        _cmd_play(call, {"url": music, "action": "play"})
+    pid = cmd.get("participant_id") or cmd.get("leg_id")
+    target_call_id = cmd.get("target_call_id")
+    if not pid or not target_call_id:
+        _LOGGER.warning("transfer: missing participant_id or target_call_id")
+        return
 
+    target_call = call_state.get_call(target_call_id)
+    if not target_call:
+        _LOGGER.warning("transfer: target call %s not found", target_call_id)
+        return
 
-def _cmd_unhold(call: call_state.Call, cmd: dict) -> None:
-    """Unmute a leg — rebuild the RX pipeline."""
-    # TODO: rebuild SIPSource → tee → QueueSink(mixer) pipeline for this leg
-    # For now, log a warning
-    _LOGGER.warning("unhold not yet implemented for leg rebuild")
+    # For SIP legs: kill source/sink on current mixer, re-bridge to target
+    leg = leg_mod.get_leg(pid)
+    if leg and leg._src_id:
+        call.mixer.kill_source(leg._src_id)
+        if leg._sink_id:
+            call.mixer.remove_sink(leg._sink_id)
+        call.unregister_participant(pid)
+        leg_mod.bridge_to_call(leg, target_call)
+        _LOGGER.info("Transferred leg %s from %s to %s",
+                     pid, call.call_id, target_call_id)
+        return
+
+    # TODO: webclient transfer (needs DSL pipeline rebuild)
+    _LOGGER.warning("transfer not yet implemented for webclient participants")
 
 
 def _cmd_dtmf(call: call_state.Call, cmd: dict) -> None:
+    """Send DTMF tones into a SIP leg.
+
+    TODO: Implement via pyVoIP RTP events (RFC 2833).
+    Currently a placeholder.
+    """
     _LOGGER.info("DTMF for call %s: %s", call.call_id, cmd.get("digits"))
 
 
@@ -383,8 +407,7 @@ _HANDLERS = {
     "play": _cmd_play,
     "stop_play": _cmd_stop_play,
     "hangup": _cmd_hangup,
-    "hold": _cmd_hold,
-    "unhold": _cmd_unhold,
+    "transfer": _cmd_transfer,
     "dtmf": _cmd_dtmf,
     "stt_start": _cmd_stt_start,
     "stt_stop": _cmd_stt_stop,

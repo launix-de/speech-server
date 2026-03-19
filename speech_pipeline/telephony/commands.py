@@ -87,7 +87,10 @@ def _cmd_add_leg(call: call_state.Call, cmd: dict) -> None:
 def _cmd_tts(call: call_state.Call, cmd: dict) -> None:
     """TTS: fire-and-forget — runs in background, auto-cleanup."""
     from speech_pipeline.TTSProducer import TTSProducer
-    from . import _shared
+    from . import _shared, auth
+    if not auth.check_feature(call.account_id, "tts"):
+        _LOGGER.warning("TTS denied: account %s lacks tts feature", call.account_id)
+        return
 
     text = cmd.get("text", "")
     voice = cmd.get("voice", "de_DE-thorsten-medium")
@@ -245,9 +248,13 @@ def _cmd_dtmf(call: call_state.Call, cmd: dict) -> None:
 
 
 def _cmd_stt_start(call: call_state.Call, cmd: dict) -> None:
-    """STT as tee sidechain: tee → (auto resample) → Whisper → WebhookSink."""
+    """STT as conference sink: mix → resample → Whisper → WebhookSink."""
     from speech_pipeline.WhisperSTT import WhisperTranscriber
     from speech_pipeline.WebhookSink import WebhookSink
+    from . import auth
+    if not auth.check_feature(call.account_id, "stt"):
+        _LOGGER.warning("STT denied: account %s lacks stt feature", call.account_id)
+        return
 
     callback = cmd.get("callback")
     language = cmd.get("language", "de")
@@ -292,6 +299,10 @@ def _cmd_stt_stop(call: call_state.Call, cmd: dict) -> None:
 def _cmd_webclient(call: call_state.Call, cmd: dict) -> None:
     """Create a webclient slot — returns iframe_url via callback."""
     from . import auth, webclient as wc
+
+    if not auth.check_feature(call.account_id, "webclient"):
+        _LOGGER.warning("WebClient denied: account %s lacks webclient feature", call.account_id)
+        return
 
     user = cmd.get("user", "anonymous")
     callback = cmd.get("callback")

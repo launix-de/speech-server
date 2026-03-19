@@ -1,17 +1,14 @@
-"""SIP leg management using tts-piper Stage pipelines.
+"""SIP leg management using ConferenceMixer.
 
-A leg is a SIP channel.  When bridged to a conference, two Stage
-pipelines are built with mix-minus (no self-echo):
+A leg is a SIP channel. When bridged to a conference:
+- SIPSource → conf.add_source() (auto-resamples 8kHz u8 → 48kHz s16le)
+- conf.add_sink(SIPSink, mute_source=src_id) (auto-resamples 48kHz → 8kHz)
 
-    RX: SIPSource → u8→s16le → AudioTee ──→ QueueSink(mixer)
-                                    └──→ own_queue
-
-    TX: QueueSource(mixer_output) → MixMinus(- own) → s16le→u8 → SIPSink
+All format conversion via pipe(). No manual AudioTee/MixMinus.
 """
 from __future__ import annotations
 
 import logging
-import queue
 import secrets
 import threading
 import time
@@ -19,8 +16,6 @@ from typing import Dict, List, Optional
 
 import requests as http_requests
 
-from speech_pipeline.QueueSink import QueueSink
-from speech_pipeline.QueueSource import QueueSource
 from speech_pipeline.SIPSource import SIPSource
 from speech_pipeline.SIPSink import SIPSink
 
@@ -47,11 +42,9 @@ class Leg:
         self.created_at = time.time()
         self.answered_at: Optional[float] = None
 
-        # Stage pipelines (set when bridged)
-        self._rx_pipeline: Optional[QueueSink] = None
-        self._tx_pipeline: Optional[SIPSink] = None
-        self._threads: List[threading.Thread] = []
-        self._sip_session = None  # SIPSession for outbound legs
+        self._src_id: Optional[str] = None
+        self._sink_id: Optional[str] = None
+        self._sip_session = None
 
     def to_dict(self) -> dict:
         return {
@@ -66,10 +59,13 @@ class Leg:
         }
 
     def hangup(self) -> None:
-        if self._rx_pipeline:
-            self._rx_pipeline.cancel()
-        if self._tx_pipeline:
-            self._tx_pipeline.cancel()
+        if self._src_id and self.call_id:
+            from . import call_state
+            call = call_state.get_call(self.call_id)
+            if call:
+                call.mixer.kill_source(self._src_id)
+                if self._sink_id:
+                    call.mixer.remove_sink(self._sink_id)
         if self.voip_call:
             try:
                 self.voip_call.hangup()
@@ -117,22 +113,15 @@ def list_legs(subscriber_id: Optional[str] = None) -> List[Leg]:
 
 
 # ---------------------------------------------------------------------------
-# Bridge: connect a SIP leg to a conference mixer via Stage pipelines
+# Bridge: connect a SIP leg to a conference via ConferenceMixer
 # ---------------------------------------------------------------------------
 
 def bridge_to_call(leg: Leg, call) -> None:
-    """Bridge leg audio into call.mixer → call.tee with mix-minus.
+    """Bridge SIP leg into conference using ConferenceMixer.
 
-    Pipelines (all Stage-based)::
-
-        RX: SIPSource → u8→s16le → AudioTee ──→ QueueSink(call.mixer input)
-                                        └──→ own_queue (for MixMinus)
-
-        TX: call.tee sidechain → MixMinus(- own_queue) → s16le→u8 → SIPSink
+    RX: SIPSource → conf.add_source (auto u8@8k → s16le@48k via pipe)
+    TX: conf.add_sink(SIPSink, mute_source=src_id) (auto 48k → 8k u8)
     """
-    from speech_pipeline.AudioTee import AudioTee
-    from speech_pipeline.MixMinus import MixMinus
-
     leg.call_id = call.call_id
     leg.status = "in-progress"
     leg.answered_at = time.time()
@@ -141,45 +130,16 @@ def bridge_to_call(leg: Leg, call) -> None:
 
     session = _CallSession(leg.voip_call)
 
-    # RX: SIP → tee → (1) mixer input + (2) own_queue for MixMinus
-    mixer_input_q = call.mixer.add_input()
-    own_queue = queue.Queue(maxsize=200)
-
+    # RX: SIPSource → conference mixer (auto-resampled)
     rx_source = SIPSource(session)
-    rx_tee = AudioTee(8000, "s16le")
-    rx_tee.add_mixer_feed(own_queue)                          # copy for MixMinus
-    rx_sink = QueueSink(mixer_input_q, sample_rate=8000, encoding="s16le")
-    rx_source.pipe(rx_tee).pipe(rx_sink)                      # u8→s16le auto-inserted
-    leg._rx_pipeline = rx_sink
+    leg._src_id = call.mixer.add_source(rx_source)
 
-    # TX: call.tee → MixMinus(- own) → SIP
-    mix_minus = MixMinus(sample_rate=8000)
-    mix_minus.set_own(own_queue)
+    # TX: conference mix (minus own) → SIPSink (auto-resampled)
     tx_sink = SIPSink(session)
-    mix_minus.pipe(tx_sink)                                   # s16le→u8 auto-inserted
-    call.tee.add_sidechain(mix_minus)                         # attaches to conference tee
-    leg._tx_pipeline = tx_sink
+    leg._sink_id = call.mixer.add_sink(tx_sink, mute_source=leg._src_id)
 
-    # Run both pipelines in background threads
-    def _run_rx():
-        try:
-            rx_sink.run()
-        except Exception as e:
-            _LOGGER.warning("Leg %s RX error: %s", leg.leg_id, e)
-
-    def _run_tx():
-        try:
-            tx_sink.run()
-        except Exception as e:
-            _LOGGER.warning("Leg %s TX error: %s", leg.leg_id, e)
-
-    t_rx = threading.Thread(target=_run_rx, daemon=True,
-                            name=f"rx-{leg.leg_id}")
-    t_tx = threading.Thread(target=_run_tx, daemon=True,
-                            name=f"tx-{leg.leg_id}")
-    t_rx.start()
-    t_tx.start()
-    leg._threads = [t_rx, t_tx]
+    _LOGGER.info("Leg %s bridged to call %s (src=%s sink=%s)",
+                 leg.leg_id, call.call_id, leg._src_id, leg._sink_id)
 
     # Monitor for SIP hangup
     def _monitor():
@@ -191,14 +151,10 @@ def bridge_to_call(leg: Leg, call) -> None:
 
         leg.status = "completed"
         duration = time.time() - leg.answered_at if leg.answered_at else 0
-
-        # Cancel pipelines
-        rx_source.cancel()
-        tx_source.cancel()
-        call.remove_input(leg.leg_id)
-
-        t_rx.join(timeout=3)
-        t_tx.join(timeout=3)
+        call.mixer.kill_source(leg._src_id)
+        if leg._sink_id:
+            call.mixer.remove_sink(leg._sink_id)
+        call.unregister_participant(leg.leg_id)
 
         _fire_callback(leg, "completed", duration=duration)
         _LOGGER.info("Leg %s ended (duration=%.1fs)", leg.leg_id, duration)
@@ -208,10 +164,7 @@ def bridge_to_call(leg: Leg, call) -> None:
 
 
 def originate_and_bridge(leg: Leg, call, pbx_entry: dict) -> None:
-    """Originate an outbound SIP call and bridge into conference.
-
-    Uses SIPSession to dial out, then bridges via ``bridge_to_call``.
-    """
+    """Originate an outbound SIP call and bridge into conference."""
     from speech_pipeline.SIPSession import SIPSession
 
     _fire_callback(leg, "ringing")
@@ -224,7 +177,7 @@ def originate_and_bridge(leg: Leg, call, pbx_entry: dict) -> None:
             username=pbx_entry.get("sip_user", "piper"),
             password=pbx_entry.get("sip_password", ""),
         )
-        session.start()  # blocks until answered or timeout
+        session.start()
     except Exception as e:
         _LOGGER.warning("Originate %s failed: %s", leg.number, e)
         leg.status = "failed"
@@ -249,7 +202,7 @@ class _CallSession:
         self._call = voip_call
         self.connected = threading.Event()
         self.hungup = threading.Event()
-        self.connected.set()  # already answered
+        self.connected.set()
 
     @property
     def call(self):

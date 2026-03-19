@@ -133,6 +133,31 @@ def _find_account_by_token(token: str) -> Optional[dict]:
     return None
 
 
+def check_pbx_access(account_id: str, pbx_id: str) -> bool:
+    """Check if account is allowed to use this PBX.
+
+    Returns True if: account has no PBX pin (any PBX allowed),
+    or account is pinned to this specific PBX.
+    """
+    acct = get_account(account_id)
+    if not acct:
+        return False
+    if not acct.get("pbx"):
+        return True  # no pin = any PBX
+    return acct["pbx"] == pbx_id
+
+
+def check_feature(account_id: str, feature: str) -> bool:
+    """Check if account has a feature enabled (tts, stt, webclient)."""
+    acct = get_account(account_id)
+    if not acct:
+        return False
+    features = acct.get("features", [])
+    if not features:
+        return True  # no feature list = all features
+    return feature in features
+
+
 # ---------------------------------------------------------------------------
 # Nonce management
 # ---------------------------------------------------------------------------

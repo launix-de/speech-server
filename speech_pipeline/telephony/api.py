@@ -203,10 +203,15 @@ def create_call():
     if aid and sub["account_id"] != aid:
         return ("Forbidden\n", 403)
 
-    # Resolve PBX
+    # Resolve PBX — account pin takes precedence
     acct = auth.get_account(sub["account_id"]) if sub["account_id"] != "__admin__" else None
-    pbx_id = (acct["pbx"] if acct and acct.get("pbx") else
-              body.get("pbx", ""))
+    requested_pbx = body.get("pbx", "")
+    if acct and acct.get("pbx"):
+        pbx_id = acct["pbx"]
+        if requested_pbx and requested_pbx != pbx_id:
+            return (f"Account pinned to PBX {pbx_id}, cannot use {requested_pbx}\n", 403)
+    else:
+        pbx_id = requested_pbx
 
     call = call_state.create_call(
         subscriber_id=sub_id,
@@ -396,6 +401,9 @@ def originate_leg():
         return ("Forbidden\n", 403)
     if not to:
         return ("'to' is required\n", 400)
+    # Enforce PBX pinning
+    if aid and not auth.check_pbx_access(aid, call.pbx_id):
+        return (f"Account not allowed to use PBX {call.pbx_id}\n", 403)
 
     pbx_entry = pbx_reg.get(call.pbx_id)
     if not pbx_entry:

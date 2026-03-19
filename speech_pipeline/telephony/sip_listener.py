@@ -104,6 +104,17 @@ def _handle_incoming(pbx_id: str, voip_call) -> None:
             pass
         return
 
+    # Verify subscriber's account is allowed on this PBX
+    from . import auth as auth_mod
+    if not auth_mod.check_pbx_access(sub["account_id"], pbx_id):
+        _LOGGER.warning("Account %s not allowed on PBX %s — rejecting",
+                        sub["account_id"], pbx_id)
+        try:
+            voip_call.deny()
+        except Exception:
+            pass
+        return
+
     # Answer the SIP call (we're bridging it ourselves)
     try:
         voip_call.answer()

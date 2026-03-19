@@ -141,6 +141,21 @@ def bridge_to_call(leg: Leg, call) -> None:
     _LOGGER.info("Leg %s bridged to call %s (src=%s sink=%s)",
                  leg.leg_id, call.call_id, leg._src_id, leg._sink_id)
 
+    # Monitor for DTMF digits from caller → fire subscriber callback
+    def _dtmf_monitor():
+        while leg.status == "in-progress":
+            try:
+                digit = leg.voip_call.get_dtmf(length=1)
+                if digit:
+                    _LOGGER.info("Leg %s DTMF received: %s", leg.leg_id, digit)
+                    _fire_callback(leg, "dtmf", digit=digit,
+                                   call_id=call.call_id)
+            except Exception:
+                time.sleep(0.1)
+
+    threading.Thread(target=_dtmf_monitor, daemon=True,
+                     name=f"dtmf-{leg.leg_id}").start()
+
     # Monitor for SIP hangup
     def _monitor():
         from pyVoIP.VoIP.VoIP import CallState

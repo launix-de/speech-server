@@ -263,12 +263,65 @@ def _cmd_transfer(call: call_state.Call, cmd: dict) -> None:
 
 
 def _cmd_dtmf(call: call_state.Call, cmd: dict) -> None:
-    """Send DTMF tones into a SIP leg.
+    """Send DTMF tones into a SIP leg as inband audio.
 
-    TODO: Implement via pyVoIP RTP events (RFC 2833).
-    Currently a placeholder.
+    Generates DTMF audio tones and feeds them into the conference
+    mixer as a temporary source.  The receiving SIP endpoint should
+    decode the tones.
+
+    Params:
+    - digits: string of digits (0-9, *, #)
+    - duration_ms: per-digit duration (default 200ms)
     """
-    _LOGGER.info("DTMF for call %s: %s", call.call_id, cmd.get("digits"))
+    import struct, math
+
+    digits_str = str(cmd.get("digits", ""))
+    duration_ms = cmd.get("duration_ms", 200)
+    if not digits_str:
+        return
+
+    # DTMF frequency pairs (ITU-T Q.23)
+    DTMF_FREQS = {
+        "1": (697, 1209), "2": (697, 1336), "3": (697, 1477),
+        "4": (770, 1209), "5": (770, 1336), "6": (770, 1477),
+        "7": (852, 1209), "8": (852, 1336), "9": (852, 1477),
+        "*": (941, 1209), "0": (941, 1336), "#": (941, 1477),
+    }
+
+    rate = call_state.MIXER_SAMPLE_RATE
+    samples_per_digit = int(rate * duration_ms / 1000)
+    gap_samples = int(rate * 50 / 1000)  # 50ms gap between digits
+
+    pcm = bytearray()
+    for digit in digits_str:
+        freqs = DTMF_FREQS.get(digit)
+        if not freqs:
+            continue
+        f1, f2 = freqs
+        for i in range(samples_per_digit):
+            t = i / rate
+            sample = 0.3 * (math.sin(2 * math.pi * f1 * t) +
+                            math.sin(2 * math.pi * f2 * t))
+            pcm.extend(struct.pack("<h", max(-32768, min(32767, int(sample * 32767)))))
+        # Gap
+        pcm.extend(b"\x00\x00" * gap_samples)
+
+    if not pcm:
+        return
+
+    # Feed as temporary source via add_source (proper Stage pipeline)
+    from speech_pipeline.QueueSource import QueueSource
+    import queue as _queue
+
+    q = _queue.Queue()
+    q.put(bytes(pcm))
+    q.put(None)  # EOF
+    src = QueueSource(q, rate, "s16le")
+    src_id = call.mixer.add_source(src)
+    call.mixer.wait_source(src_id)
+    call.mixer.remove_source(src_id)
+
+    _LOGGER.info("DTMF sent for call %s: %s", call.call_id, digits_str)
 
 
 def _cmd_stt_start(call: call_state.Call, cmd: dict) -> None:

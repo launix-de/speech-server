@@ -77,13 +77,14 @@ class Call:
             return self._participants.pop(pid, None)
 
     def get_participant(self, pid: str) -> Optional[dict]:
+        """Get participant metadata (direct reference, not a copy)."""
         with self._lock:
-            p = self._participants.get(pid)
-            return dict(p) if p else None
+            return self._participants.get(pid)
 
     def list_participants(self) -> List[dict]:
         with self._lock:
-            return [{"id": k, **v} for k, v in self._participants.items()]
+            return [{"id": k, **{kk: vv for kk, vv in v.items() if not kk.startswith("_")}}
+                    for k, v in self._participants.items()]
 
     def end(self) -> None:
         self.mixer.cancel()

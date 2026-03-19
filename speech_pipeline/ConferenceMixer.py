@@ -129,7 +129,32 @@ class ConferenceMixer(Stage):
         with self._lock:
             to_remove = [sid for sid, s in self._sources.items() if s.queue is q]
             for sid in to_remove:
-                self._sources.pop(sid)
+                src = self._sources.pop(sid)
+                src.buffer.clear()
+
+    def wait_source(self, src_id: str, timeout: float = None) -> bool:
+        """Block until a source is fully consumed (buffer drained).
+
+        Returns True if done, False on timeout.
+        """
+        with self._lock:
+            entry = self._sources.get(src_id)
+        if not entry:
+            return True
+        return entry.done.wait(timeout=timeout)
+
+    def kill_source(self, src_id: str) -> None:
+        """Immediately stop a source: cancel pipeline, clear buffer, remove."""
+        with self._lock:
+            entry = self._sources.pop(src_id, None)
+        if entry:
+            if entry.sink:
+                entry.sink.cancel()
+            entry.buffer.clear()
+            entry.finished = True
+            entry.done.set()
+            _LOGGER.info("ConferenceMixer '%s': killed source %s",
+                         self.name, src_id)
 
     def remove_source(self, src_id: str) -> None:
         """Disconnect a source."""
@@ -264,6 +289,7 @@ class ConferenceMixer(Stage):
             for sid, src in sources.items():
                 if src.finished and len(src.buffer) < self.frame_bytes:
                     frames[sid] = silence
+                    src.done.set()
                     continue
                 while True:
                     try:
@@ -359,14 +385,15 @@ class ConferenceMixer(Stage):
 
 
 class _Source:
-    __slots__ = ("id", "queue", "sink", "buffer", "finished", "thread")
+    __slots__ = ("id", "queue", "sink", "buffer", "finished", "done", "thread")
 
-    def __init__(self, id: str, queue: queue.Queue, sink: QueueSink):
+    def __init__(self, id: str, queue: queue.Queue, sink: Optional[QueueSink]):
         self.id = id
         self.queue = queue
         self.sink = sink
         self.buffer = bytearray()
         self.finished = False
+        self.done = threading.Event()  # set when finished AND buffer drained
         self.thread: Optional[threading.Thread] = None
 
 

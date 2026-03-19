@@ -95,22 +95,68 @@ def setup_conference() -> str:
     return call_id
 
 
-def add_welcome_tts(call_id: str) -> None:
-    """Add a TTS bot that says welcome and auto-removes."""
+JOINED_COUNT = 0
+HOLD_MUSIC_PID = None
+
+
+def on_user_joined(call_id: str) -> None:
+    """Called when any user joins the conference."""
+    global JOINED_COUNT, HOLD_MUSIC_PID
+    JOINED_COUNT += 1
+
+    if JOINED_COUNT == 1:
+        # First user: welcome + hold music loop
+        _start_welcome_and_hold(call_id)
+    else:
+        # Second+ user: stop hold music, announce
+        _stop_hold_music(call_id)
+        piper("POST", f"/api/calls/{call_id}/commands", {
+            "commands": [{
+                "action": "tts",
+                "text": "Ein weiterer Teilnehmer ist beigetreten.",
+                "voice": "de_DE-thorsten-medium",
+            }],
+        }, token=ACCOUNT_TOKEN)
+
+
+def _start_welcome_and_hold(call_id: str) -> None:
+    global HOLD_MUSIC_PID
+    # Find the play pid from the participant list after the command
     piper("POST", f"/api/calls/{call_id}/commands", {
         "commands": [
             {
                 "action": "tts",
-                "text": "Herzlich willkommen in der Konferenz!",
+                "text": "Herzlich willkommen in der Konferenz! Bitte warten Sie auf weitere Teilnehmer.",
                 "voice": "de_DE-thorsten-medium",
             },
-            # TODO: remove play command before commit — test only
             {
                 "action": "play",
-                "url": f"{PIPER_URL}/examples/word-on-beat.mp3",
+                "url": f"{PIPER_URL}/examples/queue.mp3",
+                "loop": True,
+                "volume": 30,
             },
         ],
     }, token=ACCOUNT_TOKEN)
+    # Find the play participant to get its pid for later stop
+    time.sleep(0.5)
+    try:
+        calls = piper("GET", f"/api/calls/{call_id}", token=ACCOUNT_TOKEN)
+        for p in calls.get("participants", []):
+            if p.get("type") == "play":
+                HOLD_MUSIC_PID = p["id"]
+                _LOG.info("Hold music pid: %s", HOLD_MUSIC_PID)
+    except Exception:
+        pass
+
+
+def _stop_hold_music(call_id: str) -> None:
+    global HOLD_MUSIC_PID
+    if HOLD_MUSIC_PID:
+        _LOG.info("Stopping hold music: %s", HOLD_MUSIC_PID)
+        piper("POST", f"/api/calls/{call_id}/commands", {
+            "commands": [{"action": "stop_play", "pid": HOLD_MUSIC_PID}],
+        }, token=ACCOUNT_TOKEN)
+        HOLD_MUSIC_PID = None
 
 
 PENDING_IFRAME_URLS: list = []  # filled by webclient-callback
@@ -246,7 +292,7 @@ class Handler(BaseHTTPRequestHandler):
             if body.get("result") == "ready" and body.get("iframe_url"):
                 PENDING_IFRAME_URLS.append(body["iframe_url"])
             if body.get("result") == "joined":
-                threading.Thread(target=add_welcome_tts, args=(CALL_ID,),
+                threading.Thread(target=on_user_joined, args=(CALL_ID,),
                                  daemon=True).start()
             self._json({"ok": True})
 

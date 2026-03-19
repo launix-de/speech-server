@@ -14,6 +14,8 @@ from typing import Iterator, Optional
 
 import requests as http_requests
 
+import json
+
 from .base import AudioFormat, Stage
 
 _LOGGER = logging.getLogger("webhook-sink")
@@ -56,7 +58,6 @@ class WebhookSink(Stage):
                 try:
                     # Merge extra fields into the JSON payload
                     if self.extra_fields:
-                        import json
                         obj = json.loads(line)
                         obj.update(self.extra_fields)
                         line = json.dumps(obj)

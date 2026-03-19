@@ -99,17 +99,35 @@ JOINED_COUNT = 0
 HOLD_MUSIC_PID = None
 
 
+def _update_hold_music(call_id: str) -> None:
+    """Start/stop hold music based on participant count.
+
+    0 participants → silence
+    1 participant  → hold music loop
+    ≥2 participants → silence (people can talk)
+    """
+    if JOINED_COUNT == 1:
+        _start_hold_music(call_id)
+    else:
+        _stop_hold_music(call_id)
+
+
 def on_user_joined(call_id: str) -> None:
     """Called when any user joins the conference."""
-    global JOINED_COUNT, HOLD_MUSIC_PID
+    global JOINED_COUNT
     JOINED_COUNT += 1
 
     if JOINED_COUNT == 1:
-        # First user: welcome + hold music loop
-        _start_welcome_and_hold(call_id)
+        # First user: welcome + hold music
+        piper("POST", f"/api/calls/{call_id}/commands", {
+            "commands": [{
+                "action": "tts",
+                "text": "Herzlich willkommen in der Konferenz! Bitte warten Sie auf weitere Teilnehmer.",
+                "voice": "de_DE-thorsten-medium",
+            }],
+        }, token=ACCOUNT_TOKEN)
     else:
-        # Second+ user: stop hold music, announce
-        _stop_hold_music(call_id)
+        # Second+ user: announce
         piper("POST", f"/api/calls/{call_id}/commands", {
             "commands": [{
                 "action": "tts",
@@ -117,36 +135,38 @@ def on_user_joined(call_id: str) -> None:
                 "voice": "de_DE-thorsten-medium",
             }],
         }, token=ACCOUNT_TOKEN)
+    _update_hold_music(call_id)
 
 
-def _start_welcome_and_hold(call_id: str) -> None:
+def on_user_left(call_id: str) -> None:
+    """Called when a user leaves the conference."""
+    global JOINED_COUNT
+    JOINED_COUNT = max(0, JOINED_COUNT - 1)
+    _update_hold_music(call_id)
+
+
+def _start_hold_music(call_id: str) -> None:
     global HOLD_MUSIC_PID
-    # Find the play pid from the participant list after the command
+    if HOLD_MUSIC_PID:
+        return  # already playing
     piper("POST", f"/api/calls/{call_id}/commands", {
-        "commands": [
-            {
-                "action": "tts",
-                "text": "Herzlich willkommen in der Konferenz! Bitte warten Sie auf weitere Teilnehmer.",
-                "voice": "de_DE-thorsten-medium",
-            },
-            {
-                "action": "play",
-                "url": f"{PIPER_URL}/examples/queue.mp3",
-                "loop": True,
-                "volume": 30,
-            },
-        ],
+        "commands": [{
+            "action": "play",
+            "url": f"{PIPER_URL}/examples/queue.mp3",
+            "loop": True,
+            "volume": 30,
+        }],
     }, token=ACCOUNT_TOKEN)
-    # Find the play participant to get its pid for later stop
     time.sleep(0.5)
     try:
-        calls = piper("GET", f"/api/calls/{call_id}", token=ACCOUNT_TOKEN)
-        for p in calls.get("participants", []):
+        call_data = piper("GET", f"/api/calls/{call_id}", token=ACCOUNT_TOKEN)
+        for p in call_data.get("participants", []):
             if p.get("type") == "play":
                 HOLD_MUSIC_PID = p["id"]
-                _LOG.info("Hold music pid: %s", HOLD_MUSIC_PID)
+                _LOG.info("Hold music started: %s", HOLD_MUSIC_PID)
     except Exception:
         pass
+
 
 
 def _stop_hold_music(call_id: str) -> None:
@@ -293,6 +313,9 @@ class Handler(BaseHTTPRequestHandler):
                 PENDING_IFRAME_URLS.append(body["iframe_url"])
             if body.get("result") == "joined":
                 threading.Thread(target=on_user_joined, args=(CALL_ID,),
+                                 daemon=True).start()
+            if body.get("result") == "left":
+                threading.Thread(target=on_user_left, args=(CALL_ID,),
                                  daemon=True).start()
             self._json({"ok": True})
 

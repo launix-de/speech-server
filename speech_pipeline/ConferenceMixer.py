@@ -132,6 +132,21 @@ class ConferenceMixer(Stage):
                 src = self._sources.pop(sid)
                 src.buffer.clear()
 
+    def add_participant(self, in_q: queue.Queue) -> tuple:
+        """Add a full participant (input + auto-muted output).
+
+        Returns ``(src_id, out_queue)``.  The output automatically
+        subtracts this participant's own input (mix-minus).
+        """
+        src_id = _next_id("src")
+        entry = _Source(id=src_id, queue=in_q, sink=None)
+        with self._lock:
+            self._sources[src_id] = entry
+        self._has_sources.set()
+        out_q = self.add_output(mute_source=src_id)
+        _LOGGER.info("ConferenceMixer '%s': +participant %s", self.name, src_id)
+        return src_id, out_q
+
     def wait_source(self, src_id: str, timeout: float = None) -> bool:
         """Block until a source is fully consumed (buffer drained).
 

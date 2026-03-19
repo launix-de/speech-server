@@ -1202,6 +1202,24 @@ def create_app(args: argparse.Namespace) -> Flask:
                             return _on_attached
 
                         stage.on_attached = _make_on_attached(sub, call, callback_path, sess["session_id"])
+
+                        def _make_on_detached(sub_info, call_obj, cb_path, part_id):
+                            def _on_detached(leg):
+                                if not cb_path:
+                                    return
+                                url = sub_info["base_url"].rstrip("/") + "/" + cb_path.lstrip("/")
+                                try:
+                                    _http.post(url, json={
+                                        "callId": call_obj.call_id,
+                                        "command": "webclient",
+                                        "participantId": part_id,
+                                        "result": "left",
+                                    }, headers={"Authorization": f"Bearer {sub_info['bearer_token']}"}, timeout=5)
+                                except Exception:
+                                    pass
+                            return _on_detached
+
+                        stage.on_detached = _make_on_detached(sub, call, callback_path, sess["session_id"])
             except ImportError:
                 pass
             except Exception as e:

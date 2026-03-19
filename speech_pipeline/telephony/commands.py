@@ -22,8 +22,6 @@ _LOGGER = logging.getLogger("telephony.commands")
 def execute_commands(call: call_state.Call, commands: list) -> None:
     """Execute a list of commands sequentially in a background thread."""
     def _run():
-        import sys
-        print(f"[CMD] execute_commands thread start: {len(commands)} commands for {call.call_id}", file=sys.stderr, flush=True)
         _LOGGER.info("execute_commands thread start: %d commands for %s",
                      len(commands), call.call_id)
         for cmd in commands:

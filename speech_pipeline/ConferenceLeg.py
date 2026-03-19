@@ -53,18 +53,9 @@ class ConferenceLeg(Stage):
         if not self.upstream or not self._mixer:
             return
 
-        # Register as source — feed upstream audio into mixer via queue
-        in_q = self._mixer.add_input()
-        self._src_id = None
-        # Find the src_id for this input queue
-        with self._mixer._lock:
-            for sid, src in self._mixer._sources.items():
-                if src.queue is in_q:
-                    self._src_id = sid
-                    break
-
-        # Register output — get conference mix minus own source
-        self._out_q = self._mixer.add_output(mute_source=self._src_id)
+        # Register as full participant (input + auto mix-minus output)
+        in_q = queue.Queue(maxsize=200)
+        self._src_id, self._out_q = self._mixer.add_participant(in_q)
 
         _LOGGER.info("ConferenceLeg: attached (src=%s)", self._src_id)
 

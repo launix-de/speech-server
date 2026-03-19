@@ -1,0 +1,129 @@
+"""Subscriber registry with heartbeat-based liveliness tracking.
+
+Subscribers are ephemeral — held in memory only.  Each subscriber
+belongs to an account and refreshes itself via periodic heartbeat
+(``PUT /api/subscribe/{id}``).  Stale subscribers are flagged after
+``STALE_SECONDS`` and removed after ``REMOVE_SECONDS``.
+"""
+from __future__ import annotations
+
+import logging
+import time
+from typing import Dict, List, Optional
+
+_LOGGER = logging.getLogger("telephony.subscriber")
+
+STALE_SECONDS = 180     # 3 minutes
+REMOVE_SECONDS = 600    # 10 minutes
+
+# subscriber_id -> subscriber dict
+_subscribers: Dict[str, dict] = {}
+
+# did -> subscriber_id  (reverse index for inbound routing)
+_did_map: Dict[str, str] = {}
+
+
+def put(subscriber_id: str, account_id: str, data: dict) -> dict:
+    """Register or refresh a subscriber (idempotent)."""
+    old = _subscribers.get(subscriber_id)
+    if old and old["account_id"] != account_id:
+        raise PermissionError("Subscriber belongs to a different account")
+
+    # Rebuild DID map entries for this subscriber
+    if old:
+        for did in old.get("inbound_dids", []):
+            _did_map.pop(did, None)
+
+    entry = {
+        "id": subscriber_id,
+        "account_id": account_id,
+        "base_url": data.get("base_url", ""),
+        "bearer_token": data.get("bearer_token", ""),
+        "outbound_caller_id": data.get("outbound_caller_id", ""),
+        "inbound_dids": data.get("inbound_dids", []),
+        "events": data.get("events", {}),
+        "last_seen": time.time(),
+    }
+
+    # Check DID uniqueness
+    for did in entry["inbound_dids"]:
+        owner = _did_map.get(did)
+        if owner and owner != subscriber_id:
+            raise ValueError(
+                f"DID {did} already claimed by subscriber {owner}")
+        _did_map[did] = subscriber_id
+
+    _subscribers[subscriber_id] = entry
+    _LOGGER.info("Subscriber %s registered (account=%s, dids=%s)",
+                 subscriber_id, account_id, entry["inbound_dids"])
+    return entry
+
+
+def delete(subscriber_id: str, account_id: Optional[str] = None) -> bool:
+    """Remove a subscriber.  If *account_id* is given, ownership is checked."""
+    entry = _subscribers.get(subscriber_id)
+    if not entry:
+        return False
+    if account_id and entry["account_id"] != account_id:
+        raise PermissionError("Subscriber belongs to a different account")
+    for did in entry.get("inbound_dids", []):
+        _did_map.pop(did, None)
+    del _subscribers[subscriber_id]
+    _LOGGER.info("Subscriber %s removed", subscriber_id)
+    return True
+
+
+def get(subscriber_id: str) -> Optional[dict]:
+    return _subscribers.get(subscriber_id)
+
+
+def list_all(account_id: Optional[str] = None) -> List[dict]:
+    """List subscribers, optionally filtered by account.
+
+    Automatically purges entries past ``REMOVE_SECONDS`` and annotates
+    each entry with a ``status`` field (``alive`` or ``stale``).
+    """
+    _purge()
+    now = time.time()
+    result = []
+    for s in _subscribers.values():
+        if account_id and s["account_id"] != account_id:
+            continue
+        age = now - s["last_seen"]
+        s_copy = dict(s)
+        s_copy["status"] = "stale" if age > STALE_SECONDS else "alive"
+        result.append(s_copy)
+    return result
+
+
+def find_by_did(did: str) -> Optional[dict]:
+    """Look up subscriber by inbound DID number."""
+    sid = _did_map.get(did)
+    if not sid:
+        return None
+    entry = _subscribers.get(sid)
+    if not entry:
+        _did_map.pop(did, None)
+        return None
+    age = time.time() - entry["last_seen"]
+    if age > STALE_SECONDS:
+        return None  # stale — treat as unreachable
+    return entry
+
+
+def delete_all_for_account(account_id: str) -> int:
+    """Remove all subscribers belonging to an account.  Returns count."""
+    to_remove = [sid for sid, s in _subscribers.items()
+                 if s["account_id"] == account_id]
+    for sid in to_remove:
+        delete(sid)
+    return len(to_remove)
+
+
+def _purge() -> None:
+    """Remove subscribers past REMOVE_SECONDS."""
+    now = time.time()
+    expired = [sid for sid, s in _subscribers.items()
+               if now - s["last_seen"] > REMOVE_SECONDS]
+    for sid in expired:
+        delete(sid)

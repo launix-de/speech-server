@@ -73,6 +73,12 @@ class AudioMixer(Stage):
             _LOGGER.debug("AudioMixer '%s': removed input, %d remaining", self.name, len(self._inputs))
 
     def stream_pcm24k(self) -> Iterator[bytes]:
+        if hasattr(self, '_streaming') and self._streaming:
+            raise RuntimeError(
+                f"AudioMixer '{self.name}' is already being consumed. "
+                f"Use AudioTee to distribute to multiple consumers."
+            )
+        self._streaming = True
         # Wait for at least one input (or cancellation)
         while not self.cancelled:
             if self._has_inputs.wait(timeout=0.5):

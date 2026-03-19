@@ -75,6 +75,7 @@ class PipelineBuilder:
         self._sip_sessions: Dict[str, Any] = {}
         self._mixers: Dict[str, Any] = {}  # name -> AudioMixer
         self._codec_sessions: Dict[str, Any] = {}  # id -> CodecSocketSession
+        self._named_queues: Dict[str, Any] = {}  # name -> queue.Queue
 
     def parse(self, pipe_str: str) -> List[Tuple[str, List[str]]]:
         """Parse ``'a:x:y | b:z | c'`` into ``[('a', ['x','y']), ('b', ['z']), ('c', [])]``."""
@@ -377,10 +378,12 @@ class PipelineBuilder:
                 current_output_type = "pcm"
 
             elif typ == "tee":
-                # tee:NAME — feeds a named mixer.
+                # tee:NAME     — feeds a named mixer
+                # tee:NAME:q   — feeds a named queue (for mixminus)
                 if not params:
-                    raise ValueError("tee requires a mixer name (e.g. tee:call)")
-                mixer_name = params[0]
+                    raise ValueError("tee requires a name (e.g. tee:call or tee:own:q)")
+                target_name = params[0]
+                is_queue_mode = len(params) > 1 and params[1] == "q"
 
                 if not current_stage or current_output_type != "pcm":
                     raise ValueError("tee requires PCM upstream")
@@ -398,54 +401,62 @@ class PipelineBuilder:
                     current_stage.pipe(tee)
                 run.stages.append(tee)
 
-                # Get or create the mixer, then register an input queue
-                mixer = self._get_or_create_mixer(mixer_name)
-                mixer_input_q = mixer.add_input()
-
-                # If tee rate differs from mixer rate, we need a resampler
-                # between the tee and the mixer queue. For simplicity, the
-                # tee feeds the mixer queue directly at its own rate; the
-                # mixer's rate is set by the first tee or by mix:NAME:RATE.
-                # If rates differ, insert a SampleRateConverter in a thread.
-                if rate > 0 and mixer.sample_rate > 0 and rate != mixer.sample_rate:
-                    from .SampleRateConverter import SampleRateConverter
-                    from .QueueSource import QueueSource
+                if is_queue_mode:
+                    # Feed a named queue (used by mixminus)
                     import queue as _queue
+                    q = self._named_queues.get(target_name)
+                    if q is None:
+                        q = _queue.Queue(maxsize=200)
+                        self._named_queues[target_name] = q
+                    tee.add_mixer_feed(q)
 
-                    # tee -> intermediate queue -> SRC -> mixer queue
-                    intermediate_q = _queue.Queue(maxsize=200)
-                    tee.add_mixer_feed(intermediate_q)
+                    current_stage = tee
+                    current_output_type = "pcm"
 
-                    src = QueueSource(intermediate_q, rate, encoding)
-                    src_stage = SampleRateConverter(rate, mixer.sample_rate)
-                    src.pipe(src_stage)
-                    run.stages.append(src_stage)
+                else:
+                    # Default: feed a named mixer
+                    mixer_name = target_name
+                    mixer = self._get_or_create_mixer(mixer_name)
+                    mixer_input_q = mixer.add_input()
 
-                    def _make_resampler_thread(src_stage, mixer_q):
-                        def _resample():
-                            try:
-                                for chunk in src_stage.stream_pcm24k():
+                    if rate > 0 and mixer.sample_rate > 0 and rate != mixer.sample_rate:
+                        from .SampleRateConverter import SampleRateConverter
+                        from .QueueSource import QueueSource
+                        import queue as _queue
+
+                        intermediate_q = _queue.Queue(maxsize=200)
+                        tee.add_mixer_feed(intermediate_q)
+
+                        src = QueueSource(intermediate_q, rate, encoding)
+                        src_stage = SampleRateConverter(rate, mixer.sample_rate)
+                        src.pipe(src_stage)
+                        run.stages.append(src_stage)
+
+                        def _make_resampler_thread(src_stage, mixer_q):
+                            def _resample():
+                                try:
+                                    for chunk in src_stage.stream_pcm24k():
+                                        try:
+                                            mixer_q.put_nowait(chunk)
+                                        except Exception:
+                                            pass
+                                except Exception as e:
+                                    _LOGGER.warning("tee resampler error: %s", e)
+                                finally:
                                     try:
-                                        mixer_q.put_nowait(chunk)
+                                        mixer_q.put(None, timeout=1.0)
                                     except Exception:
                                         pass
-                            except Exception as e:
-                                _LOGGER.warning("tee resampler error: %s", e)
-                            finally:
-                                try:
-                                    mixer_q.put(None, timeout=1.0)
-                                except Exception:
-                                    pass
-                        return _resample
+                            return _resample
 
-                    t = threading.Thread(
-                        target=_make_resampler_thread(src_stage, mixer_input_q),
-                        daemon=True,
-                    )
-                    t.start()
-                    run._cancel_extras.append(lambda s=src_stage: s.cancel())
-                else:
-                    tee.add_mixer_feed(mixer_input_q)
+                        t = threading.Thread(
+                            target=_make_resampler_thread(src_stage, mixer_input_q),
+                            daemon=True,
+                        )
+                        t.start()
+                        run._cancel_extras.append(lambda s=src_stage: s.cancel())
+                    else:
+                        tee.add_mixer_feed(mixer_input_q)
 
                 current_stage = tee
                 current_output_type = "pcm"
@@ -526,6 +537,67 @@ class PipelineBuilder:
                     run._run_fn = sink.run
                 else:
                     raise ValueError("codec element can only appear at start or end of pipeline")
+
+            elif typ == "mixminus":
+                # mixminus:NAME — subtracts the named queue from upstream.
+                # Use with ``tee`` that feeds a named queue via ``tee:NAME:q``
+                # in the RX pipeline of the same participant.
+                #
+                # Example duplex:
+                #   RX: codec:x | tee:conf | tee:own:q
+                #   TX: mix:conf | mixminus:own | codec:x
+                if not params:
+                    raise ValueError("mixminus requires a queue name")
+                q_name = params[0]
+
+                if not current_stage or current_output_type != "pcm":
+                    raise ValueError("mixminus requires PCM upstream")
+
+                rate = current_stage.output_format.sample_rate if current_stage.output_format else 48000
+
+                from .MixMinus import MixMinus
+                import queue as _queue
+                mm = MixMinus(sample_rate=rate)
+
+                own_q = self._named_queues.get(q_name)
+                if own_q is None:
+                    own_q = _queue.Queue(maxsize=200)
+                    self._named_queues[q_name] = own_q
+                mm.set_own(own_q)
+
+                if current_stage:
+                    current_stage.pipe(mm)
+                run.stages.append(mm)
+                current_output_type = "pcm"
+                current_stage = mm
+
+            elif typ == "conference":
+                # conference:ID — join a ConferenceMixer as bidirectional participant.
+                #
+                # Usage: codec:x | conference:myconf | codec:x
+                #   input | conference:id          → add source only
+                #   conference:id | output         → unmuted output only
+                #   input | conference:id | output → source + muted output
+                if not params:
+                    raise ValueError("conference requires a mixer name")
+                conf_name = params[0]
+
+                from .ConferenceMixer import ConferenceMixer
+                from .ConferenceLeg import ConferenceLeg
+
+                conf = self._mixers.get(conf_name)
+                if not conf or not isinstance(conf, ConferenceMixer):
+                    raise ValueError(f"Conference '{conf_name}' not found or not a ConferenceMixer")
+
+                leg = ConferenceLeg(sample_rate=conf.sample_rate)
+                leg.attach(conf)
+
+                if current_stage and current_output_type == "pcm":
+                    current_stage.pipe(leg)
+
+                run.stages.append(leg)
+                current_stage = leg
+                current_output_type = "pcm"
 
             else:
                 raise ValueError(f"Unknown pipeline element: {typ}")

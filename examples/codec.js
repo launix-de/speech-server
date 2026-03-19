@@ -451,6 +451,93 @@
     return 20 * Math.log10(level);
   }
 
+  /**
+   * Join a conference: open WebSocket, start mic + speaker in one call.
+   * @param {string} wsUrl — full WebSocket URL (wss://host/ws/phone/nonce)
+   * @param {object} [opts] — optional settings
+   * @param {string} [opts.profile='low'] — codec profile
+   * @param {function} [opts.onstate] — called with state string ('connecting','ready','connected','disconnected','error')
+   * @param {function} [opts.onrms] — called with mic RMS level
+   * @param {function} [opts.onmessage] — called with parsed JSON control messages from server
+   * @returns {Promise<{close:function, ws:WebSocket, mic:object, speaker:object}>}
+   */
+  function joinConference(wsUrl, opts) {
+    opts = opts || {};
+    var profile = opts.profile || 'medium';
+    var onstate = opts.onstate || function () {};
+    var onrms = opts.onrms || null;
+    var onmessage = opts.onmessage || null;
+
+    onstate('connecting');
+
+    var ws = new WebSocket(wsUrl);
+    ws.binaryType = 'arraybuffer';
+
+    return new Promise(function (resolve, reject) {
+      var mic = null, speaker = null, closed = false;
+
+      var handle = {
+        ws: ws,
+        mic: null,
+        speaker: null,
+        close: function () {
+          if (closed) return;
+          closed = true;
+          if (handle.mic) { handle.mic.close(); handle.mic = null; }
+          if (handle.speaker) { handle.speaker.close(); handle.speaker = null; }
+          if (ws.readyState <= 1) {
+            try { ws.send(JSON.stringify({hangup: true})); } catch(e) {}
+            ws.close();
+          }
+          onstate('disconnected');
+        },
+      };
+
+      ws.onopen = function () {
+        onstate('ready');
+        // 1. Tell server we want to join (server builds pipeline + codec session)
+        ws.send(JSON.stringify({accept: true}));
+        // 2. Send codec handshake (server's CodecSocketSession expects this)
+        ws.send(JSON.stringify({type: 'hello', profiles: [profile]}));
+      };
+
+      ws.onmessage = function (evt) {
+        if (typeof evt.data !== 'string') return; // binary = audio, handled by speaker
+        try {
+          var msg = JSON.parse(evt.data);
+          if (msg.hangup) { handle.close(); return; }
+
+          // 2. Server's codec session sends hello response → start mic + speaker
+          if (msg.type === 'hello' && !handle.mic) {
+            handle.speaker = openSpeaker(ws);
+            openMic(ws, msg.profile || profile).then(function (m) {
+              if (closed) { m.close(); return; }
+              handle.mic = m;
+              if (onrms) m.onrms = onrms;
+              onstate('connected');
+              resolve(handle);
+            }).catch(function (e) {
+              onstate('error');
+              reject(e);
+            });
+            return;
+          }
+
+          if (onmessage) onmessage(msg);
+        } catch(e) {}
+      };
+
+      ws.onerror = function () {
+        onstate('error');
+        if (!handle.mic) reject(new Error('WebSocket error'));
+      };
+
+      ws.onclose = function () {
+        if (!closed) handle.close();
+      };
+    });
+  }
+
   return {
     FRAME_SAMPLES,
     SAMPLE_RATE,
@@ -467,5 +554,6 @@
     computeRMS,
     computePeak,
     levelToDb,
+    joinConference,
   };
 });

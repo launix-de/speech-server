@@ -48,6 +48,7 @@ class CodecSocketSession:
         self.tx_queue: Queue[bytes] = Queue(maxsize=500)
         self.connected = threading.Event()
         self.closed = threading.Event()
+        self.last_rx_profile: Optional[str] = None  # tracks client's current profile
         self._ws = None
         with _sessions_lock:
             _sessions[session_id] = self
@@ -155,7 +156,9 @@ class CodecSocketSession:
                     continue
                 # Binary: encoded codec frame
                 try:
-                    samples, _prof = codec.decode_frame(msg)
+                    samples, frame_profile = codec.decode_frame(msg)
+                    if frame_profile:
+                        self.last_rx_profile = frame_profile
                     pcm = codec.float32_to_pcm_s16le(samples)
                     self.rx_queue.put_nowait(pcm)
                     rx_count += 1
@@ -175,7 +178,6 @@ class CodecSocketSession:
     # ------------------------------------------------------------------
 
     def _tx_loop(self, ws) -> None:
-        profile = self.negotiated_profile or "low"
         frame_bytes = codec.FRAME_SAMPLES * 2  # s16le
         buf = b""
         try:
@@ -191,7 +193,9 @@ class CodecSocketSession:
                     chunk = buf[:frame_bytes]
                     buf = buf[frame_bytes:]
                     samples = codec.pcm_s16le_to_float32(chunk)
-                    encoded = codec.encode_frame(samples, profile)
+                    # Use client's current profile (follows per-frame switching)
+                    tx_profile = self.last_rx_profile or self.negotiated_profile or "low"
+                    encoded = codec.encode_frame(samples, tx_profile)
                     try:
                         ws.send(encoded)
                     except Exception:
@@ -201,7 +205,8 @@ class CodecSocketSession:
             if buf:
                 padded = buf + b"\x00" * (frame_bytes - len(buf))
                 samples = codec.pcm_s16le_to_float32(padded)
-                encoded = codec.encode_frame(samples, profile)
+                tx_profile = self.last_rx_profile or self.negotiated_profile or "low"
+                encoded = codec.encode_frame(samples, tx_profile)
                 try:
                     ws.send(encoded)
                 except Exception:

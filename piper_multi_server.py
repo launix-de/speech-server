@@ -143,6 +143,44 @@ def create_app(args: argparse.Namespace) -> Flask:
         app.register_blueprint(pipeline_api_bp)
         _LOGGER.info("Pipeline control API enabled at /api/ (bearer-authenticated)")
 
+        # Telephony API (shares the admin token, adds account-scoped auth)
+        from speech_pipeline.telephony.auth import init as tel_auth_init
+        from speech_pipeline.telephony.api import api as telephony_api_bp
+        tel_auth_init(admin_token)
+        app.register_blueprint(telephony_api_bp)
+        _LOGGER.info("Telephony API enabled at /api/ (admin + account auth)")
+
+        # Share TTS registry and app with telephony modules
+        import speech_pipeline.telephony._shared as _tel_shared
+        _tel_shared.tts_registry = registry
+        _tel_shared.flask_app = app
+
+        # WebClient: phone UI + WebSocket
+        from speech_pipeline.telephony.webclient import bp as webclient_bp
+        app.register_blueprint(webclient_bp)
+        _LOGGER.info("WebClient phone UI enabled")
+
+        # Startup callback: notify provisioning service that we are ready
+        startup_cb = getattr(args, 'startup_callback', None) or ''
+        if startup_cb:
+            def _fire_startup_callback(url: str, token: str) -> None:
+                import requests
+                try:
+                    _LOGGER.info("Sending startup callback to %s", url)
+                    resp = requests.get(url, headers={
+                        "Authorization": f"Bearer {token}",
+                    }, timeout=30)
+                    _LOGGER.info("Startup callback response: %s", resp.status_code)
+                except Exception as e:
+                    _LOGGER.warning("Startup callback failed: %s", e)
+            # Fire after app is ready (in a thread to not block startup)
+            threading.Thread(
+                target=_fire_startup_callback,
+                args=(startup_cb, admin_token),
+                daemon=True,
+                name="startup-callback",
+            ).start()
+
     # Ensure our module logger emits at desired level and propagates to root handler
     try:
         _LOGGER.setLevel(logging.DEBUG if args.debug else logging.INFO)
@@ -1097,6 +1135,24 @@ def create_app(args: argparse.Namespace) -> Flask:
         lp = LivePipeline(dsl=dsl)
         builder = PipelineBuilder(ws, registry, args, live_pipeline=lp)
 
+        # Inject conference mixers referenced in the DSL
+        try:
+            from speech_pipeline.telephony.webclient import get_mixer_for_session
+            from speech_pipeline.telephony.call_state import get_call
+            import re as _re
+            # Inject conference mixers for codec:wc-* sessions
+            for sid in _re.findall(r'codec:(wc-[^\s|]+)', dsl):
+                mixer_name, mixer = get_mixer_for_session(sid)
+                if mixer and mixer_name:
+                    builder._mixers[mixer_name] = mixer
+            # Inject conference mixers for conference:CALL-ID elements
+            for call_id in _re.findall(r'conference:(call-[^\s|:]+)', dsl):
+                call = get_call(call_id)
+                if call:
+                    builder._mixers[call_id] = call.mixer
+        except ImportError:
+            pass
+
         try:
             if "pipe" in config:
                 run = builder.build(config["pipe"])
@@ -1120,7 +1176,7 @@ def create_app(args: argparse.Namespace) -> Flask:
             else:
                 ws.send(_json.dumps({"error": "Config must contain 'pipe' or 'pipes'"}))
         except Exception as e:
-            _LOGGER.warning("ws_pipe error: %s", e)
+            _LOGGER.warning("ws_pipe error: %s", e, exc_info=True)
             try:
                 ws.send(_json.dumps({"error": str(e)}))
             except Exception:
@@ -1202,6 +1258,7 @@ def main() -> None:
     parser.add_argument("--bearer", default="", help="Bearer token for authorizing remote (http/https) downloads/streams")
     parser.add_argument("--whisper-model", default="base", help="Whisper model size for STT (default: base)")
     parser.add_argument("--admin-token", default="", help="Bearer token to enable the /api/ pipeline control endpoints")
+    parser.add_argument("--startup-callback", default="", help="URL to GET on startup (with admin token). The called service provisions PBX/accounts via the API.")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 

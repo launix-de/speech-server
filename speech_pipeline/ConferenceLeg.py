@@ -100,6 +100,7 @@ class ConferenceLeg(Stage):
         t.start()
 
         # Yield conference output to downstream
+        frame_count = 0
         try:
             while not self.cancelled:
                 try:
@@ -110,6 +111,9 @@ class ConferenceLeg(Stage):
                     continue
                 if frame is None:
                     break
+                frame_count += 1
+                if frame_count == 1 or frame_count % 500 == 0:
+                    _LOGGER.info("ConferenceLeg %s: yielded %d frames", self._src_id, frame_count)
                 yield frame
         finally:
             self._mixer.remove_input(in_q)

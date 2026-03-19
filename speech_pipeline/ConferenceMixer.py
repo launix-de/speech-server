@@ -99,8 +99,6 @@ class ConferenceMixer(Stage):
             except Exception as e:
                 _LOGGER.warning("ConferenceMixer '%s' source %s error: %s",
                                 self.name, src_id, e)
-            finally:
-                entry.finished = True
 
         entry.thread = threading.Thread(target=_pump, daemon=True,
                                         name=f"csrc-{src_id}")
@@ -240,7 +238,7 @@ class ConferenceMixer(Stage):
         # Start sink threads
         with self._lock:
             for entry in self._sinks:
-                if entry.thread is None:
+                if entry.thread is None and entry.stage is not None:
                     entry.thread = self._start_sink_thread(entry)
 
         silence = b"\x00" * self.frame_bytes
@@ -264,7 +262,7 @@ class ConferenceMixer(Stage):
             # Step 1: drain queues, extract one frame per source
             frames: Dict[str, bytes] = {}
             for sid, src in sources.items():
-                if src.finished:
+                if src.finished and len(src.buffer) < self.frame_bytes:
                     frames[sid] = silence
                     continue
                 while True:
@@ -319,9 +317,11 @@ class ConferenceMixer(Stage):
         self._has_sources.set()
         with self._lock:
             for src in self._sources.values():
-                src.sink.cancel()
+                if src.sink:
+                    src.sink.cancel()
             for entry in self._sinks:
-                entry.source.cancel()
+                if entry.source:
+                    entry.source.cancel()
         super().cancel()
 
     # ------------------------------------------------------------------

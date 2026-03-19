@@ -1155,6 +1155,7 @@ def create_app(args: argparse.Namespace) -> Flask:
 
         # After build, wire ConferenceLeg callbacks to subscriber events
         def _wire_leg_callbacks(run_obj):
+            _LOGGER.info("_wire_leg_callbacks called with %d stages", len(run_obj.stages))
             try:
                 from speech_pipeline.ConferenceLeg import ConferenceLeg
                 from speech_pipeline.telephony.webclient import get_webclient_session
@@ -1181,8 +1182,11 @@ def create_app(args: argparse.Namespace) -> Flask:
                         participant = call.get_participant(sess["session_id"])
                         callback_path = participant.get("callback") if participant else None
 
+                        _LOGGER.info("_wire: participant=%s callback=%s", sess["session_id"], callback_path)
+
                         def _make_on_attached(sub_info, call_obj, cb_path, part_id):
                             def _on_attached(leg):
+                                _LOGGER.info("on_attached fired for %s cb=%s", part_id, cb_path)
                                 if not cb_path:
                                     return
                                 url = sub_info["base_url"].rstrip("/") + "/" + cb_path.lstrip("/")

@@ -10,9 +10,11 @@ from .util import ffprobe_duration_sec
 class AudioReader(Stage):
     def __init__(self, src_ref: str, bearer: str = "", chunk_seconds: float = 10.0) -> None:
         super().__init__()
+        from .base import AudioFormat
         self.src_ref = src_ref
         self.bearer = bearer
         self.chunk_seconds = float(chunk_seconds)
+        self.output_format = AudioFormat(24000, "s16le")
 
     def estimate_frames_24k(self) -> Optional[int]:
         d = ffprobe_duration_sec(self.src_ref)

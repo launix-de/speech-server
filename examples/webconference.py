@@ -98,11 +98,18 @@ def setup_conference() -> str:
 def add_welcome_tts(call_id: str) -> None:
     """Add a TTS bot that says welcome and auto-removes."""
     piper("POST", f"/api/calls/{call_id}/commands", {
-        "commands": [{
-            "action": "tts",
-            "text": "Herzlich willkommen in der Konferenz!",
-            "voice": "de_DE-thorsten-medium",
-        }],
+        "commands": [
+            {
+                "action": "tts",
+                "text": "Herzlich willkommen in der Konferenz!",
+                "voice": "de_DE-thorsten-medium",
+            },
+            # TODO: remove play command before commit — test only
+            {
+                "action": "play",
+                "url": f"{PIPER_URL}/examples/word-on-beat.mp3",
+            },
+        ],
     }, token=ACCOUNT_TOKEN)
 
 

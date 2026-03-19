@@ -22,6 +22,8 @@ _LOGGER = logging.getLogger("telephony.commands")
 def execute_commands(call: call_state.Call, commands: list) -> None:
     """Execute a list of commands sequentially in a background thread."""
     def _run():
+        import sys
+        print(f"[CMD] execute_commands thread start: {len(commands)} commands for {call.call_id}", file=sys.stderr, flush=True)
         _LOGGER.info("execute_commands thread start: %d commands for %s",
                      len(commands), call.call_id)
         for cmd in commands:
@@ -110,11 +112,23 @@ def _cmd_tts(call: call_state.Call, cmd: dict) -> None:
             producer = TTSProducer(voice_obj, synth_config, text, sentence_silence=0.0)
             src_id = call.mixer.add_source(producer)
 
-            # add_source starts a pump thread — wait for it to finish
+            # add_source starts a pump thread — wait for it to finish.
+            # The pump thread pushes all TTS frames into the mixer queue
+            # then sends EOF (None). The mixer reads them at real-time
+            # pace. We wait for the source to be marked finished by the
+            # mixer (all frames consumed), not just for the pump to end.
             src = call.mixer._sources.get(src_id)
             if src and src.thread:
                 src.thread.join()
-
+            # Wait for mixer to consume all buffered frames
+            if src:
+                import sys
+                print(f"[TTS] waiting: finished={src.finished} buffer={len(src.buffer)} frame_bytes={call.mixer.frame_bytes}", file=sys.stderr, flush=True)
+                while not call.mixer.cancelled:
+                    if src.finished and len(src.buffer) < call.mixer.frame_bytes:
+                        break
+                    time.sleep(0.05)
+                print(f"[TTS] done waiting: finished={src.finished} buffer={len(src.buffer)}", file=sys.stderr, flush=True)
             call.mixer.remove_source(src_id)
         except Exception as e:
             _LOGGER.warning("TTS failed for call %s: %s", call.call_id, e)
@@ -144,13 +158,17 @@ def _cmd_play(call: call_state.Call, cmd: dict) -> None:
 
     def _run():
         try:
-            reader = AudioReader(url, target_sample_rate=call_state.MIXER_SAMPLE_RATE)
+            reader = AudioReader(url)
             src_id = call.mixer.add_source(reader)
 
             src = call.mixer._sources.get(src_id)
             if src and src.thread:
                 src.thread.join()
-
+            if src:
+                while not call.mixer.cancelled:
+                    if src.finished and len(src.buffer) < call.mixer.frame_bytes:
+                        break
+                    time.sleep(0.05)
             call.mixer.remove_source(src_id)
         except Exception as e:
             _LOGGER.warning("Play failed for call %s: %s", call.call_id, e)

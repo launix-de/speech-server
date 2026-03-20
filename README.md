@@ -20,6 +20,8 @@ echo "Hallo Welt" | speech-pipeline run "cli:text | tts:de_DE-thorsten-medium | 
 
 **Pipeline DSL** -- Describe complex audio flows as simple text: `ws:pcm | resample:48000:16000 | stt:de | ws:ndjson`. The builder wires up all the stages, converters, and adapters automatically.
 
+**Telephony Platform** -- Multi-tenant conferencing with PBX management, SIP legs, browser participants, hold music, DTMF, live STT, and webhook-driven call control. Full REST API for accounts, subscribers, and call commands.
+
 **SIP Bridge** -- Dial into Asterisk conferences as a bot with full-duplex STT/TTS. Transcribe what others say, speak generated text back.
 
 **Fourier Codec** -- Custom FFT-based audio codec with four quality profiles (low/medium/high/full) for compressed real-time audio over WebSockets.
@@ -180,6 +182,7 @@ CLI                 TTS:            cli:text | tts:de_DE-thorsten-medium | cli:r
 | `CLIReader` | `speech_pipeline.CLIReader` | Text lines from stdin. |
 | `QueueSource` | `speech_pipeline.QueueSource` | PCM from a `queue.Queue`. Bridge for AudioTee/AudioMixer. |
 | `AudioMixer` | `speech_pipeline.AudioMixer` | Mixes N input queues. Hot-pluggable. |
+| `ConferenceMixer` | `speech_pipeline.ConferenceMixer` | N-to-M mixer with atomic per-sink mix-minus (echo cancellation). Real-time paced. |
 | `CodecSocketSource` | `speech_pipeline.CodecSocketSource` | Decoded PCM from Fourier codec WebSocket. |
 
 #### Processors (transform PCM, have upstream)
@@ -191,6 +194,8 @@ CLI                 TTS:            cli:text | tts:de_DE-thorsten-medium | cli:r
 | `SampleRateConverter` | `speech_pipeline.SampleRateConverter` | Resampling via audioop (zero-latency). No-op when rates match. |
 | `EncodingConverter` | `speech_pipeline.EncodingConverter` | s16le <-> u8. Auto-inserted by `pipe()`. |
 | `AudioTee` | `speech_pipeline.AudioTee` | Pass-through with side-chain sinks via queues. Hot-pluggable. |
+| `ConferenceLeg` | `speech_pipeline.ConferenceLeg` | Bidirectional conference participant with mix-minus output. |
+| `MixMinus` | `speech_pipeline.MixMinus` | Subtract own audio from full mix (manual mix-minus). |
 | `GainStage` | `speech_pipeline.GainStage` | Runtime-adjustable volume. |
 | `DelayLine` | `speech_pipeline.DelayLine` | Runtime-adjustable audio delay. |
 
@@ -206,6 +211,8 @@ CLI                 TTS:            cli:text | tts:de_DE-thorsten-medium | cli:r
 | `CLIWriter` | `speech_pipeline.CLIWriter` | NDJSON, text, or raw binary to stdout. |
 | `FileRecorder` | `speech_pipeline.FileRecorder` | Records PCM to file (MP3/WAV/OGG) via ffmpeg. |
 | `CodecSocketSink` | `speech_pipeline.CodecSocketSink` | Encodes PCM to Fourier codec frames. |
+| `QueueSink` | `speech_pipeline.QueueSink` | Drains a stage pipeline into a `queue.Queue`. |
+| `WebhookSink` | `speech_pipeline.WebhookSink` | POST NDJSON lines to an HTTP endpoint (e.g. STT transcription). |
 
 #### Utilities
 
@@ -219,6 +226,7 @@ CLI                 TTS:            cli:text | tts:de_DE-thorsten-medium | cli:r
 | `SIPSession` | `speech_pipeline.SIPSession` | pyVoIP lifecycle manager. |
 | `CodecSocketSession` | `speech_pipeline.CodecSocketSession` | WebSocket session for Fourier codec. |
 | `fourier_codec` | `speech_pipeline.fourier_codec` | FFT-based codec with multi-profile support. |
+| `telephony` | `speech_pipeline.telephony` | Multi-tenant telephony platform (PBX, accounts, calls, commands). |
 
 ## CLI Reference
 
@@ -265,6 +273,7 @@ Each element: `type:param1:param2`
 | `gain` | FACTOR | GainStage (1.0 = unity) |
 | `delay` | MS | DelayLine |
 | `codec` | ID or ID:PROFILE | CodecSocketSource / CodecSocketSink |
+| `conference` | CALL_ID | ConferenceLeg (bidirectional mix-minus participant) |
 
 ### Example DSL Pipelines
 
@@ -384,6 +393,111 @@ TX: CLIReader --> StreamingTTSProducer --> SampleRateConverter(native->8k) --> S
 
 SIP stages require `pyVoIP` (`pip install pyVoIP`).
 
+## Telephony Platform
+
+Multi-tenant conferencing platform with PBX integration, subscriber webhooks, and browser-based participation. All telephony API endpoints live under `/api/` and require `--admin-token` to be set.
+
+### Architecture
+
+```
+Subscriber App ──webhook──► speech-pipeline ──SIP──► Asterisk PBX
+                                │                        │
+                                ├── ConferenceMixer ◄────┘
+                                │       │
+                                ├── TTS/STT/Play (as conference sources/sinks)
+                                │
+                                └── WebClient (browser via Fourier codec)
+```
+
+Each call owns a `ConferenceMixer` that handles N-to-M audio mixing with per-sink mix-minus (echo cancellation). Participants (SIP legs, TTS, STT, browser clients) connect as sources and sinks.
+
+### Telephony API
+
+#### PBX Management (admin-only)
+
+```
+PUT    /api/pbx/<pbx_id>       Register/update PBX (sip_proxy, ari_url, credentials)
+GET    /api/pbx                List all PBX connections
+DELETE /api/pbx/<pbx_id>       Remove PBX and stop its SIP listener
+```
+
+#### Account Management (admin-only)
+
+```
+PUT    /api/accounts/<id>      Register account (token, PBX pin, features, call limits)
+GET    /api/accounts            List accounts
+GET    /api/accounts/<id>      Account details
+DELETE /api/accounts/<id>      Delete account and its subscribers
+```
+
+#### Subscriber Management (account-scoped)
+
+```
+PUT    /api/subscribe/<id>     Register subscriber (base_url, bearer_token, DIDs, events)
+GET    /api/subscribers         List subscribers
+GET    /api/subscribers/<id>   Subscriber details (includes liveliness status)
+DELETE /api/subscribers/<id>   Unsubscribe
+```
+
+#### Call Management (account-scoped)
+
+```
+POST   /api/calls              Create call/conference
+GET    /api/calls              List calls
+GET    /api/calls/<id>         Call details (participants, status)
+POST   /api/calls/<id>/commands  Execute commands (async)
+GET    /api/calls/<id>/participants  List participants
+DELETE /api/calls/<id>         End call
+```
+
+#### Leg Management (account-scoped)
+
+```
+GET    /api/legs               List SIP legs
+GET    /api/legs/<id>          Leg details
+DELETE /api/legs/<id>          Hang up leg
+POST   /api/legs/<id>/bridge   Bridge leg into conference
+POST   /api/legs/originate     Originate outbound call into existing conference
+```
+
+#### Nonce Management (for webclient iframe auth)
+
+```
+POST   /api/nonce              Create nonce (1h TTL)
+GET    /api/nonces             List nonces
+DELETE /api/nonce/<nonce>      Revoke nonce
+```
+
+### Call Commands
+
+Commands are sent via `POST /api/calls/<id>/commands` and execute asynchronously. Subscribers receive results via webhook callbacks.
+
+| Command | Description | Key Params |
+|---------|-------------|------------|
+| `originate` | Create outbound SIP leg, bridge into conference | `to`, `callbacks` |
+| `add_leg` | Bridge existing inbound leg into conference | `leg_id`, `callbacks` |
+| `tts` | Speak text into conference (fire-and-forget) | `text`, `voice`, `callback` |
+| `play` | Play audio file into conference (supports loop & volume) | `url`, `loop`, `volume`, `callback` |
+| `stop_play` | Stop looping playback instantly | `participant_id` |
+| `hangup` | Hang up a leg or entire call | `leg_id` (optional) |
+| `transfer` | Move participant between conferences | `participant_id`, `target_call_id` |
+| `dtmf` | Send DTMF tones inband | `digits`, `duration_ms` |
+| `stt_start` | Start live STT, POST transcripts to webhook | `language`, `model`, `callback` |
+| `stt_stop` | Stop STT | -- |
+| `webclient` | Create browser participant slot with iframe URL | `user`, `callback`, `base_url` |
+
+### WebClient
+
+Browser-based conference participation via Fourier codec WebSocket. The webclient command returns an iframe URL with a nonce-authenticated phone UI. Internally, the browser connects as:
+
+```
+codec:SESSION | conference:CALL | codec:SESSION
+```
+
+### Subscriber Webhooks
+
+Events (incoming call, leg answered/completed, etc.) are delivered as HTTP POST to `subscriber.base_url`. The subscriber can respond with `{"commands": [...]}` to chain further operations.
+
 ## Cluster Architecture
 
 For high-throughput deployments, speech-pipeline supports horizontal scaling across multiple nodes.
@@ -458,6 +572,7 @@ Browse all voices: https://github.com/rhasspy/piper/blob/master/VOICES.md
 | STT | `examples/stt.html` | Microphone -> WebSocket STT -> transcript display |
 | STS | `examples/sts.html` | Microphone -> STT -> TTS -> speaker (robot voice) |
 | Codec | `examples/codec-demo.html` | Mic -> Fourier codec -> WS -> server -> decode -> playback |
+| Conference | `examples/webconference.py` | Multi-user conference with STT, TTS, hold music, webclient |
 
 Open via `https://server/tts/examples/stt.html?api=https://server/tts`
 

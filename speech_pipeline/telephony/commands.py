@@ -95,13 +95,14 @@ def _cmd_tts(call: call_state.Call, cmd: dict) -> None:
     text = cmd.get("text", "")
     voice = cmd.get("voice", "de_DE-thorsten-medium")
     callback = cmd.get("callback")
+    callback_data = cmd.get("callback_data", {})
     pid = "tts-" + secrets.token_urlsafe(8)
 
     registry = _shared.tts_registry
     if not registry or not text:
         _LOGGER.warning("TTS failed: registry=%s text=%s", registry, text[:20] if text else None)
         _send_callback(call, callback, pid, "tts", "failed",
-                       error="no text or TTS unavailable")
+                       error="no text or TTS unavailable", **callback_data)
         return
 
     call.register_participant(pid, type="tts", text=text[:80])
@@ -116,12 +117,13 @@ def _cmd_tts(call: call_state.Call, cmd: dict) -> None:
             call.mixer.remove_source(src_id)
         except Exception as e:
             _LOGGER.warning("TTS failed for call %s: %s", call.call_id, e)
-            _send_callback(call, callback, pid, "tts", "failed", error=str(e))
+            _send_callback(call, callback, pid, "tts", "failed",
+                           error=str(e), **callback_data)
             return
         finally:
             call.unregister_participant(pid)
 
-        _send_callback(call, callback, pid, "tts", "finished")
+        _send_callback(call, callback, pid, "tts", "finished", **callback_data)
 
     threading.Thread(target=_run, daemon=True, name=f"tts-{pid}").start()
 
@@ -392,7 +394,9 @@ def _cmd_webclient(call: call_state.Call, cmd: dict) -> None:
     nonce = nonce_entry["nonce"]
 
     # Register webclient session (creates DSL, session_id etc.)
-    sess = wc.register_webclient(call, user, nonce)
+    sess = wc.register_webclient(call, user, nonce,
+                                  dsl=cmd.get("dsl"),
+                                  pipes=cmd.get("pipes"))
     session_id = sess["session_id"]
 
     call.register_participant(session_id, type="webclient", user=user,

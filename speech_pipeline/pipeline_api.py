@@ -84,10 +84,19 @@ def create_pipeline():
 
     pipeline = registry.LivePipeline(dsl=dsl)
     builder = PipelineBuilder(ws=None, registry=tts_registry, args=args, live_pipeline=pipeline)
+
+    # Inject conference mixers so DSL can reference live conferences
+    from .PipelineBuilder import inject_conference_mixers
+    inject_conference_mixers(builder, dsl)
+
     try:
         run = builder.build(dsl)
     except Exception as e:
         return (f"Build error: {e}\n", 400)
+
+    # Propagate text_input queue to LivePipeline for API access
+    if hasattr(builder, '_text_input_queue'):
+        pipeline._text_input_queue = builder._text_input_queue
 
     pipeline.run = run
     pipeline.state = "running"
@@ -107,6 +116,31 @@ def create_pipeline():
     t.start()
 
     return jsonify(pipeline.to_dict(detail=True)), 201
+
+
+@api.route("/pipelines/<pid>/input", methods=["POST"])
+@_require_auth
+def pipeline_input(pid: str):
+    """Feed text into a running pipeline's text_input stage.
+
+    Body: ``{"text": "Hello"}`` to feed text, ``{"eof": true}`` to end.
+    """
+    p = registry.get(pid)
+    if not p:
+        return ("Pipeline not found\n", 404)
+
+    q = getattr(p, '_text_input_queue', None)
+    if q is None:
+        return ("Pipeline has no text_input stage\n", 422)
+
+    body = request.get_json(force=True, silent=True) or {}
+    text = body.get("text", "")
+    if text:
+        q.put(text)
+    if body.get("eof"):
+        q.put(None)
+
+    return jsonify({"ok": True})
 
 
 @api.route("/pipelines/<pid>", methods=["DELETE"])

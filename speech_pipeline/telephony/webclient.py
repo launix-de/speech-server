@@ -32,12 +32,25 @@ _sessions: dict = {}
 
 
 def register_webclient(call: call_state.Call, user: str,
-                        nonce: str) -> dict:
-    """Register a webclient session. Returns session info with DSL."""
+                        nonce: str, dsl: str = None,
+                        pipes: list = None) -> dict:
+    """Register a webclient session. Returns session info with DSL.
+
+    If *dsl* or *pipes* is given, ``{session_id}`` and ``{call_id}``
+    placeholders are substituted.  Otherwise the default bidirectional
+    codec-conference pipeline is used.
+    """
     session_id = "wc-" + secrets.token_urlsafe(8)
 
-    # Single DSL: codec → conference (auto mix-minus) → codec
-    dsl = f"codec:{session_id} | conference:{call.call_id} | codec:{session_id}"
+    if pipes:
+        resolved = [p.replace("{session_id}", session_id)
+                      .replace("{call_id}", call.call_id) for p in pipes]
+        dsl = json.dumps({"pipes": resolved})
+    elif dsl:
+        dsl = (dsl.replace("{session_id}", session_id)
+                  .replace("{call_id}", call.call_id))
+    else:
+        dsl = f"codec:{session_id} | conference:{call.call_id} | codec:{session_id}"
 
     entry = {
         "session_id": session_id,
@@ -153,7 +166,7 @@ function start() {
 
   // 1. Get mic permission FIRST — before opening any WebSockets
   navigator.mediaDevices.getUserMedia({
-    audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false }
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
   }).then(function(stream) {
     // Mic granted — now open pipeline + codec
     statusEl.textContent = 'Connecting…';
@@ -169,7 +182,8 @@ function openPipeline(micStream) {
   pipeWs.binaryType = 'arraybuffer';
 
   pipeWs.onopen = function () {
-    pipeWs.send(JSON.stringify({ pipe: dsl }));
+    var config = (dsl.charAt(0) === '{') ? JSON.parse(dsl) : { pipe: dsl };
+    pipeWs.send(JSON.stringify(config));
     statusEl.textContent = 'Pipeline started…';
     connectCodec(micStream);
   };

@@ -1136,22 +1136,8 @@ def create_app(args: argparse.Namespace) -> Flask:
         builder = PipelineBuilder(ws, registry, args, live_pipeline=lp)
 
         # Inject conference mixers referenced in the DSL
-        try:
-            from speech_pipeline.telephony.webclient import get_mixer_for_session
-            from speech_pipeline.telephony.call_state import get_call
-            import re as _re
-            # Inject conference mixers for codec:wc-* sessions
-            for sid in _re.findall(r'codec:(wc-[^\s|]+)', dsl):
-                mixer_name, mixer = get_mixer_for_session(sid)
-                if mixer and mixer_name:
-                    builder._mixers[mixer_name] = mixer
-            # Inject conference mixers for conference:CALL-ID elements
-            for call_id in _re.findall(r'conference:(call-[^\s|:]+)', dsl):
-                call = get_call(call_id)
-                if call:
-                    builder._mixers[call_id] = call.mixer
-        except ImportError:
-            pass
+        from speech_pipeline.PipelineBuilder import inject_conference_mixers
+        inject_conference_mixers(builder, dsl)
 
         # After build, wire ConferenceLeg callbacks to subscriber events
         def _wire_leg_callbacks(run_obj):
@@ -1161,6 +1147,7 @@ def create_app(args: argparse.Namespace) -> Flask:
                 from speech_pipeline.telephony.webclient import get_webclient_session
                 from speech_pipeline.telephony import call_state as _cs, subscriber as _sub, commands as _cmd
                 import requests as _http
+                import re as _re
 
                 leg_count = sum(1 for s in run_obj.stages if isinstance(s, ConferenceLeg))
                 _LOGGER.info("_wire_leg_callbacks: %d legs in %d stages, dsl=%s",
@@ -1191,12 +1178,17 @@ def create_app(args: argparse.Namespace) -> Flask:
                                     return
                                 url = sub_info["base_url"].rstrip("/") + "/" + cb_path.lstrip("/")
                                 try:
-                                    _http.post(url, json={
+                                    resp = _http.post(url, json={
                                         "callId": call_obj.call_id,
                                         "command": "webclient",
                                         "participantId": part_id,
                                         "result": "joined",
                                     }, headers={"Authorization": f"Bearer {sub_info['bearer_token']}"}, timeout=5)
+                                    if resp.status_code == 200 and resp.content:
+                                        body = resp.json()
+                                        cmds = body.get("commands", [])
+                                        if cmds:
+                                            _cmd.execute_commands(call_obj, cmds)
                                 except Exception:
                                     pass
                             return _on_attached
@@ -1209,21 +1201,26 @@ def create_app(args: argparse.Namespace) -> Flask:
                                     return
                                 url = sub_info["base_url"].rstrip("/") + "/" + cb_path.lstrip("/")
                                 try:
-                                    _http.post(url, json={
+                                    resp = _http.post(url, json={
                                         "callId": call_obj.call_id,
                                         "command": "webclient",
                                         "participantId": part_id,
                                         "result": "left",
                                     }, headers={"Authorization": f"Bearer {sub_info['bearer_token']}"}, timeout=5)
+                                    if resp.status_code == 200 and resp.content:
+                                        body = resp.json()
+                                        cmds = body.get("commands", [])
+                                        if cmds:
+                                            _cmd.execute_commands(call_obj, cmds)
                                 except Exception:
                                     pass
                             return _on_detached
 
                         stage.on_detached = _make_on_detached(sub, call, callback_path, sess["session_id"])
-            except ImportError:
-                pass
+            except ImportError as e:
+                _LOGGER.warning("_wire_leg_callbacks import error: %s", e)
             except Exception as e:
-                _LOGGER.warning("_wire_leg_callbacks error: %s", e)
+                _LOGGER.warning("_wire_leg_callbacks error: %s", e, exc_info=True)
 
         try:
             if "pipe" in config:

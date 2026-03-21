@@ -81,6 +81,10 @@ class WhisperTranscriber(Stage):
         self.input_format = AudioFormat(sample_rate, "s16le")
         self.output_format = AudioFormat(0, "ndjson")
 
+    def ensure_model_loaded(self) -> None:
+        """Pre-load the Whisper model so stream_pcm24k() starts instantly."""
+        _get_model(self.model_size)
+
     def stream_pcm24k(self) -> Iterator[bytes]:
         """Yields NDJSON lines (as bytes) instead of PCM.
 

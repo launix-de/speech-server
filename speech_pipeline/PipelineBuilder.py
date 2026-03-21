@@ -10,6 +10,29 @@ from .base import Stage
 _LOGGER = logging.getLogger("pipeline-builder")
 
 
+def inject_conference_mixers(builder: "PipelineBuilder", dsl: str) -> None:
+    """Inject conference mixers for known session/call patterns.
+
+    Scans the DSL for ``codec:wc-*`` and ``conference:call-*`` patterns
+    and injects the corresponding mixers into the builder so the pipeline
+    can connect to live conferences.
+    """
+    import re
+    try:
+        from .telephony.webclient import get_mixer_for_session
+        from .telephony.call_state import get_call
+        for sid in re.findall(r'codec:(wc-[^\s|]+)', dsl):
+            mixer_name, mixer = get_mixer_for_session(sid)
+            if mixer and mixer_name:
+                builder._mixers[mixer_name] = mixer
+        for call_id in re.findall(r'conference:(call-[^\s|:]+)', dsl):
+            call = get_call(call_id)
+            if call:
+                builder._mixers[call_id] = call.mixer
+    except ImportError:
+        pass
+
+
 class PipelineRun:
     """Encapsulates a runnable pipeline with cancel support."""
 
@@ -234,14 +257,10 @@ class PipelineBuilder:
                     raise ValueError("cli element can only appear at start or end of pipeline")
 
             elif typ == "resample":
-                from .SampleRateConverter import SampleRateConverter
-                src = int(params[0]) if len(params) > 0 else 48000
-                dst = int(params[1]) if len(params) > 1 else 16000
-                stage = SampleRateConverter(src, dst)
-                if current_stage:
-                    current_stage.pipe(stage)
-                current_stage = stage
-                run.stages.append(stage)
+                raise ValueError(
+                    "resample is not needed — pipe() inserts sample rate "
+                    "conversion automatically when formats differ"
+                )
                 current_output_type = "pcm"
 
             elif typ == "stt":
@@ -250,6 +269,7 @@ class PipelineBuilder:
                 chunk_seconds = float(params[1]) if len(params) > 1 else 3.0
                 model_size = params[2] if len(params) > 2 else getattr(self.args, "whisper_model", "small")
                 stage = WhisperTranscriber(model_size, chunk_seconds=chunk_seconds, language=lang)
+                stage.ensure_model_loaded()
                 if current_stage:
                     current_stage.pipe(stage)
                 current_stage = stage
@@ -572,32 +592,97 @@ class PipelineBuilder:
                 current_stage = mm
 
             elif typ == "conference":
-                # conference:ID — join a ConferenceMixer as bidirectional participant.
+                # conference:ID — connect to a ConferenceMixer.
                 #
-                # Usage: codec:x | conference:myconf | codec:x
-                #   input | conference:id          → add source only
-                #   conference:id | output         → unmuted output only
-                #   input | conference:id | output → source + muted output
+                # Adapts automatically based on position:
+                #   input | conference:id          → add_source (producer only)
+                #   conference:id | output         → add_sink (consumer only)
+                #   input | conference:id | output → ConferenceLeg (bidirectional)
                 if not params:
                     raise ValueError("conference requires a mixer name")
                 conf_name = params[0]
 
                 from .ConferenceMixer import ConferenceMixer
-                from .ConferenceLeg import ConferenceLeg
 
                 conf = self._mixers.get(conf_name)
                 if not conf or not isinstance(conf, ConferenceMixer):
                     raise ValueError(f"Conference '{conf_name}' not found or not a ConferenceMixer")
 
-                leg = ConferenceLeg(sample_rate=conf.sample_rate)
-                leg.attach(conf)
+                has_upstream = current_stage is not None and current_output_type == "pcm"
 
-                if current_stage and current_output_type == "pcm":
-                    current_stage.pipe(leg)
+                if has_upstream and is_last:
+                    # Source only: pipe upstream into conference via add_source
+                    src_id = conf.add_source(current_stage)
+                    # Block until source is consumed
+                    def _make_wait(c, s):
+                        def _wait():
+                            c.wait_source(s)
+                            c.remove_source(s)
+                        return _wait
+                    run._run_fn = _make_wait(conf, src_id)
+                    current_stage = None
+                    current_output_type = None
 
-                run.stages.append(leg)
-                current_stage = leg
-                current_output_type = "pcm"
+                elif not has_upstream and not is_last:
+                    # Sink only: read from conference mix
+                    conf_q = conf.add_output()
+                    from .QueueSource import QueueSource
+                    src = QueueSource(conf_q, conf.sample_rate, "s16le")
+                    run.stages.append(src)
+                    current_stage = src
+                    current_output_type = "pcm"
+
+                else:
+                    # Bidirectional: ConferenceLeg
+                    from .ConferenceLeg import ConferenceLeg
+                    leg = ConferenceLeg(sample_rate=conf.sample_rate)
+                    leg.attach(conf)
+                    if has_upstream:
+                        current_stage.pipe(leg)
+                    run.stages.append(leg)
+                    current_stage = leg
+                    current_output_type = "pcm"
+
+            elif typ == "webhook":
+                # webhook:URL or webhook:URL:BEARER — POST NDJSON to HTTP
+                if not is_last:
+                    raise ValueError("webhook can only appear at the end of a pipeline")
+                if not params:
+                    raise ValueError("webhook requires a URL")
+                # Rejoin params to reconstruct URL (split on : breaks http://)
+                url = ":".join(params)
+                bearer = ""
+                # If last param looks like a token (no / or .), treat as bearer
+                if len(params) > 2 and "/" not in params[-1] and "." not in params[-1]:
+                    bearer = params[-1]
+                    url = ":".join(params[:-1])
+                from .WebhookSink import WebhookSink
+                sink = WebhookSink(url=url, bearer_token=bearer)
+                if current_stage:
+                    current_stage.pipe(sink)
+                run.stages.append(sink)
+                run._run_fn = sink.run
+
+            elif typ == "text_input":
+                # text_input — queue-backed text source for API-driven TTS
+                if not is_first:
+                    raise ValueError("text_input must be at the start of a pipeline")
+                import queue as _queue
+                q = _queue.Queue()
+
+                def _make_text_iter(q):
+                    def _iter():
+                        while True:
+                            item = q.get()
+                            if item is None:
+                                break
+                            yield item
+                    return _iter()
+
+                current_text_iter = _make_text_iter(q)
+                current_output_type = "text"
+                current_stage = None
+                self._text_input_queue = q
 
             else:
                 raise ValueError(f"Unknown pipeline element: {typ}")

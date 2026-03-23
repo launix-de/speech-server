@@ -170,6 +170,15 @@ def _find_free_rtp_port(start: int = 10000, end: int = 20000) -> int:
 # ---------------------------------------------------------------------------
 
 
+def _find_free_port() -> int:
+    """Find a free UDP port for RTP."""
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.bind(("", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
 def _build_sdp(ip: str, rtp_port: int) -> str:
     session_id = str(random.randint(100000, 999999))
     return (
@@ -838,8 +847,10 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
         return
 
     # Call CRM to get HA1
+    # Use the raw sip_user (as the SIP client sees it) for digest computation
+    raw_sip_user = auth_params.get("username", sip_user)
     realm = auth_params.get("realm", "")
-    ha1_info = _crm_login(subscriber, username, realm, sip_user)
+    ha1_info = _crm_login(subscriber, username, realm, raw_sip_user)
     if not ha1_info:
         resp = _build_response(403, "Forbidden", msg, to_tag=_gen_tag())
         _send(resp, addr)
@@ -921,9 +932,10 @@ def _split_sip_user(sip_user: str) -> Tuple[str, str]:
 
 
 def _find_subscriber_by_base_url(base_url: str) -> Optional[dict]:
-    """Find a subscriber whose base_url matches."""
+    """Find a subscriber whose base_url matches (ignoring trailing slash)."""
+    base_url = base_url.rstrip("/")
     for sub in sub_mod.list_all():
-        if sub.get("base_url") == base_url:
+        if sub.get("base_url", "").rstrip("/") == base_url:
             return sub
     return None
 
@@ -971,8 +983,29 @@ def _crm_login(
 # ---------------------------------------------------------------------------
 
 
+def _is_from_trunk(addr: Tuple[str, int]) -> Optional[str]:
+    """Check if an INVITE comes from a registered trunk. Returns pbx_id or None."""
+    with _trunks_lock:
+        for pbx_id, trunk in _trunks.items():
+            # Match by server IP (resolve hostname)
+            try:
+                trunk_ip = socket.gethostbyname(trunk.server)
+            except Exception:
+                trunk_ip = trunk.server
+            if addr[0] == trunk_ip:
+                return pbx_id
+    return None
+
+
 def _handle_inbound_invite(msg: dict, addr: Tuple[str, int]) -> None:
-    """Handle INVITE addressed to a registered client device."""
+    """Handle inbound INVITE — either from trunk (incoming call) or to a registered device."""
+    # Check if this INVITE comes from a trunk PBX
+    pbx_id = _is_from_trunk(addr)
+    if pbx_id:
+        _handle_trunk_invite(msg, addr, pbx_id)
+        return
+
+    # Otherwise: route to registered device
     to_h = _get_header(msg, "to")
     to_uri = _extract_uri(to_h)
     target_user = _extract_user(to_uri)
@@ -998,10 +1031,33 @@ def _handle_inbound_invite(msg: dict, addr: Tuple[str, int]) -> None:
         return
 
     _LOGGER.info("Routing INVITE for %s to %s", target_user, reg.contact_uri)
-
-    # Forward the INVITE to the registered device
-    # We act as a stateful proxy: rewrite Via, add our own, forward
     _proxy_invite(msg, addr, reg)
+
+
+def _handle_trunk_invite(msg: dict, addr: Tuple[str, int], pbx_id: str) -> None:
+    """Handle incoming call from a trunk PBX — delegate to sip_listener logic."""
+    from_h = _get_header(msg, "from")
+    to_h = _get_header(msg, "to")
+    caller = _extract_user(_extract_uri(from_h))
+    callee = _extract_user(_extract_uri(to_h))
+
+    _LOGGER.info("Trunk INVITE on %s: %s → %s", pbx_id, caller, callee)
+
+    # Send 200 OK (we handle the call ourselves via conference)
+    to_tag = _gen_tag()
+    # Generate SDP with an RTP port for the inbound audio
+    rtp_port = _find_free_port()
+    sdp = _build_sdp(_local_ip, rtp_port)
+    resp = _build_response(200, "OK", msg, to_tag=to_tag, body=sdp)
+    _send(resp, addr)
+
+    # Delegate to sip_listener for subscriber lookup + CRM webhook
+    from . import sip_listener
+    threading.Thread(
+        target=sip_listener._handle_trunk_call,
+        args=(pbx_id, caller, callee, msg, addr, rtp_port),
+        daemon=True,
+    ).start()
 
 
 def _proxy_invite(
@@ -1256,6 +1312,62 @@ def call(pbx_id: str, target: str) -> SIPCall:
     return call_obj
 
 
+def call_device(sip_user: str, reg: dict) -> SIPCall:
+    """Originate a call directly to a registered SIP device.
+
+    Sends INVITE to the device's contact URI (from registration).
+    No trunk needed — direct SIP signaling.
+    """
+    contact_uri = reg["contact_uri"]
+    # Parse contact URI: sip:user@host:port
+    m = re.match(r"sip:([^@]+)@([^:;>]+)(?::(\d+))?", contact_uri)
+    if not m:
+        raise ValueError(f"Invalid contact URI: {contact_uri}")
+    device_host = m.group(2)
+    device_port = int(m.group(3)) if m.group(3) else 5060
+
+    rtp_port = _find_free_rtp_port()
+    call_id = _gen_call_id()
+    call_obj = SIPCall(
+        call_id=call_id,
+        local_rtp_port=rtp_port,
+        _local_tag=_gen_tag(),
+        _remote_addr=(device_host, device_port),
+    )
+
+    with _calls_lock:
+        _calls[call_id] = call_obj
+
+    # Build and send INVITE directly to device
+    sdp = _build_sdp(_local_ip, rtp_port)
+    branch = _gen_branch()
+    call_obj._cseq = 1
+
+    from_uri = f"sip:conference@{_local_ip}"
+    to_uri = contact_uri
+    call_obj._to_header = f"<{to_uri}>"
+
+    invite = (
+        f"INVITE {to_uri} SIP/2.0\r\n"
+        f"Via: SIP/2.0/UDP {_local_ip}:{_sip_port};branch={branch};rport\r\n"
+        f"Max-Forwards: 70\r\n"
+        f"From: <{from_uri}>;tag={call_obj._local_tag}\r\n"
+        f"To: <{to_uri}>\r\n"
+        f"Call-ID: {call_id}\r\n"
+        f"CSeq: 1 INVITE\r\n"
+        f"Contact: <sip:{_local_ip}:{_sip_port}>\r\n"
+        f"Content-Type: application/sdp\r\n"
+        f"User-Agent: tts-piper-sip\r\n"
+        f"Content-Length: {len(sdp)}\r\n"
+        f"\r\n{sdp}"
+    )
+
+    _send(invite, (device_host, device_port))
+    _LOGGER.info("Call %s: INVITE sent directly to device %s (%s:%d)",
+                 call_id, sip_user, device_host, device_port)
+    return call_obj
+
+
 def get_registration(sip_user: str) -> Optional[dict]:
     """Look up a registered client device by SIP username.
 
@@ -1263,11 +1375,19 @@ def get_registration(sip_user: str) -> Optional[dict]:
     or None if not registered / expired.
     """
     with _registrations_lock:
-        reg = _registrations.get(sip_user)
+        from urllib.parse import unquote
+        needle = unquote(sip_user)
+        reg = None
+        reg_key = None
+        for key, r in _registrations.items():
+            if unquote(key) == needle:
+                reg = r
+                reg_key = key
+                break
         if not reg:
             return None
         if reg.expires < time.time():
-            del _registrations[sip_user]
+            del _registrations[reg_key]
             return None
         return {
             "sip_user": reg.sip_user,

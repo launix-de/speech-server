@@ -120,6 +120,14 @@ def get_call(call_id: str) -> Optional[Call]:
 def delete_call(call_id: str) -> bool:
     call = _calls.get(call_id)
     if call:
+        # Hang up all SIP legs associated with this call
+        from . import leg as leg_mod
+        for lg in leg_mod.list_legs():
+            if lg.call_id == call_id:
+                try:
+                    leg_mod.delete_leg(lg.leg_id)
+                except Exception:
+                    pass
         call.end()
         del _calls[call_id]
         return True

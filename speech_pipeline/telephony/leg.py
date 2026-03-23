@@ -187,9 +187,17 @@ def originate_and_bridge(leg: Leg, call, pbx_entry: dict) -> None:
 
     try:
         from . import sip_stack
-        if sip_stack._running:
-            _originate_sip_stack(leg, call, pbx_entry)
+        # SIP URI with @ → check if registered device on our registrar
+        if sip_stack._running and "@" in leg.number:
+            from urllib.parse import unquote
+            sip_user = unquote(leg.number)
+            reg = sip_stack.get_registration(sip_user)
+            if reg:
+                _originate_to_device(leg, call, reg)
+            else:
+                raise RuntimeError(f"SIP device {sip_user} not registered")
         else:
+            # Phone number → via pyVoIP trunk (has RTP)
             _originate_pyvoip(leg, call, pbx_entry)
     except Exception as e:
         _LOGGER.warning("Originate %s failed: %s", leg.number, e)
@@ -198,12 +206,13 @@ def originate_and_bridge(leg: Leg, call, pbx_entry: dict) -> None:
         delete_leg(leg.leg_id)
 
 
-def _originate_sip_stack(leg: Leg, call, pbx_entry: dict) -> None:
-    """Originate via built-in SIP stack."""
+def _originate_to_device(leg: Leg, call, reg: dict) -> None:
+    """Originate to a registered SIP device via our registrar."""
     from . import sip_stack
 
-    _LOGGER.info("Originate %s via SIP stack on PBX %s", leg.number, leg.pbx_id)
-    sip_call = sip_stack.call(leg.pbx_id, leg.number)
+    _LOGGER.info("Originate %s to registered device %s",
+                 leg.number, reg.get("contact_uri", "?"))
+    sip_call = sip_stack.call_device(leg.number, reg)
 
     # Wait for answer (up to 30s)
     deadline = time.time() + 30

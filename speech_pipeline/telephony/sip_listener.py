@@ -174,10 +174,10 @@ def _execute_inbound_commands(leg, sub: dict, cmds: list) -> None:
     """Execute commands that came from the incoming event response."""
     from . import commands as cmd_engine, call_state
 
+    bridged = False
     for cmd in cmds:
         action = cmd.get("action")
         if action == "create_call":
-            # Create a conference and bridge this leg in
             call = call_state.create_call(
                 subscriber_id=sub["id"],
                 account_id=sub["account_id"],
@@ -189,8 +189,8 @@ def _execute_inbound_commands(leg, sub: dict, cmds: list) -> None:
             callbacks = cmd.get("callbacks", {})
             leg.callbacks.update(callbacks)
             leg_mod.bridge_to_call(leg, call)
+            bridged = True
 
-            # Execute remaining commands on this call
             remaining = [c for c in cmds if c is not cmd]
             if remaining:
                 cmd_engine.execute_commands(call, remaining)
@@ -198,28 +198,47 @@ def _execute_inbound_commands(leg, sub: dict, cmds: list) -> None:
 
         elif action == "add_leg" and cmd.get("leg_id") == leg.leg_id:
             call_id = cmd.get("call_id")
+            callbacks = cmd.get("callbacks", {})
+            leg.callbacks.update(callbacks)
+
+            # Find the call — either from command or from any active call for this subscriber
+            call = None
             if call_id:
                 call = call_state.get_call(call_id)
-                if call:
-                    leg_mod.bridge_to_call(leg, call)
-                    return
+            if not call:
+                # CRM created the call via API — find it by subscriber
+                for c in call_state.list_calls():
+                    if c.subscriber_id == sub["id"] and c.status == "active":
+                        call = c
+                        break
+            if call:
+                leg_mod.bridge_to_call(leg, call)
+                bridged = True
 
-    # If no bridge command, wait
-    _wait_for_bridge(leg, leg.voip_call)
+                remaining = [c for c in cmds if c is not cmd and c.get("action") != "add_leg"]
+                if remaining:
+                    cmd_engine.execute_commands(call, remaining)
+                return
+
+    if not bridged:
+        _wait_for_bridge(leg, getattr(leg, 'voip_call', None))
 
 
 def _wait_for_bridge(leg, voip_call) -> None:
     """Wait for subscriber to bridge the leg via API, or timeout."""
-    from pyVoIP.VoIP.VoIP import CallState
-
     deadline = time.time() + RING_TIMEOUT
     while time.time() < deadline:
         if leg.call_id:
             return  # bridged via API
-        if voip_call.state == CallState.ENDED:
-            leg.status = "completed"
-            leg_mod.delete_leg(leg.leg_id)
-            return
+        if voip_call is not None:
+            try:
+                from pyVoIP.VoIP.VoIP import CallState
+                if voip_call.state == CallState.ENDED:
+                    leg.status = "completed"
+                    leg_mod.delete_leg(leg.leg_id)
+                    return
+            except Exception:
+                pass
         time.sleep(0.5)
 
     # Timeout — reject
@@ -263,6 +282,49 @@ def _monitor_hangup(leg, voip_call) -> None:
                                   {"callId": call.call_id})
             call.status = "completed"
             call_state.delete_call(call.call_id)
+
+
+def _handle_trunk_call(pbx_id: str, caller: str, callee: str,
+                       sip_msg: dict, addr, rtp_port: int) -> None:
+    """Handle incoming call from trunk via built-in SIP stack (no pyVoIP)."""
+    _LOGGER.info("Trunk call on %s: %s → %s", pbx_id, caller, callee)
+
+    # Find subscriber
+    sub = sub_mod.find_by_did(callee)
+    if not sub:
+        sub = sub_mod.find_by_pbx(pbx_id)
+    if not sub:
+        _LOGGER.warning("No subscriber for DID %s on PBX %s", callee, pbx_id)
+        return
+
+    from . import auth as auth_mod
+    if not auth_mod.check_pbx_access(sub["account_id"], pbx_id):
+        _LOGGER.warning("Account %s not allowed on PBX %s", sub["account_id"], pbx_id)
+        return
+
+    # Create inbound leg (no voip_call — RTP handled separately)
+    leg = leg_mod.create_leg(
+        direction="inbound",
+        number=caller,
+        pbx_id=pbx_id,
+        subscriber_id=sub["id"],
+    )
+    leg.status = "ringing"
+    leg._sip_msg = sip_msg
+    leg._sip_addr = addr
+    leg._rtp_port = rtp_port
+
+    # Fire incoming event to subscriber
+    cmds = dispatcher.fire_event(
+        _EventContext(sub, leg),
+        "incoming",
+        {"caller": caller, "callee": callee, "leg_id": leg.leg_id},
+    )
+
+    if cmds:
+        _execute_inbound_commands(leg, sub, cmds)
+
+    # TODO: monitor for BYE from trunk (sip_stack handles this via _handle_inbound_bye)
 
 
 class _EventContext:

@@ -161,6 +161,15 @@ class SIPSession:
         def _incoming(call):
             call.deny()
 
+        # Determine local IP by connecting a UDP socket to the SIP server
+        import socket as _sock
+        _s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+        try:
+            _s.connect((self.server, self.port))
+            _local_ip = _s.getsockname()[0]
+        finally:
+            _s.close()
+
         self._phone = VoIPPhone(
             server=self.server,
             port=self.port,
@@ -168,7 +177,7 @@ class SIPSession:
             password=self.password,
             callCallback=_incoming,
             sipPort=self.local_port,
-            myIP=self.server,  # Must match server for local setups, NOT 0.0.0.0
+            myIP=_local_ip,
         )
 
         # Fix pyVoIP ACK race condition before starting

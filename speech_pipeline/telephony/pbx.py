@@ -20,6 +20,10 @@ def put(pbx_id: str, data: dict) -> dict:
     entry = {
         "id": pbx_id,
         "sip_proxy": data.get("sip_proxy", ""),
+        "sip_host": data.get("sip_host", ""),
+        "sip_port": int(data.get("sip_port", 5060)),
+        "sip_user": data.get("sip_user", ""),
+        "sip_password": data.get("sip_password", ""),
         "ari_url": data.get("ari_url", ""),
         "ari_user": data.get("ari_user", ""),
         "ari_password": data.get("ari_password", ""),
@@ -48,4 +52,4 @@ def list_all() -> List[dict]:
 
 def _public(entry: dict) -> dict:
     """Return a copy without sensitive fields (passwords)."""
-    return {k: v for k, v in entry.items() if k != "ari_password"}
+    return {k: v for k, v in entry.items() if k not in ("ari_password", "sip_password")}

@@ -111,6 +111,23 @@ def find_by_did(did: str) -> Optional[dict]:
     return entry
 
 
+def find_by_pbx(pbx_id: str) -> Optional[dict]:
+    """Find the first alive subscriber whose account is pinned to this PBX.
+
+    Used as fallback when no DID-specific subscriber is found — subscribers
+    with empty DID lists act as wildcard receivers for their PBX.
+    """
+    from . import auth as auth_mod
+    for entry in _subscribers.values():
+        age = time.time() - entry["last_seen"]
+        if age > STALE_SECONDS:
+            continue
+        if not entry.get("inbound_dids"):  # wildcard: no specific DIDs
+            if auth_mod.check_pbx_access(entry["account_id"], pbx_id):
+                return entry
+    return None
+
+
 def delete_all_for_account(account_id: str) -> int:
     """Remove all subscribers belonging to an account.  Returns count."""
     to_remove = [sid for sid, s in _subscribers.items()

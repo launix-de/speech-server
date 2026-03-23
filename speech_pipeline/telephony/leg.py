@@ -179,26 +179,89 @@ def bridge_to_call(leg: Leg, call) -> None:
 
 
 def originate_and_bridge(leg: Leg, call, pbx_entry: dict) -> None:
-    """Originate an outbound SIP call and bridge into conference."""
-    from speech_pipeline.SIPSession import SIPSession
+    """Originate an outbound SIP call and bridge into conference.
 
+    Uses the built-in SIP stack if active, otherwise falls back to pyVoIP.
+    """
     _fire_callback(leg, "ringing")
 
     try:
-        session = SIPSession(
-            target=leg.number,
-            server=pbx_entry.get("sip_proxy", "127.0.0.1"),
-            port=int(pbx_entry.get("sip_port", 5060)),
-            username=pbx_entry.get("sip_user", "piper"),
-            password=pbx_entry.get("sip_password", ""),
-        )
-        session.start()
+        from . import sip_stack
+        if sip_stack._running:
+            _originate_sip_stack(leg, call, pbx_entry)
+        else:
+            _originate_pyvoip(leg, call, pbx_entry)
     except Exception as e:
         _LOGGER.warning("Originate %s failed: %s", leg.number, e)
         leg.status = "failed"
         _fire_callback(leg, "failed", error=str(e))
         delete_leg(leg.leg_id)
-        return
+
+
+def _originate_sip_stack(leg: Leg, call, pbx_entry: dict) -> None:
+    """Originate via built-in SIP stack."""
+    from . import sip_stack
+
+    _LOGGER.info("Originate %s via SIP stack on PBX %s", leg.number, leg.pbx_id)
+    sip_call = sip_stack.call(leg.pbx_id, leg.number)
+
+    # Wait for answer (up to 30s)
+    deadline = time.time() + 30
+    while sip_call.state not in ("answered", "ended"):
+        if time.time() > deadline:
+            sip_stack.hangup(sip_call)
+            raise RuntimeError(f"SIP call to {leg.number} ring timeout")
+        sip_call.state_event.wait(timeout=1.0)
+        sip_call.state_event.clear()
+
+    if sip_call.state == "ended":
+        raise RuntimeError(f"SIP call to {leg.number} ended/rejected")
+
+    _LOGGER.info("SIP call answered: %s (RTP %s:%d)",
+                 leg.number, sip_call.remote_rtp_host, sip_call.remote_rtp_port)
+
+    leg._sip_call = sip_call
+    bridge_to_call(leg, call)
+    _fire_callback(leg, "answered")
+
+    # Monitor for hangup
+    while sip_call.state != "ended":
+        sip_call.state_event.wait(timeout=2.0)
+        sip_call.state_event.clear()
+
+    _LOGGER.info("SIP call ended: %s", leg.number)
+    leg.status = "completed"
+    _fire_callback(leg, "completed")
+    delete_leg(leg.leg_id)
+
+
+def _originate_pyvoip(leg: Leg, call, pbx_entry: dict) -> None:
+    """Fallback: originate via pyVoIP SIPSession."""
+    from speech_pipeline.SIPSession import SIPSession
+    from pyVoIP.VoIP.VoIP import CallState
+
+    _LOGGER.info("Originate %s via pyVoIP on PBX %s", leg.number, leg.pbx_id)
+    session = SIPSession(
+        target=leg.number,
+        server=pbx_entry.get("sip_proxy", "127.0.0.1"),
+        port=int(pbx_entry.get("sip_port", 5060)),
+        username=pbx_entry.get("sip_user", "piper"),
+        password=pbx_entry.get("sip_password", ""),
+    )
+    session.start()
+
+    # Wait for answer
+    deadline = time.time() + 30
+    while session.call.state != CallState.ANSWERED:
+        if session.call.state == CallState.ENDED:
+            raise RuntimeError(f"SIP call to {leg.number} ended/rejected")
+        if time.time() > deadline:
+            try:
+                session.call.hangup()
+            except Exception:
+                pass
+            raise RuntimeError(f"SIP call to {leg.number} ring timeout")
+        time.sleep(0.3)
 
     leg.voip_call = session.call
     leg._sip_session = session

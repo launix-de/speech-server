@@ -72,11 +72,26 @@ def _body() -> dict:
 def put_pbx(pbx_id: str):
     body = _body()
     entry = pbx.put(pbx_id, body)
-    # Start SIP listener for this PBX
-    from . import sip_listener
-    full = pbx.get(pbx_id)  # includes password
-    if full:
-        sip_listener.start_listener(pbx_id, full)
+    # Register SIP trunk (built-in stack preferred, pyVoIP fallback)
+    pbx_data = pbx.get(pbx_id)
+    from . import sip_stack
+    if sip_stack._running:
+        try:
+            sip_stack.register_trunk(
+                pbx_id,
+                server=pbx_data.get("sip_proxy") or pbx_data.get("sip_host", ""),
+                port=int(pbx_data.get("sip_port", 5060)),
+                username=pbx_data.get("sip_user", ""),
+                password=pbx_data.get("sip_password", ""),
+            )
+        except Exception as e:
+            _LOGGER.warning("SIP trunk registration failed for %s: %s", pbx_id, e)
+    else:
+        from . import sip_listener
+        try:
+            sip_listener.start_listener(pbx_id, pbx_data)
+        except Exception as e:
+            _LOGGER.warning("SIP listener start failed for %s: %s", pbx_id, e)
     return jsonify(entry), 200
 
 

@@ -49,6 +49,15 @@ def start_listener(pbx_id: str, pbx_entry: dict) -> None:
             daemon=True,
         ).start()
 
+    # Determine local IP by connecting to the SIP server
+    import socket as _sock
+    _s = _sock.socket(_sock.AF_INET, _sock.SOCK_DGRAM)
+    try:
+        _s.connect((sip_proxy, sip_port))
+        local_ip = _s.getsockname()[0]
+    finally:
+        _s.close()
+
     phone = VoIPPhone(
         server=sip_proxy,
         port=sip_port,
@@ -56,7 +65,7 @@ def start_listener(pbx_id: str, pbx_entry: dict) -> None:
         password=sip_pass,
         callCallback=_on_incoming,
         sipPort=local_port,
-        myIP=sip_proxy,
+        myIP=local_ip,
     )
     _patch_voip_phone(phone)
     phone.start()
@@ -72,6 +81,11 @@ def stop_listener(pbx_id: str) -> None:
             phone.stop()
         except Exception:
             pass
+
+
+def get_phone(pbx_id: str):
+    """Get the VoIPPhone instance for a PBX (for outbound calls)."""
+    return _phones.get(pbx_id)
 
 
 def stop_all() -> None:
@@ -94,10 +108,13 @@ def _handle_incoming(pbx_id: str, voip_call) -> None:
 
     _LOGGER.info("Incoming SIP on %s: %s → %s", pbx_id, caller, callee)
 
-    # Find subscriber by DID
+    # Find subscriber by DID, fallback to any subscriber on this PBX
     sub = sub_mod.find_by_did(callee)
     if not sub:
-        _LOGGER.warning("No subscriber for DID %s — rejecting", callee)
+        sub = sub_mod.find_by_pbx(pbx_id)
+    if not sub:
+        _LOGGER.warning("No subscriber for DID %s on PBX %s — rejecting",
+                        callee, pbx_id)
         try:
             voip_call.deny()
         except Exception:
@@ -144,12 +161,13 @@ def _handle_incoming(pbx_id: str, voip_call) -> None:
     if cmds:
         # Execute commands — they should bridge this leg into a conference
         from . import commands as cmd_engine, call_state
-        # Commands need a call context; if subscriber created one, find it
-        # For now, execute in a temporary context
         _execute_inbound_commands(leg, sub, cmds)
     else:
         # No commands — wait for subscriber to call the bridge API
         _wait_for_bridge(leg, voip_call)
+
+    # Monitor for hangup (runs until SIP call ends)
+    _monitor_hangup(leg, voip_call)
 
 
 def _execute_inbound_commands(leg, sub: dict, cmds: list) -> None:
@@ -213,6 +231,38 @@ def _wait_for_bridge(leg, voip_call) -> None:
     except Exception:
         pass
     leg_mod.delete_leg(leg.leg_id)
+
+
+def _monitor_hangup(leg, voip_call) -> None:
+    """Block until the SIP call ends, then fire the completed callback."""
+    from pyVoIP.VoIP.VoIP import CallState
+
+    while True:
+        try:
+            if voip_call.state == CallState.ENDED:
+                break
+        except Exception:
+            break
+        time.sleep(0.5)
+
+    _LOGGER.info("Inbound leg %s: SIP call ended", leg.leg_id)
+    leg.status = "completed"
+
+    # Fire completed callback
+    cb_path = leg.callbacks.get("completed")
+    if cb_path:
+        from . import leg as leg_mod
+        leg_mod._fire_callback(leg, "completed")
+
+    # Fire call_ended event to subscriber
+    if leg.call_id:
+        from . import call_state, subscriber as sub_mod
+        call = call_state.get_call(leg.call_id)
+        if call:
+            dispatcher.fire_event(call, "call_ended",
+                                  {"callId": call.call_id})
+            call.status = "completed"
+            call_state.delete_call(call.call_id)
 
 
 class _EventContext:

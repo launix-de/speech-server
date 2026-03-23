@@ -163,6 +163,7 @@ def create_app(args: argparse.Namespace) -> Flask:
         # Startup callback: notify provisioning service that we are ready
         startup_cb = getattr(args, 'startup_callback', None) or ''
         if startup_cb:
+            startup_cb_token = getattr(args, 'startup_callback_token', None) or admin_token
             def _fire_startup_callback(url: str, token: str) -> None:
                 import requests
                 try:
@@ -176,7 +177,7 @@ def create_app(args: argparse.Namespace) -> Flask:
             # Fire after app is ready (in a thread to not block startup)
             threading.Thread(
                 target=_fire_startup_callback,
-                args=(startup_cb, admin_token),
+                args=(startup_cb, startup_cb_token),
                 daemon=True,
                 name="startup-callback",
             ).start()
@@ -1330,11 +1331,20 @@ def main() -> None:
     parser.add_argument("--bearer", default="", help="Bearer token for authorizing remote (http/https) downloads/streams")
     parser.add_argument("--whisper-model", default="base", help="Whisper model size for STT (default: base)")
     parser.add_argument("--admin-token", default="", help="Bearer token to enable the /api/ pipeline control endpoints")
-    parser.add_argument("--startup-callback", default="", help="URL to GET on startup (with admin token). The called service provisions PBX/accounts via the API.")
+    parser.add_argument("--startup-callback", default="", help="URL to GET on startup. The called service provisions PBX/accounts via the API.")
+    parser.add_argument("--startup-callback-token", default="", help="Bearer token for the startup callback (if different from --admin-token).")
+    parser.add_argument("--sip-port", type=int, default=0, help="Enable built-in SIP stack on this UDP port (e.g. 5061). Disables pyVoIP.")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
+
+    # Start built-in SIP stack if requested
+    if args.sip_port:
+        from speech_pipeline.telephony import sip_stack
+        sip_stack.init(args.sip_port)
+        _LOGGER.info("Built-in SIP stack enabled on port %d", args.sip_port)
+
     app = create_app(args)
     app.run(host=args.host, port=args.port, threaded=True)
 

@@ -1,0 +1,12 @@
+Voice conversion (FreeVC)
+
+138 antje
+53 carli
+
+TTS-Rework mit Piper
+--------------------
+python3 -m piper.download_voices listet auf
+python3 -m piper.download_voices de_DE-thorsten-medium lädt herunter
+python3 -m piper -m  de_DE-thorsten-medium  'text' spielt in konsole in echtzeit
+python3 -m piper -m  de_DE-thorsten-medium -f x.wav 'text' speichert ab
+python3 -m piper.http_server -m de_DE-thorsten-medium startet einen webserver

@@ -50,17 +50,21 @@ def fire_event(call: call_state.Call, event_key: str,
         **payload,
     }
 
-    try:
-        resp = http_requests.request(
-            method, url, json=event_payload,
-            headers={"Authorization": f"Bearer {sub['bearer_token']}"},
-            timeout=10)
-        if resp.status_code == 200 and resp.content:
-            body = resp.json()
-            return body.get("commands", [])
-    except Exception as e:
-        _LOGGER.warning("Event %s to %s failed: %s", event_key, url, e)
+    # Fire-and-forget in background thread.
+    # The CRM handles everything via API calls back to us.
+    import threading
 
+    def _send():
+        try:
+            http_requests.request(
+                method, url, json=event_payload,
+                headers={"Authorization": f"Bearer {sub['bearer_token']}"},
+                timeout=30)
+        except Exception as e:
+            _LOGGER.warning("Event %s to %s failed: %s", event_key, url, e)
+
+    threading.Thread(target=_send, daemon=True).start()
+    _LOGGER.info("Event %s fired (fire-and-forget) → %s", event_key, url)
     return []
 
 

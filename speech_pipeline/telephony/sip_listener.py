@@ -158,11 +158,10 @@ def _handle_incoming(pbx_id: str, voip_call) -> None:
         daemon=True,
     ).start()
 
-    # Wait for CRM to bridge this leg via the API, or timeout
+    # Wait for CRM to bridge this leg via the API, or timeout.
+    # After bridging, bridge_to_call's monitor thread handles
+    # cleanup + completed callback. No _monitor_hangup needed.
     _wait_for_bridge(leg, voip_call)
-
-    # Monitor for hangup (runs until SIP call ends)
-    _monitor_hangup(leg, voip_call)
 
 
 def _wait_for_bridge(leg, voip_call) -> None:

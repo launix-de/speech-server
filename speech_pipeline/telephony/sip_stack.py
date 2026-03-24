@@ -187,8 +187,9 @@ def _build_sdp(ip: str, rtp_port: int) -> str:
         "s=tts-piper\r\n"
         f"c=IN IP4 {ip}\r\n"
         "t=0 0\r\n"
-        f"m=audio {rtp_port} RTP/AVP 0 101\r\n"
+        f"m=audio {rtp_port} RTP/AVP 0 8 101\r\n"
         "a=rtpmap:0 PCMU/8000\r\n"
+        "a=rtpmap:8 PCMA/8000\r\n"
         "a=rtpmap:101 telephone-event/8000\r\n"
         "a=fmtp:101 0-16\r\n"
         "a=sendrecv\r\n"
@@ -443,6 +444,8 @@ def _send(data: str, addr: Tuple[str, int]) -> None:
     if _sock is None:
         _LOGGER.error("SIP stack not initialized — cannot send")
         return
+    first_line = data.split('\r\n', 1)[0]
+    _LOGGER.info("SIP TX → %s: %s", addr, first_line)
     try:
         _sock.sendto(data.encode("utf-8"), addr)
     except Exception as e:
@@ -589,6 +592,9 @@ def _recv_loop() -> None:
                 _LOGGER.error("Socket error in recv loop", exc_info=True)
             break
 
+        first_line = data.split(b'\r\n', 1)[0].decode('utf-8', errors='replace')
+        _LOGGER.info("SIP RX ← %s: %s", addr, first_line)
+
         try:
             msg = _parse_sip(data)
         except Exception:
@@ -658,20 +664,25 @@ def _handle_invite_response(
             call_obj._to_tag = to_tag
 
     elif status == 200:
+        _LOGGER.info("Call %s: FULL 200 OK:\n%s", call_id,
+                     "\n".join(f"  {k}: {v}" for k, v in msg.get("headers", {}).items()))
         to_tag = _extract_tag(_get_header(msg, "to"))
         if to_tag:
             call_obj._to_tag = to_tag
 
         # Extract RTP info from SDP
         if msg["body"]:
+            _LOGGER.info("Call %s: SDP body:\n%s", call_id, msg["body"][:300])
             host, port = _parse_sdp(msg["body"])
             call_obj.remote_rtp_host = host
             call_obj.remote_rtp_port = port
 
         # Store contact for future requests
         contact = _get_header(msg, "contact")
+        _LOGGER.info("Call %s: 200 OK Contact header: %s", call_id, contact)
         if contact:
             call_obj._contact_uri = _extract_uri(contact)
+            _LOGGER.info("Call %s: extracted contact_uri: %s", call_id, call_obj._contact_uri)
 
         # Store Record-Route for in-dialog routing
         rr = _get_header(msg, "record-route")
@@ -735,15 +746,21 @@ def _send_ack(call_obj: SIPCall, response_msg: dict) -> None:
 
     cseq = call_obj._cseq
 
+    # RFC 3261: ACK Request-URI = Contact URI from 200 OK (for 2xx)
+    ack_uri = call_obj._contact_uri if call_obj._contact_uri and status == 200 else to_uri
+    if not ack_uri.startswith("sip:"):
+        ack_uri = f"sip:{ack_uri}"
+
     msg = _build_request(
-        "ACK", to_uri if call_obj._contact_uri and status == 200
-        else _extract_uri(call_obj._to_header),
+        "ACK", ack_uri,
         call_id=call_obj.call_id,
         from_header=call_obj._from_header,
         to_header=to_h,
         cseq=cseq, via_branch=branch,
         remote_addr=call_obj._remote_addr,
     )
+    _LOGGER.info("ACK for %s → %s: %s", call_obj.call_id, call_obj._remote_addr,
+                 msg[:200].replace('\r\n', ' | '))
     _send(msg, call_obj._remote_addr)
 
 
@@ -1225,6 +1242,36 @@ def init(sip_port: int) -> None:
     cleanup.start()
 
     _LOGGER.info("SIP stack started on :%d (local IP %s)", sip_port, _local_ip)
+
+    import atexit
+    atexit.register(shutdown)
+
+
+def shutdown() -> None:
+    """Graceful shutdown: notify all registered clients and trunks."""
+    global _running
+    if not _running:
+        return
+    _LOGGER.info("SIP stack shutting down...")
+
+    # Send BYE to all active calls
+    with _calls_lock:
+        for call_obj in list(_calls.values()):
+            try:
+                hangup(call_obj)
+            except Exception:
+                pass
+
+    # Unregister from all trunks
+    with _trunks_lock:
+        for pbx_id in list(_trunks.keys()):
+            try:
+                unregister_trunk(pbx_id)
+            except Exception:
+                pass
+
+    _running = False
+    _LOGGER.info("SIP stack stopped")
 
 
 def register_trunk(

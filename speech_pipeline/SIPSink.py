@@ -29,9 +29,15 @@ class _RingBuffer:
 
     def write(self, offset: int, data: bytes) -> None:
         with self._lock:
-            for b in data:
-                self._buf[self._write_pos % self._cap] = b
-                self._write_pos += 1
+            n = len(data)
+            start = self._write_pos % self._cap
+            if start + n <= self._cap:
+                self._buf[start:start + n] = data
+            else:
+                first = self._cap - start
+                self._buf[start:] = data[:first]
+                self._buf[:n - first] = data[first:]
+            self._write_pos += n
             if self._write_pos - self._read_pos > self._cap:
                 self._read_pos = self._write_pos - self._cap
 
@@ -48,13 +54,19 @@ class _RingBuffer:
                 consume = length + 2
             elif avail > self._cap // 2:
                 consume = length + 1
+            if consume > avail:
+                consume = length
 
-            result = bytearray(consume)
-            for i in range(consume):
-                result[i] = self._buf[(self._read_pos + i) % self._cap]
+            start = self._read_pos % self._cap
             self._read_pos += consume
 
-            return bytes(result[:length])
+            if start + consume <= self._cap:
+                return bytes(self._buf[start:start + length])
+            else:
+                part1 = self._buf[start:]
+                part2 = self._buf[:consume - len(part1)]
+                result = bytes(part1 + part2)
+                return result[:length]
 
 
 class SIPSink(Stage):

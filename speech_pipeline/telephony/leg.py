@@ -152,8 +152,8 @@ def bridge_to_call(leg: Leg, call) -> None:
     tx_sink = SIPSink(session)
     leg._sink_id = call.mixer.add_sink(tx_sink, mute_source=leg._src_id)
 
-    _LOGGER.info("Leg %s bridged to call %s (src=%s sink=%s)",
-                 leg.leg_id, call.call_id, leg._src_id, leg._sink_id)
+    _LOGGER.info("Leg %s bridged to call %s (src=%s sink=%s mute=%s)",
+                 leg.leg_id, call.call_id, leg._src_id, leg._sink_id, leg._src_id)
 
     # Monitor for DTMF digits from caller → fire subscriber callback
     def _dtmf_monitor():
@@ -170,23 +170,42 @@ def bridge_to_call(leg: Leg, call) -> None:
     threading.Thread(target=_dtmf_monitor, daemon=True,
                      name=f"dtmf-{leg.leg_id}").start()
 
-    # Monitor for SIP hangup
+    # Monitor for SIP hangup — single cleanup point for all leg types
     def _monitor():
-        from pyVoIP.VoIP.VoIP import CallState
         while leg.status == "in-progress":
-            if leg.voip_call.state == CallState.ENDED:
+            ended = False
+            # pyVoIP leg (has .state attribute with CallState enum)
+            if leg.voip_call and hasattr(leg.voip_call, 'state'):
+                try:
+                    from pyVoIP.VoIP.VoIP import CallState
+                    if leg.voip_call.state == CallState.ENDED:
+                        ended = True
+                except Exception:
+                    pass  # don't assume ended on error
+            # sip_stack device leg
+            if hasattr(leg, '_sip_call') and leg._sip_call:
+                if leg._sip_call.state == "ended":
+                    ended = True
+            # session hungup (RTPSession or SIPSession)
+            if session.hungup.is_set():
+                ended = True
+            if ended:
                 break
             time.sleep(0.5)
 
         leg.status = "completed"
         duration = time.time() - leg.answered_at if leg.answered_at else 0
-        call.mixer.kill_source(leg._src_id)
-        if leg._sink_id:
-            call.mixer.remove_sink(leg._sink_id)
+        try:
+            call.mixer.kill_source(leg._src_id)
+            if leg._sink_id:
+                call.mixer.remove_sink(leg._sink_id)
+        except Exception:
+            pass
         call.unregister_participant(leg.leg_id)
 
         _fire_callback(leg, "completed", duration=duration)
         _LOGGER.info("Leg %s ended (duration=%.1fs)", leg.leg_id, duration)
+        delete_leg(leg.leg_id)
 
     threading.Thread(target=_monitor, daemon=True,
                      name=f"mon-{leg.leg_id}").start()
@@ -215,17 +234,12 @@ def originate_and_bridge(leg: Leg, call, pbx_entry: dict) -> None:
         delete_leg(leg.leg_id)
         return
 
-    # Bridge into conference (identical for all session types)
+    # Bridge into conference — bridge_to_call spawns a monitor thread
+    # that handles cleanup + completed callback when the SIP call ends.
+    # We do NOT do our own cleanup here to avoid double-fire.
     leg.voip_call = session.call
     bridge_to_call(leg, call)
     _fire_callback(leg, "answered")
-
-    # Monitor for hangup
-    session.hungup.wait()
-    _LOGGER.info("Originate %s: call ended", leg.number)
-    leg.status = "completed"
-    _fire_callback(leg, "completed")
-    delete_leg(leg.leg_id)
 
 
 def _create_sip_session(leg: Leg, pbx_entry: dict):
@@ -353,14 +367,16 @@ def _fire_callback(leg: Leg, event: str, **extra) -> list:
         **extra,
     }
 
-    try:
-        _LOGGER.info("Leg callback %s → %s", event, url)
-        resp = http_requests.post(url, json=payload, headers={
-            "Authorization": f"Bearer {sub['bearer_token']}",
-        }, timeout=10)
-        _LOGGER.info("Leg callback %s → %d %s", event, resp.status_code, resp.text[:200] if resp.text else "")
-        if resp.status_code == 200 and resp.content:
-            return resp.json().get("commands", [])
-    except Exception as e:
-        _LOGGER.warning("Leg callback %s → %s failed: %s", event, url, e)
+    def _send():
+        try:
+            resp = http_requests.post(url, json=payload, headers={
+                "Authorization": f"Bearer {sub['bearer_token']}",
+            }, timeout=10)
+            _LOGGER.info("Leg callback %s → %d", event, resp.status_code)
+        except Exception as e:
+            _LOGGER.warning("Leg callback %s → %s failed: %s", event, url, e)
+
+    # Fire async — don't block the caller
+    _LOGGER.info("Leg callback %s → %s", event, url)
+    threading.Thread(target=_send, daemon=True).start()
     return []

@@ -72,6 +72,7 @@ class SIPCall:
     remote_rtp_host: str = ""
     remote_rtp_port: int = 0
     local_rtp_port: int = 0
+    negotiated_pt: int = 0          # payload type from SDP answer (0=PCMU)
     # Internal bookkeeping
     _from_header: str = ""
     _to_header: str = ""
@@ -197,21 +198,32 @@ def _build_sdp(ip: str, rtp_port: int) -> str:
     )
 
 
-def _parse_sdp(sdp: str) -> Tuple[str, int]:
-    """Extract remote RTP host:port from SDP.
+def _parse_sdp(sdp: str) -> Tuple[str, int, int]:
+    """Extract remote RTP host, port, and preferred codec from SDP.
 
-    Returns (host, port).
+    Returns (host, port, payload_type).
+    The payload type is the first codec in the m-line that we support.
+    Falls back to 0 (PCMU) if none match.
     """
+    from speech_pipeline.rtp_codec import CODECS_BY_PT
+
     host = "0.0.0.0"
     port = 0
+    payload_type = 0
     for line in sdp.splitlines():
         line = line.strip()
         if line.startswith("c=IN IP4 "):
             host = line.split()[-1]
-        m = re.match(r"m=audio\s+(\d+)\s+", line)
+        m = re.match(r"m=audio\s+(\d+)\s+\S+\s+([\d\s]+)", line)
         if m:
             port = int(m.group(1))
-    return host, port
+            # Pick first supported PT from remote's offer/answer
+            for pt_str in m.group(2).split():
+                pt = int(pt_str)
+                if pt in CODECS_BY_PT:
+                    payload_type = pt
+                    break
+    return host, port, payload_type
 
 
 # ---------------------------------------------------------------------------
@@ -683,12 +695,13 @@ def _handle_invite_response(
         if to_tag:
             call_obj._to_tag = to_tag
 
-        # Extract RTP info from SDP
+        # Extract RTP info + negotiated codec from SDP
         if msg["body"]:
             _LOGGER.info("Call %s: SDP body:\n%s", call_id, msg["body"][:300])
-            host, port = _parse_sdp(msg["body"])
+            host, port, pt = _parse_sdp(msg["body"])
             call_obj.remote_rtp_host = host
             call_obj.remote_rtp_port = port
+            call_obj.negotiated_pt = pt
 
         # Store contact for future requests
         contact = _get_header(msg, "contact")
@@ -1087,6 +1100,9 @@ def _handle_trunk_invite(msg: dict, addr: Tuple[str, int], pbx_id: str) -> None:
     _send(resp, addr)
     _LOGGER.info("Trunk INVITE: sent 183 Session Progress (Early Media RTP :%d)", rtp_port)
 
+    # Parse remote's codec preference from INVITE SDP
+    _, _, remote_pt = _parse_sdp(msg.get("body", ""))
+
     # Store the dialog info so we can send 200 OK later via answer_trunk_leg()
     _trunk_dialogs[call_id] = {
         "msg": msg,
@@ -1096,6 +1112,7 @@ def _handle_trunk_invite(msg: dict, addr: Tuple[str, int], pbx_id: str) -> None:
         "sdp": sdp,
         "pbx_id": pbx_id,
         "answered": False,
+        "negotiated_pt": remote_pt,
     }
 
     # Delegate to sip_listener

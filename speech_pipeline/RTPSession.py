@@ -1,16 +1,19 @@
-"""Minimal RTP session — provides the same audio interface as pyVoIP calls.
+"""Codec-aware RTP session — provides the same audio interface as pyVoIP calls.
 
 Used by SIPSource/SIPSink to bridge sip_stack-originated calls into
-the Stage pipeline.  Handles G.711 µ-law (PCMU) over raw UDP sockets.
+the Stage pipeline.  Supports any codec via the RTPCodec abstraction.
 
-Interface contract (compatible with pyVoIP VoIPCall):
-- ``read_audio(length, blocking)`` → PCM u8 bytes
-- ``write_audio(data)`` → send PCM u8 bytes
-- ``RTPClients[0].pmout`` → output buffer (replaced by SIPSink)
+Interface contract:
+- ``read_s16le(blocking)`` → s16le PCM bytes (decoded from wire)
+- ``write_s16le(data)``    → encode s16le to wire and queue for TX
+- ``write_wire(data)``     → queue pre-encoded wire bytes for TX
+- ``codec``                → the negotiated RTPCodec instance
+
+Legacy pyVoIP-compat (used by SIPSink pyVoIP path):
+- ``RTPClients[0].pmout``  → output buffer (replaced by SIPSink)
 """
 from __future__ import annotations
 
-import audioop
 import logging
 import queue
 import socket
@@ -19,26 +22,26 @@ import threading
 import time
 from typing import Optional
 
+from speech_pipeline.rtp_codec import PCMU, RTPCodec
+
 _LOGGER = logging.getLogger("rtp-session")
 
-# RTP constants
 RTP_HEADER_SIZE = 12
-PCMU_PAYLOAD_TYPE = 0
-FRAME_SIZE = 160        # 20ms @ 8000 Hz
-SAMPLE_RATE = 8000
 
 
 class RTPSession:
-    """Raw UDP RTP session that mimics pyVoIP's call interface.
+    """Raw UDP RTP session with codec negotiation.
 
-    After construction, wrap in a ``_CallSession``-like adapter and
-    pass to ``SIPSource``/``SIPSink`` — they work identically to pyVoIP.
+    After construction, wrap in ``RTPCallSession`` and pass to
+    ``SIPSource``/``SIPSink`` — they detect the codec automatically.
     """
 
-    def __init__(self, local_port: int, remote_host: str, remote_port: int):
+    def __init__(self, local_port: int, remote_host: str, remote_port: int,
+                 codec: Optional[RTPCodec] = None) -> None:
         self.local_port = local_port
         self.remote_host = remote_host
         self.remote_port = remote_port
+        self.codec = codec or PCMU
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -56,13 +59,12 @@ class RTPSession:
         self._tx_ts = 0
         self._tx_ssrc = struct.unpack("!I", struct.pack("!I", id(self) & 0xFFFFFFFF))[0]
 
-        # Fake RTPClient for SIPSink compatibility
+        # Fake RTPClient for SIPSink pyVoIP compatibility
         self._rtp_client = _RTPClient(self)
         self.RTPClients = [self._rtp_client]
 
-        self._tx_packet_count = 0
-        _LOGGER.info("RTPSession: %s:%d ↔ %s:%d",
-                      "0.0.0.0", local_port, remote_host, remote_port)
+        _LOGGER.info("RTPSession %s: %s:%d ↔ %s:%d",
+                      self.codec, "0.0.0.0", local_port, remote_host, remote_port)
 
     def start(self) -> None:
         """Start RTP receive and transmit threads."""
@@ -82,35 +84,43 @@ class RTPSession:
         except Exception:
             pass
 
-    def read_audio(self, length: int = FRAME_SIZE, blocking: bool = False) -> bytes:
-        """Read audio from RTP, decoded to linear u8 (compatible with SIPSource).
+    # ----- Audio API (s16le) -----
 
-        RTP payload is µ-law (PCMU). Decodes to linear unsigned 8-bit PCM
-        (silence=128) matching the pipeline's u8 format.
-        """
+    def read_s16le(self, blocking: bool = False) -> bytes:
+        """Read one frame from RTP, decoded to s16le PCM."""
         try:
             timeout = 0.02 if blocking else 0.0
-            ulaw_data = self._rx_queue.get(timeout=timeout)
+            wire_data = self._rx_queue.get(timeout=timeout)
         except queue.Empty:
             return b""
-        if not ulaw_data:
+        if not wire_data:
             return b""
-        # µ-law → u8 (same as pyVoIP's parse_pcmu)
-        data = audioop.ulaw2lin(ulaw_data, 1)
-        return audioop.bias(data, 1, 128)
+        return self.codec.decode(wire_data)
 
-    def write_audio(self, data: bytes) -> None:
-        """Buffer u8 audio for paced RTP transmission.
+    def write_s16le(self, data: bytes) -> None:
+        """Encode s16le PCM to wire format and queue for TX."""
+        self._tx_queue.put(self.codec.encode(data))
 
-        Receives u8 PCM (same as pyVoIP), encodes to µ-law for RTP.
+    def write_wire(self, data: bytes) -> None:
+        """Queue pre-encoded wire bytes for TX (no encoding)."""
+        self._tx_queue.put(data)
+
+    # ----- Legacy pyVoIP-compat API (u8) -----
+
+    def read_audio(self, length: int = 160, blocking: bool = False) -> bytes:
+        """Read audio decoded to s16le (kept for SIPSource compat).
+
+        Note: despite the name, this now returns s16le, not u8.
+        SIPSource detects RTPSession and sets output_format accordingly.
         """
-        # u8 → µ-law (same as pyVoIP's encode_pcmu)
-        ulaw_data = audioop.bias(data, 1, -128)
-        ulaw_data = audioop.lin2ulaw(ulaw_data, 1)
-        self._tx_queue.put(ulaw_data)
+        return self.read_s16le(blocking=blocking)
+
+    # ----- TX loop -----
 
     def _tx_loop(self) -> None:
-        """Send RTP packets at exactly 20ms intervals (160 bytes PCMU)."""
+        """Send RTP packets at exactly 20ms intervals."""
+        frame_bytes = self.codec.frame_bytes
+        silence = bytes([self.codec.silence_byte]) * frame_bytes
         buf = b""
         next_send = time.monotonic()
 
@@ -123,26 +133,20 @@ class RTPSession:
                 pass
 
             # Send one frame if we have enough data
-            if len(buf) >= FRAME_SIZE:
-                chunk = buf[:FRAME_SIZE]
-                buf = buf[FRAME_SIZE:]
-
+            if len(buf) >= frame_bytes:
+                chunk = buf[:frame_bytes]
+                buf = buf[frame_bytes:]
                 packet = self._build_rtp_packet(chunk)
-                try:
-                    self._sock.sendto(packet, (self.remote_host, self.remote_port))
-                except Exception:
-                    pass
-                self._tx_seq = (self._tx_seq + 1) & 0xFFFF
-                self._tx_ts += FRAME_SIZE
             else:
                 # Not enough data — send silence
-                packet = self._build_rtp_packet(b"\xff" * FRAME_SIZE)
-                try:
-                    self._sock.sendto(packet, (self.remote_host, self.remote_port))
-                except Exception:
-                    pass
-                self._tx_seq = (self._tx_seq + 1) & 0xFFFF
-                self._tx_ts += FRAME_SIZE
+                packet = self._build_rtp_packet(silence)
+
+            try:
+                self._sock.sendto(packet, (self.remote_host, self.remote_port))
+            except Exception:
+                pass
+            self._tx_seq = (self._tx_seq + 1) & 0xFFFF
+            self._tx_ts += self.codec.frame_samples
 
             # Pace at exactly 20ms
             next_send += 0.020
@@ -174,23 +178,22 @@ class RTPSession:
             if len(data) < RTP_HEADER_SIZE:
                 continue
 
-            # Parse RTP header
+            # Parse RTP header — accept only our negotiated codec
             payload_type = data[1] & 0x7F
-            if payload_type != PCMU_PAYLOAD_TYPE:
-                continue  # skip non-PCMU (e.g. DTMF events)
+            if payload_type != self.codec.payload_type:
+                continue
 
             payload = data[RTP_HEADER_SIZE:]
             try:
                 self._rx_queue.put_nowait(payload)
             except queue.Full:
-                pass  # drop oldest — real-time audio
+                pass  # drop — real-time audio
 
     def _build_rtp_packet(self, payload: bytes) -> bytes:
-        """Build a minimal RTP packet with PCMU payload."""
-        # V=2, P=0, X=0, CC=0, M=0, PT=0 (PCMU)
+        """Build RTP packet with negotiated codec payload type."""
         header = struct.pack("!BBHII",
-                             0x80,                    # V=2
-                             PCMU_PAYLOAD_TYPE,       # PT=0 (PCMU)
+                             0x80,
+                             self.codec.payload_type,
                              self._tx_seq,
                              self._tx_ts,
                              self._tx_ssrc)
@@ -212,7 +215,7 @@ class RTPCallSession:
 
     Pass to SIPSource/SIPSink via bridge_to_call::
 
-        rtp = RTPSession(local_port, remote_host, remote_port)
+        rtp = RTPSession(local_port, remote_host, remote_port, codec=PCMA)
         rtp.start()
         session = RTPCallSession(rtp)
         # Now use session with SIPSource(session), SIPSink(session)

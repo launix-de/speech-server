@@ -267,6 +267,7 @@ def _create_sip_stack_session(leg: Leg, reg: dict):
     """Originate via sip_stack + RTPSession for audio."""
     from . import sip_stack
     from speech_pipeline.RTPSession import RTPSession, RTPCallSession
+    from speech_pipeline.rtp_codec import codec_for_pt, PCMU
 
     _LOGGER.info("Originate %s to device %s", leg.number, reg.get("contact_uri", "?"))
     sip_call = sip_stack.call_device(leg.number, reg)
@@ -283,13 +284,16 @@ def _create_sip_stack_session(leg: Leg, reg: dict):
     if sip_call.state == "ended":
         raise RuntimeError(f"SIP call to {leg.number} ended/rejected")
 
-    _LOGGER.info("SIP answered: %s → RTP %s:%d (local :%d)",
+    # Use codec negotiated from SDP answer
+    codec = codec_for_pt(sip_call.negotiated_pt) or PCMU
+    _LOGGER.info("SIP answered: %s → RTP %s:%d (local :%d, codec=%s)",
                  leg.number, sip_call.remote_rtp_host,
-                 sip_call.remote_rtp_port, sip_call.local_rtp_port)
+                 sip_call.remote_rtp_port, sip_call.local_rtp_port, codec)
 
     # Create RTP media session + wrap as SIPSource/SIPSink-compatible session
     rtp = RTPSession(sip_call.local_rtp_port,
-                     sip_call.remote_rtp_host, sip_call.remote_rtp_port)
+                     sip_call.remote_rtp_host, sip_call.remote_rtp_port,
+                     codec=codec)
     rtp.start()
     session = RTPCallSession(rtp)
     leg._sip_call = sip_call

@@ -11,15 +11,21 @@ _LOGGER = logging.getLogger("sip-source")
 class SIPSource(Stage):
     """Source stage: reads audio from a pyVoIP or RTPSession SIP call.
 
-    Output: unsigned 8-bit PCM (u8) mono @ 8000 Hz.
-    pyVoIP decodes µ-law → u8 internally. RTPSession does the same.
+    For RTPSession: output is s16le @ codec sample rate (codec decodes).
+    For pyVoIP: output is u8 @ 8000 Hz (pyVoIP decodes internally).
     pipe() auto-inserts converters to the mixer's s16le@48kHz.
     """
 
     def __init__(self, session) -> None:
         super().__init__()
         self.session = session
-        self.output_format = AudioFormat(8000, "u8")
+        # Detect output format based on call type
+        from speech_pipeline.RTPSession import RTPSession
+        call = session.call if hasattr(session, 'call') else None
+        if isinstance(call, RTPSession):
+            self.output_format = AudioFormat(call.codec.sample_rate, "s16le")
+        else:
+            self.output_format = AudioFormat(8000, "u8")
 
     def stream_pcm24k(self) -> Iterator[bytes]:
         import time as _time
@@ -32,7 +38,7 @@ class SIPSource(Stage):
             _LOGGER.warning("SIPSource: call already hung up")
             return
 
-        _LOGGER.info("SIPSource: streaming audio from SIP call")
+        _LOGGER.info("SIPSource: streaming audio (%s)", self.output_format)
         call = self.session.call
         while not self.cancelled and not self.session.hungup.is_set():
             try:

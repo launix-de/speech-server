@@ -438,18 +438,22 @@ def _send_callback(call: call_state.Call, callback_path: Optional[str],
         "result": result,
         **extra,
     }
-    try:
-        resp = http_requests.post(url, json=payload, headers={
-            "Authorization": f"Bearer {sub['bearer_token']}",
-        }, timeout=10)
-        if resp.status_code == 200 and resp.content:
-            body = resp.json()
-            cmds = body.get("commands", [])
-            if cmds:
-                execute_commands(call, cmds)
-            return cmds
-    except Exception as e:
-        _LOGGER.warning("Callback to %s failed: %s", url, e)
+    import threading
+
+    def _send():
+        try:
+            resp = http_requests.post(url, json=payload, headers={
+                "Authorization": f"Bearer {sub['bearer_token']}",
+            }, timeout=10)
+            if resp.status_code == 200 and resp.content:
+                body = resp.json()
+                cmds = body.get("commands", [])
+                if cmds:
+                    execute_commands(call, cmds)
+        except Exception as e:
+            _LOGGER.warning("Callback to %s failed: %s", url, e)
+
+    threading.Thread(target=_send, daemon=True).start()
     return []
 
 

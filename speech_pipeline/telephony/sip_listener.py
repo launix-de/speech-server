@@ -247,9 +247,11 @@ def _handle_trunk_call(pbx_id: str, caller: str, callee: str,
     # Create RTPSession for inbound audio (Early Media capable)
     from . import sip_stack
     from speech_pipeline.RTPSession import RTPSession, RTPCallSession
+    from speech_pipeline.rtp_codec import codec_for_pt
 
-    remote_host, remote_port = sip_stack._parse_sdp(sip_msg.get("body", ""))
-    rtp = RTPSession(rtp_port, remote_host, remote_port)
+    remote_host, remote_port, remote_pt = sip_stack._parse_sdp(sip_msg.get("body", ""))
+    codec = codec_for_pt(remote_pt)
+    rtp = RTPSession(rtp_port, remote_host, remote_port, codec=codec)
     rtp.start()
     session = RTPCallSession(rtp)
 

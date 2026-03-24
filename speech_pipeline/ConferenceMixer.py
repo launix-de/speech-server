@@ -327,9 +327,22 @@ class ConferenceMixer(Stage):
             for frame in frames.values():
                 full_mix = audioop.add(full_mix, frame, 2)
 
+            # Debug: log non-silent sources every 2s (~100 ticks)
+            if hasattr(self, '_dbg_tick'):
+                self._dbg_tick += 1
+            else:
+                self._dbg_tick = 0
+
             # Step 3: per-sink mix-minus and distribute
             with self._lock:
                 sinks = list(self._sinks)
+
+            if self._dbg_tick % 100 == 0:
+                active = [sid for sid, f in frames.items() if f != silence]
+                mutes = {e.id: e.mute_source for e in sinks}
+                _LOGGER.debug("Mixer '%s' tick %d: sources=%s active=%s sinks=%s",
+                              self.name, self._dbg_tick,
+                              list(frames.keys()), active, mutes)
 
             for entry in sinks:
                 if entry.mute_source and entry.mute_source in frames:

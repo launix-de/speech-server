@@ -915,14 +915,11 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
     # Clean up nonce
     del _nonces[nonce]
 
-    # Parse expiry
-    expires = 3600
+    # Parse expiry — cap at 120s so clients re-register quickly after restart
     exp_header = _get_header(msg, "expires")
-    if exp_header:
-        try:
-            expires = int(exp_header)
-        except ValueError:
-            pass
+    expires = min(int(exp_header or "120"), 120)
+    if expires < 30:
+        expires = 30
 
     # Build contact URI from the contact header or from addr
     if contact:

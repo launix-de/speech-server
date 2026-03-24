@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import queue
+import threading
 from typing import Iterator
 
 from .base import AudioFormat, Stage
@@ -9,17 +11,17 @@ _LOGGER = logging.getLogger("sip-source")
 
 
 class SIPSource(Stage):
-    """Source stage: reads audio from a pyVoIP or RTPSession SIP call.
+    """Source stage: reads audio from a SIP call (pyVoIP or RTPSession).
 
-    For RTPSession: output is s16le @ codec sample rate (codec decodes).
-    For pyVoIP: output is u8 @ 8000 Hz (pyVoIP decodes internally).
+    Uses a bounded queue with drop-oldest to prevent drift buildup.
+    Same code path for all backends — only output_format differs.
+
     pipe() auto-inserts converters to the mixer's s16le@48kHz.
     """
 
     def __init__(self, session) -> None:
         super().__init__()
         self.session = session
-        # Detect output format based on call type
         from speech_pipeline.RTPSession import RTPSession
         call = session.call if hasattr(session, 'call') else None
         if isinstance(call, RTPSession):
@@ -38,20 +40,44 @@ class SIPSource(Stage):
             _LOGGER.warning("SIPSource: call already hung up")
             return
 
-        _LOGGER.info("SIPSource: streaming audio (%s)", self.output_format)
         call = self.session.call
+        _LOGGER.info("SIPSource: streaming audio (%s)", self.output_format)
+
+        # Bounded queue — drop oldest on overflow. Prevents drift buildup
+        # regardless of backend timing (pyVoIP, RTPSession, or anything else).
+        rx_q: queue.Queue = queue.Queue(maxsize=5)
+
+        def _pump():
+            while not self.cancelled and not self.session.hungup.is_set():
+                try:
+                    frame = call.read_audio(length=160, blocking=True)
+                    if not frame:
+                        continue
+                    try:
+                        rx_q.put_nowait(frame)
+                    except queue.Full:
+                        try:
+                            rx_q.get_nowait()
+                        except queue.Empty:
+                            pass
+                        rx_q.put_nowait(frame)
+                except Exception:
+                    if not self.cancelled:
+                        break
+
+        threading.Thread(target=_pump, daemon=True, name="sip-rx-pump").start()
+
         while not self.cancelled and not self.session.hungup.is_set():
             try:
-                # Drain all available frames (don't let RX queue build up)
                 got_any = False
-                for _ in range(10):  # max 10 frames per burst to stay responsive
-                    frame = call.read_audio(length=160, blocking=False)
-                    if not frame:
+                for _ in range(10):
+                    try:
+                        frame = rx_q.get_nowait()
+                    except queue.Empty:
                         break
                     yield frame
                     got_any = True
                 if not got_any:
-                    # No data available — wait for next RTP packet
                     _time.sleep(0.02)
             except Exception as e:
                 if not self.cancelled:

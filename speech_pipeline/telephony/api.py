@@ -281,8 +281,14 @@ def post_commands(call_id: str):
 
     # Execute commands in background thread
     from . import commands as cmd_engine
-    cmd_engine.execute_commands(call, commands)
-    _LOGGER.info("Executing %d commands for call %s", len(commands), call_id)
+    # Execute commands in background thread — return 202 immediately
+    threading.Thread(
+        target=cmd_engine.execute_commands,
+        args=(call, commands),
+        daemon=True,
+        name=f"cmds-{call_id}",
+    ).start()
+    _LOGGER.info("Executing %d commands for call %s (background)", len(commands), call_id)
 
     return jsonify({"queued": len(commands), "call_id": call_id}), 202
 

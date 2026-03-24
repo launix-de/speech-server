@@ -1392,6 +1392,7 @@ def call_device(sip_user: str, reg: dict) -> SIPCall:
 
     from_uri = f"sip:conference@{_local_ip}"
     to_uri = contact_uri
+    call_obj._from_header = f"<{from_uri}>;tag={call_obj._local_tag}"
     call_obj._to_header = f"<{to_uri}>"
 
     invite = (

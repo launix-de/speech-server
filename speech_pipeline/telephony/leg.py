@@ -209,6 +209,8 @@ def originate_and_bridge(leg: Leg, call, pbx_entry: dict) -> None:
     except Exception as e:
         _LOGGER.warning("Originate %s failed: %s", leg.number, e)
         leg.status = "failed"
+        _LOGGER.info("Firing failed callback for leg %s (callbacks=%s, sub=%s)",
+                     leg.leg_id, list(leg.callbacks.keys()), leg.subscriber_id)
         _fire_callback(leg, "failed", error=str(e))
         delete_leg(leg.leg_id)
         return
@@ -331,10 +333,14 @@ def _fire_callback(leg: Leg, event: str, **extra) -> list:
 
     cb_path = leg.callbacks.get(event)
     if not cb_path:
+        _LOGGER.warning("_fire_callback: no callback for event=%s (leg=%s, callbacks=%s)",
+                        event, leg.leg_id, list(leg.callbacks.keys()))
         return []
 
     sub = sub_mod.get(leg.subscriber_id)
     if not sub:
+        _LOGGER.warning("_fire_callback: no subscriber %s for event=%s",
+                        leg.subscriber_id, event)
         return []
 
     url = sub["base_url"].rstrip("/") + "/" + cb_path.lstrip("/")
@@ -348,9 +354,11 @@ def _fire_callback(leg: Leg, event: str, **extra) -> list:
     }
 
     try:
+        _LOGGER.info("Leg callback %s → %s", event, url)
         resp = http_requests.post(url, json=payload, headers={
             "Authorization": f"Bearer {sub['bearer_token']}",
         }, timeout=10)
+        _LOGGER.info("Leg callback %s → %d %s", event, resp.status_code, resp.text[:200] if resp.text else "")
         if resp.status_code == 200 and resp.content:
             return resp.json().get("commands", [])
     except Exception as e:

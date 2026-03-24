@@ -13,8 +13,8 @@ from typing import Dict, List, Optional
 
 _LOGGER = logging.getLogger("telephony.subscriber")
 
-STALE_SECONDS = 180     # 3 minutes
-REMOVE_SECONDS = 600    # 10 minutes
+STALE_SECONDS = 0   # disabled — subscribers are permanent once registered
+REMOVE_SECONDS = 0  # disabled
 
 # subscriber_id -> subscriber dict
 _subscribers: Dict[str, dict] = {}
@@ -105,9 +105,10 @@ def find_by_did(did: str) -> Optional[dict]:
     if not entry:
         _did_map.pop(did, None)
         return None
-    age = time.time() - entry["last_seen"]
-    if age > STALE_SECONDS:
-        return None  # stale — treat as unreachable
+    if STALE_SECONDS:
+        age = time.time() - entry["last_seen"]
+        if age > STALE_SECONDS:
+            return None  # stale — treat as unreachable
     return entry
 
 
@@ -119,9 +120,10 @@ def find_by_pbx(pbx_id: str) -> Optional[dict]:
     """
     from . import auth as auth_mod
     for entry in _subscribers.values():
-        age = time.time() - entry["last_seen"]
-        if age > STALE_SECONDS:
-            continue
+        if STALE_SECONDS:
+            age = time.time() - entry["last_seen"]
+            if age > STALE_SECONDS:
+                continue
         if not entry.get("inbound_dids"):  # wildcard: no specific DIDs
             if auth_mod.check_pbx_access(entry["account_id"], pbx_id):
                 return entry
@@ -138,7 +140,9 @@ def delete_all_for_account(account_id: str) -> int:
 
 
 def _purge() -> None:
-    """Remove subscribers past REMOVE_SECONDS."""
+    """Remove subscribers past REMOVE_SECONDS (disabled if 0)."""
+    if not REMOVE_SECONDS:
+        return
     now = time.time()
     expired = [sid for sid, s in _subscribers.items()
                if now - s["last_seen"] > REMOVE_SECONDS]

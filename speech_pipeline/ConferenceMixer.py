@@ -285,75 +285,81 @@ class ConferenceMixer(Stage):
         frame_interval = self.frame_ms / 1000.0
         next_tick = time.monotonic()
 
+        _dbg_tick = 0
+
         while not self.cancelled:
-            # Real-time pacing: one frame per frame_interval
+            # Sleep until next tick (GIL may overshoot)
             now = time.monotonic()
             wait = next_tick - now
             if wait > 0:
                 time.sleep(wait)
-            next_tick += frame_interval
 
-            with self._lock:
-                sources = dict(self._sources)
+            # Process ALL pending ticks — catches up after GIL delays
+            ticks = 0
+            while next_tick <= time.monotonic():
+                next_tick += frame_interval
+                ticks += 1
+            if ticks == 0:
+                ticks = 1
+                next_tick += frame_interval
 
-            if not sources:
-                continue
+            for _ in range(ticks):
+                with self._lock:
+                    sources = dict(self._sources)
 
-            # Step 1: drain queues, extract one frame per source
-            frames: Dict[str, bytes] = {}
-            for sid, src in sources.items():
-                if src.finished and len(src.buffer) < self.frame_bytes:
-                    frames[sid] = silence
-                    src.done.set()
+                if not sources:
                     continue
-                while True:
+
+                # Step 1: drain queues, extract one frame per source
+                frames: Dict[str, bytes] = {}
+                for sid, src in sources.items():
+                    if src.finished and len(src.buffer) < self.frame_bytes:
+                        frames[sid] = silence
+                        src.done.set()
+                        continue
+                    while True:
+                        try:
+                            chunk = src.queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        if chunk is None:
+                            src.finished = True
+                            break
+                        src.buffer.extend(chunk)
+
+                    if len(src.buffer) >= self.frame_bytes:
+                        frames[sid] = bytes(src.buffer[:self.frame_bytes])
+                        del src.buffer[:self.frame_bytes]
+                    else:
+                        frames[sid] = silence
+
+                # Step 2: full mix
+                full_mix = silence
+                for frame in frames.values():
+                    full_mix = audioop.add(full_mix, frame, 2)
+
+                # Step 3: per-sink mix-minus and distribute
+                with self._lock:
+                    sinks = list(self._sinks)
+
+                _dbg_tick += 1
+                if _dbg_tick % 100 == 0:
+                    active = [sid for sid, f in frames.items() if f != silence]
+                    mutes = {e.id: e.mute_source for e in sinks}
+                    _LOGGER.debug("Mixer '%s' tick %d: sources=%s active=%s sinks=%s",
+                                  self.name, _dbg_tick,
+                                  list(frames.keys()), active, mutes)
+
+                for entry in sinks:
+                    if entry.mute_source and entry.mute_source in frames:
+                        negated = audioop.mul(frames[entry.mute_source], 2, -1)
+                        out = audioop.add(full_mix, negated, 2)
+                    else:
+                        out = full_mix
                     try:
-                        chunk = src.queue.get_nowait()
-                    except queue.Empty:
-                        break
-                    if chunk is None:
-                        src.finished = True
-                        break
-                    src.buffer.extend(chunk)
-
-                if len(src.buffer) >= self.frame_bytes:
-                    frames[sid] = bytes(src.buffer[:self.frame_bytes])
-                    del src.buffer[:self.frame_bytes]
-                else:
-                    frames[sid] = silence
-
-            # Step 2: full mix
-            full_mix = silence
-            for frame in frames.values():
-                full_mix = audioop.add(full_mix, frame, 2)
-
-            # Debug: log non-silent sources every 2s (~100 ticks)
-            if hasattr(self, '_dbg_tick'):
-                self._dbg_tick += 1
-            else:
-                self._dbg_tick = 0
-
-            # Step 3: per-sink mix-minus and distribute
-            with self._lock:
-                sinks = list(self._sinks)
-
-            if self._dbg_tick % 100 == 0:
-                active = [sid for sid, f in frames.items() if f != silence]
-                mutes = {e.id: e.mute_source for e in sinks}
-                _LOGGER.debug("Mixer '%s' tick %d: sources=%s active=%s sinks=%s",
-                              self.name, self._dbg_tick,
-                              list(frames.keys()), active, mutes)
-
-            for entry in sinks:
-                if entry.mute_source and entry.mute_source in frames:
-                    negated = audioop.mul(frames[entry.mute_source], 2, -1)
-                    out = audioop.add(full_mix, negated, 2)
-                else:
-                    out = full_mix
-                try:
-                    entry.queue.put_nowait(out)
-                except queue.Full:
-                    pass
+                        entry.queue.put_nowait(out)
+                    except queue.Full:
+                        pass
 
         # EOF to all sinks
         with self._lock:

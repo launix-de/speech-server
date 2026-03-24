@@ -333,13 +333,36 @@ def _create_pyvoip_session(leg: Leg, pbx_entry: dict):
 # ---------------------------------------------------------------------------
 
 class _CallSession:
-    """Minimal adapter so SIPSource/SIPSink can use a raw pyVoIP call."""
+    """Adapter so SIPSource/SIPSink can use a raw pyVoIP call.
+
+    Provides rx_queue (same pattern as AudioSocketSession) —
+    a pump thread reads from pyVoIP and fills the queue.
+    """
 
     def __init__(self, voip_call):
+        import queue as _queue
         self._call = voip_call
         self.connected = threading.Event()
         self.hungup = threading.Event()
         self.connected.set()
+        self.rx_queue: _queue.Queue = _queue.Queue(maxsize=10)
+
+        # Pump: pyVoIP read_audio → rx_queue (bounded, drop on full)
+        def _rx_pump():
+            while not self.hungup.is_set():
+                try:
+                    frame = voip_call.read_audio(length=160, blocking=True)
+                    if frame:
+                        try:
+                            self.rx_queue.put_nowait(frame)
+                        except _queue.Full:
+                            pass  # drop — bounded delay
+                except Exception:
+                    if not self.hungup.is_set():
+                        break
+
+        threading.Thread(target=_rx_pump, daemon=True,
+                         name="pyvoip-rx").start()
 
     @property
     def call(self):

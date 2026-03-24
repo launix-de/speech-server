@@ -49,6 +49,8 @@ class RTPSession:
         self._sock.settimeout(0.1)
 
         self._rx_queue: queue.Queue = queue.Queue(maxsize=10)
+        # Decoded frames for SIPSource (same pattern as AudioSocketSession.rx_queue)
+        self.rx_queue: queue.Queue = queue.Queue(maxsize=10)
         self._tx_queue: queue.Queue = queue.Queue(maxsize=10)
         self._running = False
         self._rx_thread: Optional[threading.Thread] = None
@@ -190,8 +192,9 @@ class RTPSession:
                 continue
 
             payload = data[RTP_HEADER_SIZE:]
+            # Decode and put into public rx_queue (for SIPSource)
             try:
-                self._rx_queue.put_nowait(payload)
+                self.rx_queue.put_nowait(self.codec.decode(payload))
             except queue.Full:
                 pass  # drop — real-time audio
 
@@ -232,6 +235,7 @@ class RTPCallSession:
         self.connected = threading.Event()
         self.hungup = threading.Event()
         self.connected.set()  # already connected
+        self.rx_queue = rtp_session.rx_queue  # for SIPSource
 
     @property
     def call(self):

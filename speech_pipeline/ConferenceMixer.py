@@ -86,7 +86,7 @@ class ConferenceMixer(Stage):
         mixer.  Returns a source ID for use with ``mute_source``.
         """
         src_id = _next_id("src")
-        in_q: queue.Queue = queue.Queue(maxsize=200)
+        in_q: queue.Queue = queue.Queue(maxsize=50)
         sink = QueueSink(in_q, self.sample_rate, "s16le")
         stage.pipe(sink)
 
@@ -116,7 +116,7 @@ class ConferenceMixer(Stage):
         Used by PipelineBuilder's ``tee:NAME`` element.
         """
         src_id = _next_id("src")
-        in_q: queue.Queue = queue.Queue(maxsize=200)
+        in_q: queue.Queue = queue.Queue(maxsize=50)
         entry = _Source(id=src_id, queue=in_q, sink=None)
         with self._lock:
             self._sources[src_id] = entry
@@ -195,7 +195,7 @@ class ConferenceMixer(Stage):
         Returns a sink ID.
         """
         sink_id = _next_id("sink")
-        out_q: queue.Queue = queue.Queue(maxsize=200)
+        out_q: queue.Queue = queue.Queue(maxsize=50)
         src = QueueSource(out_q, self.sample_rate, "s16le")
         src.pipe(stage)
 
@@ -218,7 +218,7 @@ class ConferenceMixer(Stage):
         Used by PipelineBuilder's ``mix:NAME`` element.
         """
         sink_id = _next_id("out")
-        out_q: queue.Queue = queue.Queue(maxsize=200)
+        out_q: queue.Queue = queue.Queue(maxsize=50)
         entry = _Sink(id=sink_id, stage=None, queue=out_q,
                       source=None, mute_source=mute_source, thread=None)
         with self._lock:

@@ -48,8 +48,8 @@ class RTPSession:
         self._sock.bind(("0.0.0.0", local_port))
         self._sock.settimeout(0.1)
 
-        self._rx_queue: queue.Queue = queue.Queue(maxsize=100)
-        self._tx_queue: queue.Queue = queue.Queue()
+        self._rx_queue: queue.Queue = queue.Queue(maxsize=10)
+        self._tx_queue: queue.Queue = queue.Queue(maxsize=10)
         self._running = False
         self._rx_thread: Optional[threading.Thread] = None
         self._tx_thread: Optional[threading.Thread] = None
@@ -99,11 +99,17 @@ class RTPSession:
 
     def write_s16le(self, data: bytes) -> None:
         """Encode s16le PCM to wire format and queue for TX."""
-        self._tx_queue.put(self.codec.encode(data))
+        try:
+            self._tx_queue.put_nowait(self.codec.encode(data))
+        except queue.Full:
+            pass  # drop — real-time audio, don't build up delay
 
     def write_wire(self, data: bytes) -> None:
         """Queue pre-encoded wire bytes for TX (no encoding)."""
-        self._tx_queue.put(data)
+        try:
+            self._tx_queue.put_nowait(data)
+        except queue.Full:
+            pass  # drop — real-time audio
 
     # ----- Legacy pyVoIP-compat API (u8) -----
 

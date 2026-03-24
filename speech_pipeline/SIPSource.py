@@ -42,10 +42,17 @@ class SIPSource(Stage):
         call = self.session.call
         while not self.cancelled and not self.session.hungup.is_set():
             try:
-                frame = call.read_audio(length=160, blocking=False)
-                if frame:
+                # Drain all available frames (don't let RX queue build up)
+                got_any = False
+                for _ in range(10):  # max 10 frames per burst to stay responsive
+                    frame = call.read_audio(length=160, blocking=False)
+                    if not frame:
+                        break
                     yield frame
-                _time.sleep(0.02)
+                    got_any = True
+                if not got_any:
+                    # No data available — wait for next RTP packet
+                    _time.sleep(0.02)
             except Exception as e:
                 if not self.cancelled:
                     _LOGGER.warning("SIPSource read error: %s", e)

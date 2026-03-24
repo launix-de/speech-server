@@ -34,6 +34,7 @@ _LOGGER = logging.getLogger("telephony.sip-stack")
 
 _sock: Optional[socket.socket] = None
 _local_ip: str = "0.0.0.0"
+_public_ip: str = ""  # learned from REGISTER response (received= param)
 _sip_port: int = 5060
 _recv_thread: Optional[threading.Thread] = None
 _running = False
@@ -361,7 +362,9 @@ def _build_request(
     via = (f"SIP/2.0/UDP {_local_ip}:{_sip_port}"
            f";branch={via_branch};rport")
     if not contact:
-        contact = f"<sip:{_local_ip}:{_sip_port}>"
+        # Use public hostname if available (NAT traversal)
+        contact_ip = _public_ip or _local_ip
+        contact = f"<sip:{contact_ip}:{_sip_port}>"
 
     content_type = ""
     if body:
@@ -494,6 +497,16 @@ def _handle_register_response(trunk: _Trunk, msg: dict) -> None:
 
     if status == 200:
         trunk.registered = True
+        # Learn public IP from Via received= parameter (NAT traversal)
+        global _public_ip
+        via = _get_header(msg, "via")
+        _LOGGER.info("Trunk %s: REGISTER 200 Via: %s", trunk.pbx_id, via)
+        m = re.search(r'received=([^;>\s]+)', via) if via else None
+        if m and not _public_ip:
+            _public_ip = m.group(1)
+            _LOGGER.info("Learned public IP: %s (from Via received=)", _public_ip)
+            # Re-register immediately with public IP in Contact
+            threading.Thread(target=_send_register, args=(trunk,), daemon=True).start()
         _LOGGER.info("Trunk %s: registered with %s:%d as %s",
                      trunk.pbx_id, trunk.server, trunk.port, trunk.username)
         # Schedule re-registration
@@ -1052,29 +1065,67 @@ def _handle_inbound_invite(msg: dict, addr: Tuple[str, int]) -> None:
 
 
 def _handle_trunk_invite(msg: dict, addr: Tuple[str, int], pbx_id: str) -> None:
-    """Handle incoming call from a trunk PBX — delegate to sip_listener logic."""
+    """Handle incoming call from a trunk PBX with Early Media.
+
+    Sends 183 Session Progress (not 200 OK) so RTP starts immediately
+    for hold music.  The CRM decides when to answer via the API.
+    """
     from_h = _get_header(msg, "from")
     to_h = _get_header(msg, "to")
     caller = _extract_user(_extract_uri(from_h))
     callee = _extract_user(_extract_uri(to_h))
+    call_id = _get_header(msg, "call-id")
 
     _LOGGER.info("Trunk INVITE on %s: %s → %s", pbx_id, caller, callee)
 
-    # Send 200 OK (we handle the call ourselves via conference)
     to_tag = _gen_tag()
-    # Generate SDP with an RTP port for the inbound audio
     rtp_port = _find_free_port()
     sdp = _build_sdp(_local_ip, rtp_port)
-    resp = _build_response(200, "OK", msg, to_tag=to_tag, body=sdp)
-    _send(resp, addr)
 
-    # Delegate to sip_listener for subscriber lookup + CRM webhook
+    # Send 183 Session Progress with SDP — starts Early Media RTP
+    resp = _build_response(183, "Session Progress", msg, to_tag=to_tag, body=sdp)
+    _send(resp, addr)
+    _LOGGER.info("Trunk INVITE: sent 183 Session Progress (Early Media RTP :%d)", rtp_port)
+
+    # Store the dialog info so we can send 200 OK later via answer_trunk_leg()
+    _trunk_dialogs[call_id] = {
+        "msg": msg,
+        "addr": addr,
+        "to_tag": to_tag,
+        "rtp_port": rtp_port,
+        "sdp": sdp,
+        "pbx_id": pbx_id,
+        "answered": False,
+    }
+
+    # Delegate to sip_listener
     from . import sip_listener
     threading.Thread(
         target=sip_listener._handle_trunk_call,
         args=(pbx_id, caller, callee, msg, addr, rtp_port),
         daemon=True,
     ).start()
+
+
+# Trunk dialog storage for deferred 200 OK
+_trunk_dialogs: Dict[str, dict] = {}
+
+
+def answer_trunk_leg(sip_call_id: str) -> bool:
+    """Send 200 OK for a trunk leg (deferred answer after Early Media).
+
+    Called by the API when the CRM decides to answer the call.
+    """
+    dialog = _trunk_dialogs.get(sip_call_id)
+    if not dialog or dialog["answered"]:
+        return False
+
+    resp = _build_response(200, "OK", dialog["msg"],
+                            to_tag=dialog["to_tag"], body=dialog["sdp"])
+    _send(resp, dialog["addr"])
+    dialog["answered"] = True
+    _LOGGER.info("Trunk leg %s: sent 200 OK (answered)", sip_call_id)
+    return True
 
 
 def _proxy_invite(

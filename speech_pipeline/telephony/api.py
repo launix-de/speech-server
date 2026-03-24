@@ -72,14 +72,27 @@ def _body() -> dict:
 def put_pbx(pbx_id: str):
     body = _body()
     entry = pbx.put(pbx_id, body)
-    # pyVoIP listener handles trunk registration + inbound calls (has RTP)
-    # sip_stack only handles the registrar for client devices
     pbx_data = pbx.get(pbx_id)
-    from . import sip_listener
-    try:
-        sip_listener.start_listener(pbx_id, pbx_data)
-    except Exception as e:
-        _LOGGER.warning("SIP listener start failed for %s: %s", pbx_id, e)
+    # Prefer sip_stack for trunk (supports Early Media + direct codec control)
+    from . import sip_stack
+    if sip_stack._running:
+        try:
+            sip_stack.register_trunk(
+                pbx_id,
+                server=pbx_data.get("sip_proxy") or pbx_data.get("sip_host", ""),
+                port=int(pbx_data.get("sip_port", 5060)),
+                username=pbx_data.get("sip_user", ""),
+                password=pbx_data.get("sip_password", ""),
+            )
+        except Exception as e:
+            _LOGGER.warning("SIP trunk registration failed for %s: %s", pbx_id, e)
+    else:
+        # Fallback: pyVoIP (no Early Media)
+        from . import sip_listener
+        try:
+            sip_listener.start_listener(pbx_id, pbx_data)
+        except Exception as e:
+            _LOGGER.warning("SIP listener start failed for %s: %s", pbx_id, e)
     return jsonify(entry), 200
 
 
@@ -343,6 +356,34 @@ def delete_leg(leg_id: str):
     if not leg_mod.delete_leg(leg_id):
         return ("Leg not found\n", 404)
     return ("", 204)
+
+
+@api.route("/legs/<leg_id>/answer", methods=["POST"])
+@auth.require_account
+def answer_leg(leg_id: str):
+    """Answer an inbound leg (send 200 OK after Early Media).
+
+    Call this when a participant has joined and the call should
+    be fully established (stops Early Media, starts billing).
+    """
+    from . import leg as leg_mod, sip_stack
+
+    l = leg_mod.get_leg(leg_id)
+    if not l:
+        return ("Leg not found\n", 404)
+
+    # For sip_stack trunk legs: send 200 OK (Early Media → Answered)
+    sip_call_id = getattr(l, '_sip_call_id', '')
+    if sip_call_id:
+        if sip_stack.answer_trunk_leg(sip_call_id):
+            _LOGGER.info("Leg %s answered (200 OK sent)", leg_id)
+            return jsonify({"answered": True, "leg_id": leg_id}), 200
+
+    # For pyVoIP legs: already answered (pyVoIP limitation)
+    if l.voip_call:
+        return jsonify({"answered": True, "leg_id": leg_id, "note": "already answered (pyVoIP)"}), 200
+
+    return ("Cannot answer this leg\n", 400)
 
 
 @api.route("/legs/<leg_id>/bridge", methods=["POST"])

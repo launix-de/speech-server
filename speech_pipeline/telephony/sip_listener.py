@@ -132,9 +132,11 @@ def _handle_incoming(pbx_id: str, voip_call) -> None:
             pass
         return
 
-    # Answer the SIP call (we're bridging it ourselves)
+    # Do NOT answer yet — CRM controls when to answer via POST /api/legs/{id}/answer.
+    # For pyVoIP: we must answer to get RTP flowing (pyVoIP limitation).
+    # For sip_stack trunk: 183 Session Progress already sent, RTP flows as Early Media.
     try:
-        voip_call.answer()
+        voip_call.answer()  # TODO: replace with 183 when pyVoIP supports it
     except Exception as e:
         _LOGGER.warning("Failed to answer: %s", e)
         return
@@ -242,17 +244,30 @@ def _handle_trunk_call(pbx_id: str, caller: str, callee: str,
         _LOGGER.warning("Account %s not allowed on PBX %s", sub["account_id"], pbx_id)
         return
 
-    # Create inbound leg (no voip_call — RTP handled separately)
+    # Create RTPSession for inbound audio (Early Media capable)
+    from . import sip_stack
+    from speech_pipeline.RTPSession import RTPSession, RTPCallSession
+
+    remote_host, remote_port = sip_stack._parse_sdp(sip_msg.get("body", ""))
+    rtp = RTPSession(rtp_port, remote_host, remote_port)
+    rtp.start()
+    session = RTPCallSession(rtp)
+
+    # Create inbound leg with RTPSession as voip_call
     leg = leg_mod.create_leg(
         direction="inbound",
         number=caller,
         pbx_id=pbx_id,
         subscriber_id=sub["id"],
+        voip_call=rtp,  # RTPSession mimics pyVoIP call interface
     )
     leg.status = "ringing"
     leg._sip_msg = sip_msg
     leg._sip_addr = addr
     leg._rtp_port = rtp_port
+    leg._rtp_session = rtp
+    # Store SIP Call-ID for deferred answer (Early Media → 200 OK)
+    leg._sip_call_id = sip_stack._get_header(sip_msg, "call-id")
 
     # Fire incoming event asynchronously
     threading.Thread(

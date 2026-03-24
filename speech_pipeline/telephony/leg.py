@@ -59,13 +59,13 @@ class Leg:
         }
 
     def hangup(self) -> None:
-        if self._src_id and self.call_id:
-            from . import call_state
-            call = call_state.get_call(self.call_id)
-            if call:
-                call.mixer.kill_source(self._src_id)
-                if self._sink_id:
-                    call.mixer.remove_sink(self._sink_id)
+        # 1. Send SIP BYE FIRST (before closing sockets)
+        if hasattr(self, '_sip_call') and self._sip_call:
+            try:
+                from . import sip_stack
+                sip_stack.hangup(self._sip_call)
+            except Exception:
+                pass
         if self.voip_call:
             try:
                 self.voip_call.hangup()
@@ -76,6 +76,20 @@ class Leg:
                 self._sip_session.hangup()
             except Exception:
                 pass
+        # 2. Stop RTP
+        if hasattr(self, '_rtp_session') and self._rtp_session:
+            try:
+                self._rtp_session.stop()
+            except Exception:
+                pass
+        # 3. Remove from mixer
+        if self._src_id and self.call_id:
+            from . import call_state
+            call = call_state.get_call(self.call_id)
+            if call:
+                call.mixer.kill_source(self._src_id)
+                if self._sink_id:
+                    call.mixer.remove_sink(self._sink_id)
         self.status = "completed"
 
 
@@ -181,37 +195,64 @@ def bridge_to_call(leg: Leg, call) -> None:
 def originate_and_bridge(leg: Leg, call, pbx_entry: dict) -> None:
     """Originate an outbound SIP call and bridge into conference.
 
-    Uses the built-in SIP stack if active, otherwise falls back to pyVoIP.
+    Routing:
+    - SIP URI with @ + registered device → sip_stack direct INVITE + RTPSession
+    - Phone number or unregistered → pyVoIP trunk (SIPSession)
+
+    Both paths produce a session compatible with SIPSource/SIPSink,
+    then feed through the same bridge_to_call → ConferenceMixer pipeline.
     """
     _fire_callback(leg, "ringing")
 
     try:
-        from . import sip_stack
-        # SIP URI with @ → check if registered device on our registrar
-        if sip_stack._running and "@" in leg.number:
-            from urllib.parse import unquote
-            sip_user = unquote(leg.number)
-            reg = sip_stack.get_registration(sip_user)
-            if reg:
-                _originate_to_device(leg, call, reg)
-            else:
-                raise RuntimeError(f"SIP device {sip_user} not registered")
-        else:
-            # Phone number → via pyVoIP trunk (has RTP)
-            _originate_pyvoip(leg, call, pbx_entry)
+        session = _create_sip_session(leg, pbx_entry)
     except Exception as e:
         _LOGGER.warning("Originate %s failed: %s", leg.number, e)
         leg.status = "failed"
         _fire_callback(leg, "failed", error=str(e))
         delete_leg(leg.leg_id)
+        return
+
+    # Bridge into conference (identical for all session types)
+    leg.voip_call = session.call
+    bridge_to_call(leg, call)
+    _fire_callback(leg, "answered")
+
+    # Monitor for hangup
+    session.hungup.wait()
+    _LOGGER.info("Originate %s: call ended", leg.number)
+    leg.status = "completed"
+    _fire_callback(leg, "completed")
+    delete_leg(leg.leg_id)
 
 
-def _originate_to_device(leg: Leg, call, reg: dict) -> None:
-    """Originate to a registered SIP device via our registrar."""
+def _create_sip_session(leg: Leg, pbx_entry: dict):
+    """Create a SIP session — returns a session object with .call, .connected, .hungup.
+
+    For registered SIP devices: uses sip_stack signaling + RTPSession for media.
+    For phone numbers: uses pyVoIP (full SIP+RTP stack).
+    """
     from . import sip_stack
 
-    _LOGGER.info("Originate %s to registered device %s",
-                 leg.number, reg.get("contact_uri", "?"))
+    # Check if target is a registered SIP device
+    if sip_stack._running and "@" in leg.number:
+        from urllib.parse import unquote
+        sip_user = unquote(leg.number)
+        reg = sip_stack.get_registration(sip_user)
+        if reg:
+            return _create_sip_stack_session(leg, reg)
+        raise RuntimeError(f"SIP device {sip_user} not registered")
+
+    # Phone number → pyVoIP trunk
+    return _create_pyvoip_session(leg, pbx_entry)
+
+
+def _create_sip_stack_session(leg: Leg, reg: dict):
+    """Originate via sip_stack + RTPSession for audio."""
+    from . import sip_stack
+    from speech_pipeline.RTPSession import RTPSession, RTPCallSession
+
+    _LOGGER.info("Originate %s to device %s", leg.number, reg.get("contact_uri", "?"))
     sip_call = sip_stack.call_device(leg.number, reg)
 
     # Wait for answer (up to 30s)
@@ -226,28 +267,34 @@ def _originate_to_device(leg: Leg, call, reg: dict) -> None:
     if sip_call.state == "ended":
         raise RuntimeError(f"SIP call to {leg.number} ended/rejected")
 
-    _LOGGER.info("SIP call answered: %s (RTP %s:%d)",
-                 leg.number, sip_call.remote_rtp_host, sip_call.remote_rtp_port)
+    _LOGGER.info("SIP answered: %s → RTP %s:%d (local :%d)",
+                 leg.number, sip_call.remote_rtp_host,
+                 sip_call.remote_rtp_port, sip_call.local_rtp_port)
 
+    # Create RTP media session + wrap as SIPSource/SIPSink-compatible session
+    rtp = RTPSession(sip_call.local_rtp_port,
+                     sip_call.remote_rtp_host, sip_call.remote_rtp_port)
+    rtp.start()
+    session = RTPCallSession(rtp)
     leg._sip_call = sip_call
-    bridge_to_call(leg, call)
-    _fire_callback(leg, "answered")
+    leg._rtp_session = rtp
 
-    # Monitor for hangup
-    while sip_call.state != "ended":
-        sip_call.state_event.wait(timeout=2.0)
-        sip_call.state_event.clear()
+    # Monitor sip_stack call state → set hungup when ended
+    def _monitor():
+        while sip_call.state != "ended":
+            sip_call.state_event.wait(timeout=2.0)
+            sip_call.state_event.clear()
+        rtp.stop()
+        session.hungup.set()
 
-    _LOGGER.info("SIP call ended: %s", leg.number)
-    leg.status = "completed"
-    _fire_callback(leg, "completed")
-    delete_leg(leg.leg_id)
+    threading.Thread(target=_monitor, daemon=True,
+                     name=f"mon-{leg.leg_id}").start()
+    return session
 
 
-def _originate_pyvoip(leg: Leg, call, pbx_entry: dict) -> None:
-    """Fallback: originate via pyVoIP SIPSession."""
+def _create_pyvoip_session(leg: Leg, pbx_entry: dict):
+    """Originate via pyVoIP (full SIP+RTP stack)."""
     from speech_pipeline.SIPSession import SIPSession
-    from pyVoIP.VoIP.VoIP import CallState
 
     _LOGGER.info("Originate %s via pyVoIP on PBX %s", leg.number, leg.pbx_id)
     session = SIPSession(
@@ -257,25 +304,8 @@ def _originate_pyvoip(leg: Leg, call, pbx_entry: dict) -> None:
         username=pbx_entry.get("sip_user", "piper"),
         password=pbx_entry.get("sip_password", ""),
     )
-    session.start()
-
-    # Wait for answer
-    deadline = time.time() + 30
-    while session.call.state != CallState.ANSWERED:
-        if session.call.state == CallState.ENDED:
-            raise RuntimeError(f"SIP call to {leg.number} ended/rejected")
-        if time.time() > deadline:
-            try:
-                session.call.hangup()
-            except Exception:
-                pass
-            raise RuntimeError(f"SIP call to {leg.number} ring timeout")
-        time.sleep(0.3)
-
-    leg.voip_call = session.call
-    leg._sip_session = session
-    bridge_to_call(leg, call)
-    _fire_callback(leg, "answered")
+    session.start()  # Blocks until registered + answered
+    return session
 
 
 # ---------------------------------------------------------------------------

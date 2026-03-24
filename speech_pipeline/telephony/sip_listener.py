@@ -18,7 +18,7 @@ from . import leg as leg_mod, subscriber as sub_mod, dispatcher
 
 _LOGGER = logging.getLogger("telephony.sip-listener")
 
-RING_TIMEOUT = 15  # seconds to wait for subscriber to accept
+RING_TIMEOUT = 30  # seconds to wait for subscriber to bridge via API
 
 _phones: Dict[str, object] = {}  # pbx_id -> VoIPPhone
 
@@ -149,79 +149,20 @@ def _handle_incoming(pbx_id: str, voip_call) -> None:
     )
     leg.status = "ringing"
 
-    # Fire incoming event to subscriber with leg_id
-    # Subscriber responds with commands (e.g. create call + add_leg)
-    cmds = dispatcher.fire_event(
-        # We need a minimal "call-like" object for fire_event
-        _EventContext(sub, leg),
-        "incoming",
-        {"caller": caller, "callee": callee, "leg_id": leg.leg_id},
-    )
+    # Fire incoming event asynchronously — CRM handles everything via REST API.
+    # Must be async because the CRM makes API calls back to us during handling.
+    threading.Thread(
+        target=dispatcher.fire_event,
+        args=(_EventContext(sub, leg), "incoming",
+              {"caller": caller, "callee": callee, "leg_id": leg.leg_id}),
+        daemon=True,
+    ).start()
 
-    if cmds:
-        # Execute commands — they should bridge this leg into a conference
-        from . import commands as cmd_engine, call_state
-        _execute_inbound_commands(leg, sub, cmds)
-    else:
-        # No commands — wait for subscriber to call the bridge API
-        _wait_for_bridge(leg, voip_call)
+    # Wait for CRM to bridge this leg via the API, or timeout
+    _wait_for_bridge(leg, voip_call)
 
     # Monitor for hangup (runs until SIP call ends)
     _monitor_hangup(leg, voip_call)
-
-
-def _execute_inbound_commands(leg, sub: dict, cmds: list) -> None:
-    """Execute commands that came from the incoming event response."""
-    from . import commands as cmd_engine, call_state
-
-    bridged = False
-    for cmd in cmds:
-        action = cmd.get("action")
-        if action == "create_call":
-            call = call_state.create_call(
-                subscriber_id=sub["id"],
-                account_id=sub["account_id"],
-                pbx_id=leg.pbx_id,
-                caller=leg.number,
-                direction="inbound",
-                events=sub.get("events", {}),
-            )
-            callbacks = cmd.get("callbacks", {})
-            leg.callbacks.update(callbacks)
-            leg_mod.bridge_to_call(leg, call)
-            bridged = True
-
-            remaining = [c for c in cmds if c is not cmd]
-            if remaining:
-                cmd_engine.execute_commands(call, remaining)
-            return
-
-        elif action == "add_leg" and cmd.get("leg_id") == leg.leg_id:
-            call_id = cmd.get("call_id")
-            callbacks = cmd.get("callbacks", {})
-            leg.callbacks.update(callbacks)
-
-            # Find the call — either from command or from any active call for this subscriber
-            call = None
-            if call_id:
-                call = call_state.get_call(call_id)
-            if not call:
-                # CRM created the call via API — find it by subscriber
-                for c in call_state.list_calls():
-                    if c.subscriber_id == sub["id"] and c.status == "active":
-                        call = c
-                        break
-            if call:
-                leg_mod.bridge_to_call(leg, call)
-                bridged = True
-
-                remaining = [c for c in cmds if c is not cmd and c.get("action") != "add_leg"]
-                if remaining:
-                    cmd_engine.execute_commands(call, remaining)
-                return
-
-    if not bridged:
-        _wait_for_bridge(leg, getattr(leg, 'voip_call', None))
 
 
 def _wait_for_bridge(leg, voip_call) -> None:
@@ -314,17 +255,16 @@ def _handle_trunk_call(pbx_id: str, caller: str, callee: str,
     leg._sip_addr = addr
     leg._rtp_port = rtp_port
 
-    # Fire incoming event to subscriber
-    cmds = dispatcher.fire_event(
-        _EventContext(sub, leg),
-        "incoming",
-        {"caller": caller, "callee": callee, "leg_id": leg.leg_id},
-    )
+    # Fire incoming event asynchronously
+    threading.Thread(
+        target=dispatcher.fire_event,
+        args=(_EventContext(sub, leg), "incoming",
+              {"caller": caller, "callee": callee, "leg_id": leg.leg_id}),
+        daemon=True,
+    ).start()
 
-    if cmds:
-        _execute_inbound_commands(leg, sub, cmds)
-
-    # TODO: monitor for BYE from trunk (sip_stack handles this via _handle_inbound_bye)
+    # Wait for CRM to bridge this leg via the API
+    _wait_for_bridge(leg, None)
 
 
 class _EventContext:

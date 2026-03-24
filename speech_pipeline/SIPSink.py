@@ -1,80 +1,79 @@
 from __future__ import annotations
 
+import audioop
 import logging
-import queue
 import threading
 
 from .base import AudioFormat, Stage
 
 _LOGGER = logging.getLogger("sip-sink")
 
-# 160 bytes u8 @ 8kHz = 20ms per frame
-_FRAME_BYTES = 160
+_FRAME = 160  # 160 samples u8 = 20ms @ 8kHz
 
 
-class _AudioQueue:
-    """Drop-in replacement for pyVoIP's RTPPacketManager (pmout).
+class _RingBuffer:
+    """Ring buffer for continuous audio streaming.
 
-    Uses a thread-safe queue instead of a BytesIO buffer.
-    pyVoIP's original buffer loses data when the trans() thread's read
-    cursor outruns the write cursor (which happens whenever there's a
-    gap between writes, e.g. between TTS sentences).
-
-    This queue never loses data: trans() blocks briefly when empty and
-    sends silence, writes are buffered until trans() is ready.
+    Writer (SIPSink) appends u8 audio from the mixer.
+    Reader (pyVoIP trans()) reads 160 bytes every ~20ms.
     """
 
-    def __init__(self):
-        self._q: queue.Queue[bytes] = queue.Queue()
-        self._partial = b""
-        self.rebuilding = False  # compat with RTPPacketManager
-
-    def read(self, length: int = 160) -> bytes:
-        """Called by pyVoIP's trans() thread every ~20ms."""
-        # Collect enough bytes for one frame
-        while len(self._partial) < length:
-            try:
-                chunk = self._q.get(timeout=0.005)
-                self._partial += chunk
-            except queue.Empty:
-                break
-
-        if len(self._partial) >= length:
-            result = self._partial[:length]
-            self._partial = self._partial[length:]
-            return result
-
-        # Not enough data — return what we have + silence padding
-        result = self._partial + b"\x80" * (length - len(self._partial))
-        self._partial = b""
-        return result
+    def __init__(self, capacity: int = 16000):
+        self._buf = bytearray(b"\x80" * capacity)
+        self._cap = capacity
+        self._write_pos = 0
+        self._read_pos = 0
+        self._lock = threading.Lock()
+        self.rebuilding = False
 
     def write(self, offset: int, data: bytes) -> None:
-        """Called by VoIPCall.write_audio() → RTPClient.write()."""
-        self._q.put(data)
+        """Append to ring buffer. Offset is ignored (FIFO)."""
+        with self._lock:
+            # Protect against writer lapping reader
+            if self._write_pos + len(data) - self._read_pos > self._cap:
+                self._read_pos = self._write_pos + len(data) - self._cap
+            for b in data:
+                self._buf[self._write_pos % self._cap] = b
+                self._write_pos += 1
+
+    def read(self, length: int = _FRAME) -> bytes:
+        """Non-blocking read."""
+        self._read_id = id(self)  # Tag for identification
+        with self._lock:
+            avail = self._write_pos - self._read_pos
+            if avail < length:
+                if self._write_pos >= length:
+                    self._read_pos = self._write_pos - length
+                else:
+                    return b"\x80" * length
+
+            start = self._read_pos % self._cap
+            self._read_pos += length
+
+            if start + length <= self._cap:
+                return bytes(self._buf[start:start + length])
+            else:
+                part1 = bytes(self._buf[start:])
+                part2 = bytes(self._buf[:length - len(part1)])
+                return part1 + part2
 
 
 class SIPSink(Stage):
-    """Sink stage: writes audio into a pyVoIP SIP call.
+    """Sink stage: writes audio into a SIP call.
 
-    Input: unsigned 8-bit PCM (u8) mono @ 8000 Hz.
-    Converters are auto-inserted by pipe() if the upstream stage
-    outputs a different format (e.g. s16le @ 22050 from TTS).
+    Input: s16le mono @ 8000 Hz (pipe() auto-resamples from mixer rate).
+    Converts s16le → u8 and feeds into a ring buffer.
+    pyVoIP's trans() reads at its own pace (fixed by TRANSMIT_DELAY_REDUCTION=1).
 
-    Replaces pyVoIP's broken output buffer with a thread-safe queue,
-    then feeds audio through the normal write_audio() path. pyVoIP's
-    trans() thread handles RTP framing, encoding, and pacing.
-
-    Terminal sink — drives the pipeline like WebSocketWriter.run().
+    Terminal sink — drives the pipeline.
     """
 
     def __init__(self, session) -> None:
         super().__init__()
         self.session = session
-        self.input_format = AudioFormat(8000, "u8")
+        self.input_format = AudioFormat(8000, "s16le")
 
     def run(self) -> None:
-        """Drive the pipeline and write all audio to the SIP call."""
         if not self.upstream:
             return
 
@@ -94,25 +93,23 @@ class SIPSink(Stage):
         rtp = call.RTPClients[0]
         _LOGGER.info("SIPSink: streaming to %s:%d", rtp.outIP, rtp.outPort)
 
-        # Replace pyVoIP's broken BytesIO buffer with our queue-based buffer.
-        # The trans() thread (already running) will now read from the queue.
-        rtp.pmout = _AudioQueue()
+        # Fix pyVoIP trans() timing bug
+        import pyVoIP
+        pyVoIP.TRANSMIT_DELAY_REDUCTION = 1.0
+
+        _LOGGER.info("SIPSink: codec=%s rate=%s",
+                     rtp.preference, getattr(rtp.preference, 'rate', '?'))
+
+        # Replace pyVoIP's broken BytesIO buffer with ring buffer
+        rtp.pmout = _RingBuffer()
 
         try:
             for pcm in self.upstream.stream_pcm24k():
                 if self.cancelled or self.session.hungup.is_set():
                     break
-                # Write in 160-byte frames (20ms @ 8kHz u8)
-                for i in range(0, len(pcm), _FRAME_BYTES):
-                    if self.cancelled or self.session.hungup.is_set():
-                        break
-                    chunk = pcm[i:i + _FRAME_BYTES]
-                    if not chunk:
-                        continue
-                    # Pad incomplete final frame with silence
-                    if len(chunk) < _FRAME_BYTES:
-                        chunk = chunk + b"\x80" * (_FRAME_BYTES - len(chunk))
-                    call.write_audio(chunk)
+                # s16le → u8, OHNE Ring-Buffer (direkt an pyVoIP's original pmout)
+                signed8 = audioop.lin2lin(pcm, 2, 1)
+                call.write_audio(audioop.bias(signed8, 1, 128))
         except Exception as e:
             if not self.cancelled:
                 _LOGGER.warning("SIPSink write error: %s", e)

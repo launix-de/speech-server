@@ -101,13 +101,38 @@ def put_account(account_id: str, data: dict) -> dict:
     acct = {
         "id": account_id,
         "token": token,
-        "pbx": data.get("pbx"),             # None = any PBX allowed
+        "base_url": data.get("base_url"),    # CRM base URL for heartbeat ping
+        "pbx": data.get("pbx"),              # None = any PBX allowed
         "max_concurrent_calls": data.get("max_concurrent_calls", 0),
         "features": data.get("features", []),
     }
     _accounts[account_id] = acct
     _LOGGER.info("Account registered: %s (pbx=%s)", account_id, acct["pbx"])
+
+    # Ping CRM to register as subscriber immediately
+    base_url = acct.get("base_url")
+    if base_url:
+        import threading
+        threading.Thread(
+            target=_ping_crm_heartbeat,
+            args=(base_url, token),
+            daemon=True,
+        ).start()
+
     return acct
+
+
+def _ping_crm_heartbeat(base_url: str, token: str) -> None:
+    """Tell the CRM to register its subscriber hooks at the speech server."""
+    import requests as http_requests
+    url = base_url.rstrip("/") + "/Telephone/SpeechServer/heartbeat"
+    try:
+        resp = http_requests.get(url,
+                                 headers={"Authorization": f"Bearer {token}"},
+                                 timeout=10)
+        _LOGGER.info("Pinged CRM heartbeat %s → %d", url, resp.status_code)
+    except Exception as e:
+        _LOGGER.warning("Failed to ping CRM heartbeat %s: %s", url, e)
 
 
 def delete_account(account_id: str) -> bool:

@@ -9,12 +9,11 @@ _LOGGER = logging.getLogger("sip-source")
 
 
 class SIPSource(Stage):
-    """Source stage: reads audio from a pyVoIP SIP call.
+    """Source stage: reads audio from a pyVoIP or RTPSession SIP call.
 
     Output: unsigned 8-bit PCM (u8) mono @ 8000 Hz.
-    This is pyVoIP's native decoded audio format.
-    Converters are auto-inserted by pipe() if the downstream stage
-    needs a different format (e.g. s16le @ 16kHz for WhisperSTT).
+    pyVoIP decodes µ-law → u8 internally. RTPSession does the same.
+    pipe() auto-inserts converters to the mixer's s16le@48kHz.
     """
 
     def __init__(self, session) -> None:
@@ -37,13 +36,10 @@ class SIPSource(Stage):
         call = self.session.call
         while not self.cancelled and not self.session.hungup.is_set():
             try:
-                # Non-blocking read: returns whatever is in the RTP buffer.
-                # We pace at real-time (20ms per 160-byte frame) to avoid
-                # spinning when the buffer only has silence.
                 frame = call.read_audio(length=160, blocking=False)
                 if frame:
                     yield frame
-                _time.sleep(0.02)  # 20ms = one frame period @ 8kHz
+                _time.sleep(0.02)
             except Exception as e:
                 if not self.cancelled:
                     _LOGGER.warning("SIPSource read error: %s", e)

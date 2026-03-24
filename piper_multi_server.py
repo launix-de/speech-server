@@ -1339,6 +1339,13 @@ def main() -> None:
 
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
 
+    # Fix pyVoIP trans() timing (must be set before any calls)
+    try:
+        import pyVoIP
+        pyVoIP.TRANSMIT_DELAY_REDUCTION = 1.0
+    except ImportError:
+        pass
+
     # Start built-in SIP stack if requested
     if args.sip_port:
         from speech_pipeline.telephony import sip_stack

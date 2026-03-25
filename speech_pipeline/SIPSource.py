@@ -1,6 +1,13 @@
+"""Source stage: reads audio from a SIP call (pyVoIP or RTPSession).
+
+Same pattern as AudioSocketSource — blocks on session.rx_queue.
+The session's RTP receiver fills the queue; this stage just yields.
+pipe() auto-inserts converters to the mixer's s16le@48kHz.
+"""
 from __future__ import annotations
 
 import logging
+from queue import Empty
 from typing import Iterator
 
 from .base import AudioFormat, Stage
@@ -9,17 +16,15 @@ _LOGGER = logging.getLogger("sip-source")
 
 
 class SIPSource(Stage):
-    """Source stage: reads audio from a pyVoIP or RTPSession SIP call.
+    """Yields audio from session.rx_queue.
 
-    For RTPSession: output is s16le @ codec sample rate (codec decodes).
-    For pyVoIP: output is u8 @ 8000 Hz (pyVoIP decodes internally).
-    pipe() auto-inserts converters to the mixer's s16le@48kHz.
+    Same pattern as AudioSocketSource/CodecSocketSource.
+    Output format depends on what the session puts in rx_queue.
     """
 
     def __init__(self, session) -> None:
         super().__init__()
         self.session = session
-        # Detect output format based on call type
         from speech_pipeline.RTPSession import RTPSession
         call = session.call if hasattr(session, 'call') else None
         if isinstance(call, RTPSession):
@@ -28,8 +33,6 @@ class SIPSource(Stage):
             self.output_format = AudioFormat(8000, "u8")
 
     def stream_pcm24k(self) -> Iterator[bytes]:
-        import time as _time
-
         if not self.session.connected.is_set():
             _LOGGER.info("SIPSource: waiting for call to connect...")
             self.session.connected.wait(timeout=30)
@@ -39,15 +42,12 @@ class SIPSource(Stage):
             return
 
         _LOGGER.info("SIPSource: streaming audio (%s)", self.output_format)
-        call = self.session.call
         while not self.cancelled and not self.session.hungup.is_set():
             try:
-                frame = call.read_audio(length=160, blocking=True)
-                if frame:
-                    yield frame
-            except Exception as e:
-                if not self.cancelled:
-                    _LOGGER.warning("SIPSource read error: %s", e)
-                break
+                frame = self.session.rx_queue.get(timeout=0.5)
+            except Empty:
+                continue
+            if frame:
+                yield frame
 
         _LOGGER.info("SIPSource: stream ended")

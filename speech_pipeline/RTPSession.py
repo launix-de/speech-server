@@ -193,9 +193,9 @@ class RTPSession:
                 continue
 
             payload = data[RTP_HEADER_SIZE:]
-            # Put raw wire payload into _rx_queue (for read_audio/read_s16le)
+            # Decode wire → s16le, put in public rx_queue (for SIPSource)
             try:
-                self._rx_queue.put_nowait(payload)
+                self.rx_queue.put_nowait(self.codec.decode(payload))
             except queue.Full:
                 pass  # drop — real-time audio
 

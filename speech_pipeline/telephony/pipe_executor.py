@@ -1,17 +1,16 @@
-"""DSL-first pipe executor for telephony calls.
+"""DSL pipe executor for telephony calls.
 
 Parses DSL pipes like::
 
-    sip:leg-abc{"completed":"/hook"} -> tee:tap-abc -> call:xyz -> sip:leg-abc
-    tee:tap-abc -> stt:de{"on_receive":"https://crm/stt?p=123"}
+    sip:leg-abc{"completed":"/hook"} -> call:call-xyz -> sip:leg-abc
+    play:https://example.com/hold.mp3{"loop":true,"volume":50} -> call:call-xyz
+    tts:de_DE-thorsten-medium{"text":"Willkommen"} -> call:call-xyz
 
 Elements: ``type:id{json_params}``
 Separator: ``->`` (or ``|`` for backward compat)
 
-Wiring rules:
-- Output: call:/tee: are multi-output (add new output), else redirect
-- Input: call: is multi-input (add new input), else redirect
-- call: always creates a ConferenceLeg
+All SIP bridging uses add_source + add_sink (proven pattern from e2e97ca).
+Play uses the same loop logic as _cmd_play (proven to work).
 """
 from __future__ import annotations
 
@@ -33,18 +32,12 @@ def parse_dsl(dsl: str) -> List[Tuple[str, str, dict]]:
     """Parse a DSL pipe string into elements.
 
     Returns list of (type, id, params_dict) tuples.
-
-    Example::
-
-        >>> parse_dsl('sip:leg-abc{"completed":"/hook"} -> call:xyz')
-        [('sip', 'leg-abc', {'completed': '/hook'}), ('call', 'xyz', {})]
     """
     elements = []
     pos = 0
     s = dsl.strip()
 
     while pos < len(s):
-        # Skip whitespace and separators
         while pos < len(s) and s[pos] in ' \t':
             pos += 1
         if pos >= len(s):
@@ -117,25 +110,19 @@ def parse_dsl(dsl: str) -> List[Tuple[str, str, dict]]:
 class CallPipeExecutor:
     """Manages DSL pipe execution for a single Call.
 
-    Maintains a registry of named stage instances. Each ``add_pipes()``
-    call parses DSL strings, resolves or creates stages, wires them
-    according to the DSL wiring rules, and starts pipelines.
+    Uses the SAME wiring as bridge_to_call (add_source + add_sink)
+    and _cmd_play (AudioReader + loop + add_source) — proven patterns.
     """
 
     def __init__(self, call, tts_registry=None, subscriber=None):
         self.call = call
         self._tts_registry = tts_registry
         self._subscriber = subscriber
-        self._stages: Dict[str, Any] = {}  # "type:id" -> stage object
+        self._stages: Dict[str, Any] = {}  # stage_id -> handle object
         self._lock = threading.Lock()
-        self._threads: List[threading.Thread] = []
-
-    # ------------------------------------------------------------------
-    # Public API
-    # ------------------------------------------------------------------
 
     def add_pipes(self, pipes: List[str]) -> List[dict]:
-        """Parse and execute DSL pipe strings. Returns stage info."""
+        """Parse and execute DSL pipe strings."""
         results = []
         for pipe_str in pipes:
             try:
@@ -150,358 +137,253 @@ class CallPipeExecutor:
     def kill_stage(self, stage_id: str) -> bool:
         """Cancel a named stage and clean up."""
         with self._lock:
-            entry = self._stages.pop(stage_id, None)
-        if not entry:
+            handle = self._stages.pop(stage_id, None)
+        if not handle:
             return False
 
-        if hasattr(entry, 'cancel'):
-            try:
-                entry.cancel()
-            except Exception:
-                pass
-        # For mixer sources (play, tts): kill_source
-        src_id = getattr(entry, '_src_id', None)
+        # Signal stop event (for play loops)
+        stop = getattr(handle, '_stop', None)
+        if stop:
+            stop.set()
+
+        # Kill current mixer source
+        src_id = getattr(handle, '_current_src', None)
         if src_id:
             try:
                 self.call.mixer.kill_source(src_id)
             except Exception:
                 pass
+
         _LOGGER.info("Killed stage %s", stage_id)
         return True
 
+    def kill_all_play(self) -> int:
+        """Kill all play stages. Returns count of killed stages."""
+        killed = 0
+        with self._lock:
+            play_keys = [k for k in self._stages if k.startswith("play:")]
+        for key in play_keys:
+            if self.kill_stage(key):
+                killed += 1
+        return killed
+
     def list_stages(self) -> List[dict]:
-        """Return info about all live stages."""
         with self._lock:
-            return [{"id": k, "type": type(v).__name__}
-                    for k, v in self._stages.items()]
+            return [{"id": k} for k in self._stages]
 
     # ------------------------------------------------------------------
-    # Stage resolution
-    # ------------------------------------------------------------------
-
-    def _key(self, typ: str, elem_id: str) -> str:
-        return f"{typ}:{elem_id}" if elem_id else typ
-
-    def _get_stage(self, key: str):
-        with self._lock:
-            return self._stages.get(key)
-
-    def _put_stage(self, key: str, stage):
-        with self._lock:
-            self._stages[key] = stage
-
-    def _resolve(self, typ: str, elem_id: str, params: dict,
-                 is_first: bool, is_last: bool):
-        """Get or create a stage. Returns (stage, is_new)."""
-        key = self._key(typ, elem_id)
-        existing = self._get_stage(key)
-        if existing is not None:
-            return existing, False
-
-        stage = self._create_stage(typ, elem_id, params, is_first, is_last)
-        if stage is not None:
-            self._put_stage(key, stage)
-        return stage, True
-
-    def _create_stage(self, typ: str, elem_id: str, params: dict,
-                      is_first: bool, is_last: bool):
-        """Create a new stage instance by type."""
-
-        if typ == "sip":
-            # Look up existing leg session
-            from . import leg as leg_mod
-            leg = leg_mod.get_leg(elem_id)
-            if not leg:
-                raise ValueError(f"Leg {elem_id} not found")
-            if not leg.voip_call:
-                raise ValueError(f"Leg {elem_id} has no SIP call")
-            # Mark leg as bridged (sip_listener._wait_for_bridge checks this)
-            leg.call_id = self.call.call_id
-            leg.status = "in-progress"
-            leg.answered_at = leg.answered_at or __import__('time').time()
-            session = leg_mod._CallSession(leg.voip_call)
-            # Attach webhooks from params
-            if params:
-                leg.callbacks.update(params)
-            return session  # SIPSource/SIPSink will wrap this
-
-        elif typ == "call":
-            # Conference — returns mixer reference (ConferenceLeg wraps it)
-            return self.call.mixer
-
-        elif typ == "tee":
-            from speech_pipeline.AudioTee import AudioTee
-            tee = AudioTee(48000, "s16le")
-            return tee
-
-        elif typ == "stt":
-            lang = elem_id or "de"
-            from speech_pipeline.WhisperSTT import WhisperTranscriber
-            stt = WhisperTranscriber(
-                model_name=getattr(self, '_stt_model', 'base'),
-                language=lang)
-            # Attach on_receive webhook from params
-            if params and params.get("on_receive"):
-                stt._webhook_url = params["on_receive"]
-            return stt
-
-        elif typ == "tts":
-            if not self._tts_registry:
-                raise ValueError("TTS registry not available")
-            voice_name = elem_id or "de_DE-thorsten-medium"
-            text = params.get("text", "")
-            if not text:
-                raise ValueError("tts requires text param")
-            from speech_pipeline.TTSProducer import TTSProducer
-            voice = self._tts_registry.ensure_loaded(voice_name)
-            syn = self._tts_registry.create_synthesis_config(voice, {})
-            return TTSProducer(voice, syn, text, sentence_silence=0.0)
-
-        elif typ == "play":
-            url = elem_id
-            loop = params.get("loop", False)
-            volume = params.get("volume", 100)
-            if not url:
-                raise ValueError("play requires URL")
-            from speech_pipeline.AudioReader import AudioReader
-            return AudioReader(url, loop=loop, volume=volume)
-
-        elif typ == "webhook":
-            url = elem_id
-            if not url:
-                raise ValueError("webhook requires URL")
-            from speech_pipeline.WebhookSink import WebhookSink
-            bearer = ""
-            if self._subscriber:
-                bearer = self._subscriber.get("bearer_token", "")
-            return WebhookSink(url, bearer_token=bearer)
-
-        else:
-            raise ValueError(f"Unknown stage type: {typ}")
-
-    # ------------------------------------------------------------------
-    # Pipe execution (wiring)
+    # Pipe execution
     # ------------------------------------------------------------------
 
     def _execute_pipe(self, elements: List[Tuple[str, str, dict]]):
-        """Wire a parsed DSL pipe."""
+        """Execute a parsed DSL pipe.
+
+        Recognizes these patterns:
+        - sip:LEG -> call:CALL -> sip:LEG  (bidirectional SIP bridge)
+        - play:URL{params} -> call:CALL     (hold music / playback)
+        - tts:VOICE{text} -> call:CALL      (text-to-speech)
+        - call:CALL -> stt:LANG{cb}         (speech-to-text)
+        """
         if not elements:
             return
 
-        n = len(elements)
-        stages = []  # (typ, elem_id, params, resolved_obj, is_new)
+        types = [e[0] for e in elements]
 
-        # Phase 1: resolve all elements
-        for i, (typ, elem_id, params) in enumerate(elements):
-            is_first = (i == 0)
-            is_last = (i == n - 1)
-            obj, is_new = self._resolve(typ, elem_id, params, is_first, is_last)
-            stages.append((typ, elem_id, params, obj, is_new))
+        # Pattern: sip -> call -> sip (bidirectional bridge)
+        if types == ["sip", "call", "sip"]:
+            self._pipe_sip_bridge(elements)
 
-        # Phase 2: build pipeline chain
-        # Walk left to right, creating Stage instances and piping them
-        from speech_pipeline.SIPSource import SIPSource
-        from speech_pipeline.SIPSink import SIPSink
-        from speech_pipeline.ConferenceLeg import ConferenceLeg
-        from speech_pipeline.ConferenceMixer import ConferenceMixer
+        # Pattern: play -> call (hold music)
+        elif types == ["play", "call"]:
+            self._pipe_play(elements)
 
-        pipeline_stages = []  # actual Stage objects in pipe order
-        terminal_sink = None
-        sip_leg_ids = []  # leg IDs for BYE on pipeline end
+        # Pattern: tts -> call (TTS announcement)
+        elif types == ["tts", "call"]:
+            self._pipe_tts(elements)
 
-        prev_stage = None  # last Stage in the chain
+        # Pattern: call -> stt (speech recognition)
+        elif len(types) >= 2 and types[0] == "call" and "stt" in types:
+            self._pipe_stt(elements)
 
-        for i, (typ, elem_id, params, obj, is_new) in enumerate(stages):
-            is_first = (i == 0)
-            is_last = (i == n - 1)
+        else:
+            _LOGGER.warning("Unrecognized pipe pattern: %s", " -> ".join(types))
 
-            if typ == "sip":
-                # SIP session — source if first, sink if last, both if both
-                sip_leg_ids.append(elem_id)
-                if is_first:
-                    src = SIPSource(obj)
-                    pipeline_stages.append(src)
-                    prev_stage = src
-                if is_last and prev_stage:
-                    sink = SIPSink(obj)
-                    prev_stage.pipe(sink)
-                    pipeline_stages.append(sink)
-                    terminal_sink = sink
-                    prev_stage = None
+    # ------------------------------------------------------------------
+    # Pattern: sip -> call -> sip (bridge leg into conference)
+    # Uses EXACTLY the same code as bridge_to_call (proven at e2e97ca)
+    # ------------------------------------------------------------------
 
-            elif typ == "call":
-                # Conference mixer — wiring depends on position:
-                # source -> call (last) = add_source (unidirectional input)
-                # call -> sink (first) = add_output (unidirectional output)
-                # source -> call -> sink = ConferenceLeg (bidirectional)
-                mixer = obj
-                has_input = prev_stage is not None
-                has_output = not is_last
+    def _pipe_sip_bridge(self, elements):
+        """Bridge a SIP leg into the conference."""
+        from . import leg as leg_mod
 
-                if has_input and has_output:
-                    # Bidirectional: add_source (input) + add_sink (output)
-                    # Same pattern as e2e97ca bridge_to_call — proven to work.
-                    # pipe() auto-inserts format converters (8k↔48k etc.)
-                    src_id = mixer.add_source(prev_stage)
-                    if pipeline_stages:
-                        pipeline_stages[0]._src_id = src_id
-                    # Output: next element will be piped from a QueueSource
-                    from speech_pipeline.QueueSource import QueueSource
-                    out_q = mixer.add_output(mute_source=src_id)
-                    qs = QueueSource(out_q, mixer.sample_rate, "s16le")
-                    pipeline_stages.append(qs)
-                    prev_stage = qs
+        sip_typ, leg_id, sip_params = elements[0]
+        call_typ, call_id, call_params = elements[1]
 
-                elif has_input and not has_output:
-                    # Source-only: pipe into mixer via add_source
-                    src_id = mixer.add_source(prev_stage)
-                    # Store src_id on the source for kill_stage
-                    if pipeline_stages:
-                        pipeline_stages[0]._src_id = src_id
-                    # Block until source is consumed, then clean up
-                    def _make_wait(m, s):
-                        def _wait():
-                            m.wait_source(s)
-                            m.remove_source(s)
-                        return _wait
-                    terminal_sink = type('_Waiter', (), {
-                        'run': _make_wait(mixer, src_id)})()
-                    prev_stage = None
+        leg = leg_mod.get_leg(leg_id)
+        if not leg:
+            raise ValueError(f"Leg {leg_id} not found")
+        if not leg.voip_call:
+            raise ValueError(f"Leg {leg_id} has no SIP call")
 
-                elif not has_input and has_output:
-                    # Output-only: read from mixer output queue
-                    from speech_pipeline.QueueSource import QueueSource
-                    out_q = mixer.add_output()
-                    src = QueueSource(out_q, mixer.sample_rate, "s16le")
-                    pipeline_stages.append(src)
-                    prev_stage = src
+        # Attach webhook callbacks
+        if sip_params:
+            leg.callbacks.update(sip_params)
 
-            elif typ == "tee":
-                # AudioTee — pass-through with sidechain outputs
-                tee = obj
-                if prev_stage:
-                    prev_stage.pipe(tee)
-                pipeline_stages.append(tee)
-                prev_stage = tee
+        # Mark as bridged (sip_listener._wait_for_bridge checks leg.call_id)
+        leg.call_id = self.call.call_id
 
-                # If tee is first element (referencing existing tee),
-                # add a new sidechain output
-                if is_first and not is_new:
-                    # Remaining elements form a sidechain
-                    self._build_sidechain(tee, stages[i+1:])
-                    return  # sidechain handled, don't continue main chain
+        # Use the proven bridge_to_call function directly
+        leg_mod.bridge_to_call(leg, self.call)
 
-            elif typ == "stt":
-                # STT processor
-                stt = obj
-                if prev_stage:
-                    prev_stage.pipe(stt)
-                pipeline_stages.append(stt)
-                prev_stage = stt
+        _LOGGER.info("SIP bridge: %s -> call:%s (via bridge_to_call)",
+                     leg_id, self.call.call_id)
 
-            elif typ == "tts":
-                # TTS source (always first)
-                pipeline_stages.append(obj)
-                prev_stage = obj
+    # ------------------------------------------------------------------
+    # Pattern: play -> call (hold music / audio playback)
+    # Uses EXACTLY the same logic as _cmd_play (proven loop + volume)
+    # ------------------------------------------------------------------
 
-            elif typ == "play":
-                # Play source (always first)
-                pipeline_stages.append(obj)
-                prev_stage = obj
+    def _pipe_play(self, elements):
+        """Play audio into the conference."""
+        from speech_pipeline.AudioReader import AudioReader
 
-            elif typ == "webhook":
-                # Webhook sink (always last)
-                sink = obj
-                if prev_stage:
-                    prev_stage.pipe(sink)
-                pipeline_stages.append(sink)
-                terminal_sink = sink
-                prev_stage = None
+        play_typ, url, params = elements[0]
+        if not url:
+            raise ValueError("play requires URL")
 
-            else:
-                _LOGGER.warning("Unhandled element type: %s", typ)
+        loop = params.get("loop", False)
+        volume = params.get("volume", 100)
+        stage_id = f"play:{url}"
 
-        # Phase 3: start the pipeline
-        if terminal_sink and hasattr(terminal_sink, 'run'):
-            self._start_pipeline(terminal_sink, pipeline_stages,
-                                 sip_legs=sip_leg_ids)
-        elif pipeline_stages:
-            # No terminal sink — source-only pipe (e.g., tts -> conference)
-            # ConferenceLeg or add_source handles the run
-            last = pipeline_stages[-1]
-            if isinstance(last, ConferenceLeg):
-                # ConferenceLeg as last = source-only into conference
-                # Need SIPSink or something to drive it... actually
-                # ConferenceLeg.stream_pcm24k drives itself via pump thread
-                # But it needs a downstream sink to iterate its output.
-                # Source-only: use add_source instead
-                pass
-            # For play/tts -> conference: the conference element handles it
-            # via add_source in the ConferenceLeg path
+        # Stop event for kill_stage
+        stop_event = threading.Event()
+        handle = type('PlayHandle', (), {
+            '_stop': stop_event,
+            '_current_src': None,
+        })()
 
-    def _build_sidechain(self, tee, remaining_elements):
-        """Build a sidechain pipe from an existing tee.
+        with self._lock:
+            self._stages[stage_id] = handle
 
-        tee:uuid -> stt:de -> webhook:url
-        The tee already exists. We add a new sidechain sink chain.
-        """
-        from speech_pipeline.base import Stage
-
-        # Build the downstream chain
-        prev = None
-        chain = []
-        terminal = None
-
-        for typ, elem_id, params, obj, is_new in remaining_elements:
-            stage = obj
-            if isinstance(stage, Stage):
-                if prev:
-                    prev.pipe(stage)
-                chain.append(stage)
-                prev = stage
-                if hasattr(stage, 'run'):
-                    terminal = stage
-
-        if chain:
-            # Add the first stage as a sidechain of the tee
-            tee.add_sidechain(chain[0])
-            _LOGGER.info("Added sidechain to tee: %s",
-                         " -> ".join(type(s).__name__ for s in chain))
-
-            # If there's a terminal sink, the sidechain thread handles it
-            # via AudioTee._run_sink. No extra thread needed.
-
-    def _start_pipeline(self, terminal_sink, stages, sip_legs=None):
-        """Run the terminal sink in a background thread.
-
-        When the pipeline ends (SIP hangup, conference deleted, etc.),
-        sends BYE to all SIP legs and fires their callbacks.
-        """
         def _run():
+            mixer = self.call.mixer
             try:
-                terminal_sink.run()
-            except Exception as e:
-                _LOGGER.warning("Pipeline error: %s", e)
-            finally:
-                _LOGGER.info("Pipeline ended: %s",
-                             " -> ".join(type(s).__name__ for s in stages))
-                # Hangup all SIP legs used in this pipeline
-                if sip_legs:
-                    from . import leg as leg_mod
-                    for leg_id in sip_legs:
-                        leg = leg_mod.get_leg(leg_id)
-                        if leg and leg.status != "completed":
-                            leg.hangup()
-                            leg.status = "completed"
-                            duration = (time.time() - leg.answered_at
-                                        if leg.answered_at else 0)
-                            leg_mod._fire_callback(
-                                leg, "completed", duration=duration)
-                            _LOGGER.info("Leg %s ended (duration=%.1fs)",
-                                         leg_id, duration)
-                            leg_mod.delete_leg(leg_id)
+                iterations = 0
+                max_iter = (int(loop) if isinstance(loop, (int, float)) and loop > 1
+                            else (999999 if loop else 1))
 
-        t = threading.Thread(target=_run, daemon=True,
-                             name=f"pipe-{secrets.token_urlsafe(4)}")
-        t.start()
-        self._threads.append(t)
+                while (iterations < max_iter
+                       and not stop_event.is_set()
+                       and not mixer.cancelled):
+                    reader = AudioReader(url, chunk_seconds=0.5)
+                    source_stage = reader
+
+                    if volume != 100:
+                        from speech_pipeline.GainStage import GainStage
+                        gain = GainStage(reader.output_format.sample_rate,
+                                         float(volume) / 100.0)
+                        reader.pipe(gain)
+                        source_stage = gain
+
+                    src_id = mixer.add_source(source_stage)
+                    handle._current_src = src_id
+
+                    mixer.wait_source(src_id)
+
+                    if stop_event.is_set():
+                        mixer.kill_source(src_id)
+                    else:
+                        mixer.remove_source(src_id)
+                    iterations += 1
+            except Exception as e:
+                _LOGGER.warning("Play failed: %s", e)
+            finally:
+                with self._lock:
+                    self._stages.pop(stage_id, None)
+
+        threading.Thread(target=_run, daemon=True,
+                         name=f"play-{secrets.token_urlsafe(4)}").start()
+
+        _LOGGER.info("Play started: %s (loop=%s, volume=%s)", url, loop, volume)
+
+    # ------------------------------------------------------------------
+    # Pattern: tts -> call (TTS announcement)
+    # ------------------------------------------------------------------
+
+    def _pipe_tts(self, elements):
+        """Speak text into the conference."""
+        tts_typ, voice_name, params = elements[0]
+        voice_name = voice_name or "de_DE-thorsten-medium"
+        text = params.get("text", "")
+        if not text:
+            raise ValueError("tts requires text param")
+        if not self._tts_registry:
+            raise ValueError("TTS registry not available")
+
+        from speech_pipeline.TTSProducer import TTSProducer
+        voice = self._tts_registry.ensure_loaded(voice_name)
+        syn = self._tts_registry.create_synthesis_config(voice, {})
+        producer = TTSProducer(voice, syn, text, sentence_silence=0.0)
+
+        def _run():
+            mixer = self.call.mixer
+            try:
+                src_id = mixer.add_source(producer)
+                mixer.wait_source(src_id)
+                mixer.remove_source(src_id)
+            except Exception as e:
+                _LOGGER.warning("TTS failed: %s", e)
+
+        threading.Thread(target=_run, daemon=True,
+                         name=f"tts-{secrets.token_urlsafe(4)}").start()
+
+        _LOGGER.info("TTS started: %s (voice=%s)", text[:40], voice_name)
+
+    # ------------------------------------------------------------------
+    # Pattern: call -> stt (speech recognition)
+    # ------------------------------------------------------------------
+
+    def _pipe_stt(self, elements):
+        """Start STT on the conference output."""
+        call_typ, call_id, call_params = elements[0]
+
+        # Find stt element
+        stt_elem = None
+        webhook_elem = None
+        for typ, eid, params in elements[1:]:
+            if typ == "stt":
+                stt_elem = (typ, eid, params)
+            elif typ == "webhook":
+                webhook_elem = (typ, eid, params)
+
+        if not stt_elem:
+            raise ValueError("No stt element found")
+
+        lang = stt_elem[1] or "de"
+        stt_params = stt_elem[2]
+
+        from speech_pipeline.WhisperSTT import WhisperTranscriber
+        stt = WhisperTranscriber(
+            model_name=stt_params.get("model", "base"),
+            language=lang)
+
+        # Build webhook sink if present
+        if webhook_elem:
+            url = webhook_elem[1]
+            from speech_pipeline.WebhookSink import WebhookSink
+            bearer = self._subscriber.get("bearer_token", "") if self._subscriber else ""
+            sink = WebhookSink(url, bearer_token=bearer)
+            stt.pipe(sink)
+            self.call.mixer.add_sink(sink, mute_source=None)
+        elif stt_params.get("on_receive"):
+            url = stt_params["on_receive"]
+            from speech_pipeline.WebhookSink import WebhookSink
+            bearer = self._subscriber.get("bearer_token", "") if self._subscriber else ""
+            sink = WebhookSink(url, bearer_token=bearer)
+            stt.pipe(sink)
+            self.call.mixer.add_sink(sink, mute_source=None)
+        else:
+            self.call.mixer.add_sink(stt, mute_source=None)
+
+        _LOGGER.info("STT started: lang=%s", lang)

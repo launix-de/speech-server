@@ -208,6 +208,25 @@ def _cmd_stop_play(call: call_state.Call, cmd: dict) -> None:
         call.mixer.kill_source(p["_current_src"])
 
 
+def _cmd_stop_play_all(call: call_state.Call, cmd: dict) -> None:
+    """Stop ALL playing sources — both commands-based and pipe-executor-based."""
+    # Stop commands-based plays (registered as participants with _stop event)
+    with call._lock:
+        plays = [(pid, p) for pid, p in call._participants.items()
+                 if p.get("type") == "play"]
+    for pid, p in plays:
+        if p.get("_stop"):
+            p["_stop"].set()
+        if p.get("_current_src"):
+            try:
+                call.mixer.kill_source(p["_current_src"])
+            except Exception:
+                pass
+    # Stop pipe-executor plays
+    if hasattr(call, 'pipe_executor') and call.pipe_executor:
+        call.pipe_executor.kill_all_play()
+
+
 def _cmd_hangup(call: call_state.Call, cmd: dict) -> None:
     """Hang up entire call or a specific leg."""
     from . import leg as leg_mod
@@ -467,6 +486,7 @@ _HANDLERS = {
     "tts": _cmd_tts,
     "play": _cmd_play,
     "stop_play": _cmd_stop_play,
+    "stop_play_all": _cmd_stop_play_all,
     "hangup": _cmd_hangup,
     "transfer": _cmd_transfer,
     "dtmf": _cmd_dtmf,

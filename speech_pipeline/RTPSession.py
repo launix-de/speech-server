@@ -193,14 +193,9 @@ class RTPSession:
                 continue
 
             payload = data[RTP_HEADER_SIZE:]
-            # Decode → s16le@8k, upsample → s16le@48k, put in rx_queue
-            # Exact 6x integer upsample — no ratecv, no drift.
-            s16_8k = self.codec.decode(payload)
-            s16_48k, self._rx_resample_state = audioop.ratecv(
-                s16_8k, 2, 1, self.codec.sample_rate, 48000,
-                self._rx_resample_state)
+            # Put raw wire payload into _rx_queue (for read_audio/read_s16le)
             try:
-                self.rx_queue.put_nowait(s16_48k)
+                self._rx_queue.put_nowait(payload)
             except queue.Full:
                 pass  # drop — real-time audio
 

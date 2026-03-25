@@ -917,7 +917,7 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
 
     # Parse expiry — cap at 120s so clients re-register quickly after restart
     exp_header = _get_header(msg, "expires")
-    expires = min(int(exp_header or "120"), 120)
+    expires = int(exp_header or "3600")
     if expires < 30:
         expires = 30
 

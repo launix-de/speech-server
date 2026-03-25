@@ -42,10 +42,9 @@ class SIPSource(Stage):
         call = self.session.call
         while not self.cancelled and not self.session.hungup.is_set():
             try:
-                frame = call.read_audio(length=160, blocking=False)
+                frame = call.read_audio(length=160, blocking=True)
                 if frame:
                     yield frame
-                _time.sleep(0.02)
             except Exception as e:
                 if not self.cancelled:
                     _LOGGER.warning("SIPSource read error: %s", e)

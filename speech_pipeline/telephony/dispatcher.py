@@ -59,7 +59,7 @@ def fire_event(call: call_state.Call, event_key: str,
             http_requests.request(
                 method, url, json=event_payload,
                 headers={"Authorization": f"Bearer {sub['bearer_token']}"},
-                timeout=30)
+                timeout=(5, 5))
         except Exception as e:
             _LOGGER.warning("Event %s to %s failed: %s", event_key, url, e)
 

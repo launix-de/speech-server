@@ -14,6 +14,7 @@ Legacy pyVoIP-compat (used by SIPSink pyVoIP path):
 """
 from __future__ import annotations
 
+import audioop
 import logging
 import queue
 import socket

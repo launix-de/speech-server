@@ -1511,35 +1511,47 @@ def get_registration(sip_user: str) -> Optional[dict]:
 
 
 def hangup(call_obj: SIPCall) -> None:
-    """Send BYE to end a call."""
+    """Send BYE (established) or CANCEL (ringing) to end a call."""
     if call_obj.state == "ended":
         return
 
-    call_obj._cseq += 1
-    branch = _gen_branch()
+    if call_obj.state in ("dialing", "ringing"):
+        # Not yet established — send CANCEL (RFC 3261 §9.1)
+        branch = call_obj._via_branch
+        msg = _build_request(
+            "CANCEL", _extract_uri(call_obj._to_header),
+            call_id=call_obj.call_id,
+            from_header=call_obj._from_header,
+            to_header=call_obj._to_header,
+            cseq=1, via_branch=branch,
+            remote_addr=call_obj._remote_addr,
+        )
+        _send(msg, call_obj._remote_addr)
+        _LOGGER.info("Call %s: CANCEL sent", call_obj.call_id)
+    else:
+        # Established — send BYE
+        call_obj._cseq += 1
+        branch = _gen_branch()
 
-    # Build To header with tag from the dialog
-    to_h = call_obj._to_header
-    if call_obj._to_tag and ";tag=" not in to_h:
-        to_h += f";tag={call_obj._to_tag}"
+        to_h = call_obj._to_header
+        if call_obj._to_tag and ";tag=" not in to_h:
+            to_h += f";tag={call_obj._to_tag}"
 
-    # Use contact URI for BYE if available (in-dialog routing)
-    target_uri = call_obj._contact_uri or _extract_uri(to_h)
-    if not target_uri.startswith("sip:"):
-        target_uri = f"sip:{target_uri}"
+        target_uri = call_obj._contact_uri or _extract_uri(to_h)
+        if not target_uri.startswith("sip:"):
+            target_uri = f"sip:{target_uri}"
 
-    msg = _build_request(
-        "BYE", target_uri,
-        call_id=call_obj.call_id,
-        from_header=call_obj._from_header,
-        to_header=to_h,
-        cseq=call_obj._cseq, via_branch=branch,
-        remote_addr=call_obj._remote_addr,
-    )
-    _send(msg, call_obj._remote_addr)
+        msg = _build_request(
+            "BYE", target_uri,
+            call_id=call_obj.call_id,
+            from_header=call_obj._from_header,
+            to_header=to_h,
+            cseq=call_obj._cseq, via_branch=branch,
+            remote_addr=call_obj._remote_addr,
+        )
+        _send(msg, call_obj._remote_addr)
+        _LOGGER.info("Call %s: BYE sent", call_obj.call_id)
 
     call_obj._set_state("ended")
     with _calls_lock:
         _calls.pop(call_obj.call_id, None)
-
-    _LOGGER.info("Call %s: BYE sent", call_obj.call_id)

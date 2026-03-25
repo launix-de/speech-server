@@ -80,12 +80,9 @@ class Leg:
             except Exception:
                 pass
         # 3. Cancel pipeline (ConferenceLeg handles mixer cleanup)
-        if hasattr(self, '_pipeline_thread'):
-            # SIPSink.cancel() propagates up through ConferenceLeg → SIPSource
+        if hasattr(self, '_conf_leg') and self._conf_leg:
             try:
-                from speech_pipeline.base import Stage
-                # Walk to find the terminal sink and cancel it
-                # cancel() propagates to upstream stages
+                self._conf_leg.cancel()
             except Exception:
                 pass
         self.status = "completed"
@@ -157,6 +154,7 @@ def bridge_to_call(leg: Leg, call) -> None:
     src.pipe(conf_leg).pipe(sink)
 
     leg._src_id = None  # set by ConferenceLeg.stream_pcm24k
+    leg._conf_leg = conf_leg  # for hangup cancellation
 
     # Run terminal sink in background — drives the entire pipeline
     def _run():
@@ -302,6 +300,7 @@ def _create_sip_stack_session(leg: Leg, reg: dict):
 
     _LOGGER.info("Originate %s to device %s", leg.number, reg.get("contact_uri", "?"))
     sip_call = sip_stack.call_device(leg.number, reg)
+    leg._sip_call = sip_call  # store early so hangup() can CANCEL during ringing
 
     # Wait for answer (up to 30s)
     deadline = time.time() + 30
@@ -416,8 +415,9 @@ class _CallSession:
                         self.rx_queue.put_nowait(s16_48k)
                     except _queue.Full:
                         pass  # drop — bounded delay
-                except Exception:
+                except Exception as e:
                     if not self.hungup.is_set():
+                        _LOGGER.warning("rx_pump died: %s", e, exc_info=True)
                         break
 
         threading.Thread(target=_rx_pump, daemon=True,

@@ -293,6 +293,53 @@ def post_commands(call_id: str):
     return jsonify({"queued": len(commands), "call_id": call_id}), 202
 
 
+@api.route("/calls/<call_id>/pipes", methods=["POST"])
+@auth.require_account
+def post_pipes(call_id: str):
+    """Execute DSL pipes on a call.
+
+    Body: {"pipes": ["sip:leg-abc -> call:xyz -> sip:leg-abc", ...]}
+    """
+    call = call_state.get_call(call_id)
+    if not call:
+        return ("Call not found\n", 404)
+    aid = _account_id()
+    if aid and call.account_id != aid:
+        return ("Forbidden\n", 403)
+
+    body = _body()
+    pipes = body.get("pipes", [])
+    if not isinstance(pipes, list):
+        return ("'pipes' must be a list\n", 400)
+
+    from .pipe_executor import CallPipeExecutor
+    if not hasattr(call, 'pipe_executor') or call.pipe_executor is None:
+        sub = subscriber.get(call.subscriber_id) if hasattr(call, 'subscriber_id') else None
+        from . import _shared
+        call.pipe_executor = CallPipeExecutor(
+            call, tts_registry=_shared.tts_registry, subscriber=sub)
+
+    results = call.pipe_executor.add_pipes(pipes)
+    return jsonify({"call_id": call_id, "results": results}), 202
+
+
+@api.route("/calls/<call_id>/stages/<stage_id>", methods=["DELETE"])
+@auth.require_account
+def delete_stage(call_id: str, stage_id: str):
+    """Kill a named stage (e.g., stop hold music)."""
+    call = call_state.get_call(call_id)
+    if not call:
+        return ("Call not found\n", 404)
+    aid = _account_id()
+    if aid and call.account_id != aid:
+        return ("Forbidden\n", 403)
+    if not hasattr(call, 'pipe_executor') or not call.pipe_executor:
+        return ("No pipe executor\n", 400)
+    if not call.pipe_executor.kill_stage(stage_id):
+        return ("Stage not found\n", 404)
+    return ("", 204)
+
+
 @api.route("/calls/<call_id>", methods=["DELETE"])
 @auth.require_account
 def delete_call(call_id: str):
@@ -302,6 +349,13 @@ def delete_call(call_id: str):
     aid = _account_id()
     if aid and call.account_id != aid:
         return ("Forbidden\n", 403)
+
+    # Hangup ALL legs for this call (Twilio semantics)
+    from . import leg as leg_mod
+    for leg in list(leg_mod.list_legs()):
+        if leg.call_id == call_id and leg.status != "completed":
+            leg_mod.delete_leg(leg.leg_id)
+
     call.status = "completed"
     call_state.delete_call(call_id)
     return ("", 204)
@@ -449,6 +503,7 @@ def originate_leg():
     leg = leg_mod.create_leg("outbound", to, call.pbx_id,
                               call.subscriber_id)
     leg.callbacks = callbacks
+    leg.call_id = call_id  # set early so delete_call can find ringing legs
 
     # Originate in background (blocks until answered)
     threading.Thread(

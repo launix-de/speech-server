@@ -357,8 +357,15 @@ def delete_call(call_id: str):
 
     # Hangup ALL legs for this call (BYE/CANCEL, Twilio semantics)
     from . import leg as leg_mod
-    for leg in list(leg_mod.list_legs()):
+    all_legs = list(leg_mod.list_legs())
+    _LOGGER.info("delete_call %s: found %d legs, checking call_id match",
+                 call_id, len(all_legs))
+    for leg in all_legs:
+        _LOGGER.info("  leg %s: call_id=%s status=%s has_sip_call=%s",
+                     leg.leg_id, leg.call_id, leg.status,
+                     hasattr(leg, '_sip_call') and leg._sip_call is not None)
         if leg.call_id == call_id and leg.status != "completed":
+            _LOGGER.info("  -> deleting leg %s", leg.leg_id)
             leg_mod.delete_leg(leg.leg_id)
 
     call.status = "completed"

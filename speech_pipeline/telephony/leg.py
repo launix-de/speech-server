@@ -169,6 +169,21 @@ def bridge_to_call(leg: Leg, call) -> None:
         target=_run, daemon=True, name=f"leg-{leg.leg_id}")
     leg._pipeline_thread.start()
 
+    # Queue monitor — find where delay accumulates
+    def _queue_mon():
+        while leg.status == "in-progress" and not session.hungup.is_set():
+            rx_q = session.rx_queue.qsize()
+            in_q = getattr(conf_leg, '_in_q', None)
+            in_qs = in_q.qsize() if in_q else '?'
+            out_q = conf_leg._out_q
+            out_qs = out_q.qsize() if out_q else '?'
+            _LOGGER.info("QUEUES %s: rx=%s in_q=%s out_q=%s",
+                         leg.leg_id, rx_q, in_qs, out_qs)
+            time.sleep(2)
+
+    threading.Thread(target=_queue_mon, daemon=True,
+                     name=f"qmon-{leg.leg_id}").start()
+
     _LOGGER.info("Leg %s bridged to call %s (ConferenceLeg pipeline)",
                  leg.leg_id, call.call_id)
 
@@ -383,16 +398,24 @@ class _CallSession:
             rtp.pmout = rb
             rtp.encode_packet = lambda data: data
 
-        # Pump: pyVoIP read_audio → rx_queue (bounded, drop on full)
+        # Pump: pyVoIP read_audio → decode u8→s16le → upsample 8k→48k → rx_queue
         def _rx_pump():
+            resample_state = None
             while not self.hungup.is_set():
                 try:
                     frame = voip_call.read_audio(length=160, blocking=True)
-                    if frame:
-                        try:
-                            self.rx_queue.put_nowait(frame)
-                        except _queue.Full:
-                            pass  # drop — bounded delay
+                    if not frame:
+                        continue
+                    # u8 → s16le
+                    signed = audioop.bias(frame, 1, -128)
+                    s16 = audioop.lin2lin(signed, 1, 2)
+                    # 8kHz → 48kHz
+                    s16_48k, resample_state = audioop.ratecv(
+                        s16, 2, 1, 8000, 48000, resample_state)
+                    try:
+                        self.rx_queue.put_nowait(s16_48k)
+                    except _queue.Full:
+                        pass  # drop — bounded delay
                 except Exception:
                     if not self.hungup.is_set():
                         break

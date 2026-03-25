@@ -55,6 +55,7 @@ class ConferenceLeg(Stage):
 
         # Register as full participant (input + auto mix-minus output)
         in_q = queue.Queue(maxsize=200)
+        self._in_q = in_q
         self._src_id, self._out_q = self._mixer.add_participant(in_q)
 
         _LOGGER.info("ConferenceLeg: attached (src=%s)", self._src_id)

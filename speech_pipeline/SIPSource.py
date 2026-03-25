@@ -1,3 +1,9 @@
+"""Source stage: reads audio from a SIP call (pyVoIP or RTPSession).
+
+Same pattern as CodecSocketSource — blocks on session.rx_queue,
+yields s16le @ 48 kHz. The session handles decoding + upsampling
+so pipe() inserts NO SampleRateConverter (same as websocket codec).
+"""
 from __future__ import annotations
 
 import logging
@@ -10,22 +16,16 @@ _LOGGER = logging.getLogger("sip-source")
 
 
 class SIPSource(Stage):
-    """Source stage: reads audio from a SIP call (pyVoIP or RTPSession).
+    """Yields PCM s16le mono 48 kHz from a SIP session's rx_queue.
 
-    Same pattern as AudioSocketSource — blocks on session.rx_queue.
-    The session's RTP receiver fills the queue; this stage just yields.
-    pipe() auto-inserts converters to the mixer's s16le@48kHz.
+    Identical to CodecSocketSource — the session does all format
+    conversion so the pipeline is converter-free to the mixer.
     """
 
     def __init__(self, session) -> None:
         super().__init__()
         self.session = session
-        from speech_pipeline.RTPSession import RTPSession
-        call = session.call if hasattr(session, 'call') else None
-        if isinstance(call, RTPSession):
-            self.output_format = AudioFormat(call.codec.sample_rate, "s16le")
-        else:
-            self.output_format = AudioFormat(8000, "u8")
+        self.output_format = AudioFormat(48000, "s16le")
 
     def stream_pcm24k(self) -> Iterator[bytes]:
         if not self.session.connected.is_set():
@@ -36,7 +36,7 @@ class SIPSource(Stage):
             _LOGGER.warning("SIPSource: call already hung up")
             return
 
-        _LOGGER.info("SIPSource: streaming audio (%s)", self.output_format)
+        _LOGGER.info("SIPSource: streaming audio (48kHz s16le)")
         while not self.cancelled and not self.session.hungup.is_set():
             try:
                 frame = self.session.rx_queue.get(timeout=0.5)

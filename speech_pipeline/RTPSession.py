@@ -49,8 +49,9 @@ class RTPSession:
         self._sock.settimeout(0.1)
 
         self._rx_queue: queue.Queue = queue.Queue(maxsize=10)
-        # Decoded frames for SIPSource (same pattern as AudioSocketSession.rx_queue)
+        # Decoded + upsampled frames for SIPSource (48kHz s16le, like CodecSocketSession)
         self.rx_queue: queue.Queue = queue.Queue(maxsize=10)
+        self._rx_resample_state = None
         self._tx_queue: queue.Queue = queue.Queue(maxsize=10)
         self._running = False
         self._rx_thread: Optional[threading.Thread] = None
@@ -126,41 +127,40 @@ class RTPSession:
     # ----- TX loop -----
 
     def _tx_loop(self) -> None:
-        """Send RTP packets at exactly 20ms intervals."""
+        """Send RTP packets as data arrives — no sleep pacing.
+
+        The mixer clock drives the timing (same as WebSocket path).
+        RTP timestamps increment correctly; the receiver's jitter
+        buffer handles any timing irregularities.
+        """
         frame_bytes = self.codec.frame_bytes
-        silence = bytes([self.codec.silence_byte]) * frame_bytes
         buf = b""
-        next_send = time.monotonic()
 
         while self._running:
-            # Collect data from queue
+            # Block until data arrives
+            try:
+                chunk = self._tx_queue.get(timeout=0.5)
+                buf += chunk
+            except queue.Empty:
+                continue
+
+            # Drain any additional queued data
             try:
                 while True:
                     buf += self._tx_queue.get_nowait()
             except queue.Empty:
                 pass
 
-            # Send one frame if we have enough data
-            if len(buf) >= frame_bytes:
-                chunk = buf[:frame_bytes]
+            # Send all complete frames immediately
+            while len(buf) >= frame_bytes:
+                packet = self._build_rtp_packet(buf[:frame_bytes])
                 buf = buf[frame_bytes:]
-                packet = self._build_rtp_packet(chunk)
-            else:
-                # Not enough data — send silence
-                packet = self._build_rtp_packet(silence)
-
-            try:
-                self._sock.sendto(packet, (self.remote_host, self.remote_port))
-            except Exception:
-                pass
-            self._tx_seq = (self._tx_seq + 1) & 0xFFFF
-            self._tx_ts += self.codec.frame_samples
-
-            # Pace at exactly 20ms
-            next_send += 0.020
-            sleep_time = next_send - time.monotonic()
-            if sleep_time > 0:
-                time.sleep(sleep_time)
+                try:
+                    self._sock.sendto(packet, (self.remote_host, self.remote_port))
+                except Exception:
+                    pass
+                self._tx_seq = (self._tx_seq + 1) & 0xFFFF
+                self._tx_ts += self.codec.frame_samples
             else:
                 next_send = time.monotonic()  # catch up
 
@@ -192,9 +192,14 @@ class RTPSession:
                 continue
 
             payload = data[RTP_HEADER_SIZE:]
-            # Decode and put into public rx_queue (for SIPSource)
+            # Decode → s16le@8k, upsample → s16le@48k, put in rx_queue
+            # Exact 6x integer upsample — no ratecv, no drift.
+            s16_8k = self.codec.decode(payload)
+            s16_48k, self._rx_resample_state = audioop.ratecv(
+                s16_8k, 2, 1, self.codec.sample_rate, 48000,
+                self._rx_resample_state)
             try:
-                self.rx_queue.put_nowait(self.codec.decode(payload))
+                self.rx_queue.put_nowait(s16_48k)
             except queue.Full:
                 pass  # drop — real-time audio
 

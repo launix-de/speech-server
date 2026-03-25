@@ -16,6 +16,8 @@ from typing import Dict, List, Optional
 
 import requests as http_requests
 
+from speech_pipeline.SIPSource import SIPSource
+from speech_pipeline.SIPSink import SIPSink
 
 _LOGGER = logging.getLogger("telephony.leg")
 
@@ -41,6 +43,7 @@ class Leg:
         self.answered_at: Optional[float] = None
 
         self._src_id: Optional[str] = None
+        self._sink_id: Optional[str] = None
         self._sip_session = None
 
     def to_dict(self) -> dict:
@@ -79,12 +82,14 @@ class Leg:
                 self._rtp_session.stop()
             except Exception:
                 pass
-        # 3. Cancel pipeline (ConferenceLeg handles mixer cleanup)
-        if hasattr(self, '_conf_leg') and self._conf_leg:
-            try:
-                self._conf_leg.cancel()
-            except Exception:
-                pass
+        # 3. Remove from mixer
+        if self._src_id and self.call_id:
+            from . import call_state
+            call = call_state.get_call(self.call_id)
+            if call:
+                call.mixer.kill_source(self._src_id)
+                if self._sink_id:
+                    call.mixer.remove_sink(self._sink_id)
         self.status = "completed"
 
 
@@ -126,17 +131,11 @@ def list_legs(subscriber_id: Optional[str] = None) -> List[Leg]:
 # ---------------------------------------------------------------------------
 
 def bridge_to_call(leg: Leg, call) -> None:
-    """Bridge SIP leg into conference via ConferenceLeg.
+    """Bridge SIP leg into conference using ConferenceMixer.
 
-    SIPSource → ConferenceLeg → SIPSink
-    pipe() auto-inserts format converters (u8↔s16le, 8k↔48k).
-    ConferenceLeg handles add_participant + mix-minus.
-    Same architecture as DSL: codec | conference | codec.
+    RX: SIPSource → conf.add_source (auto u8@8k → s16le@48k via pipe)
+    TX: conf.add_sink(SIPSink, mute_source=src_id) (auto 48k → 8k u8)
     """
-    from speech_pipeline.SIPSource import SIPSource
-    from speech_pipeline.SIPSink import SIPSink
-    from speech_pipeline.ConferenceLeg import ConferenceLeg
-
     leg.call_id = call.call_id
     leg.status = "in-progress"
     leg.answered_at = time.time()
@@ -145,45 +144,16 @@ def bridge_to_call(leg: Leg, call) -> None:
 
     session = _CallSession(leg.voip_call)
 
-    # Build pipeline: SIPSource → ConferenceLeg → SIPSink
-    src = SIPSource(session)
-    conf_leg = ConferenceLeg(sample_rate=call.mixer.sample_rate)
-    conf_leg.attach(call.mixer)
-    sink = SIPSink(session)
+    # RX: SIPSource → conference mixer (auto-resampled)
+    rx_source = SIPSource(session)
+    leg._src_id = call.mixer.add_source(rx_source)
 
-    src.pipe(conf_leg).pipe(sink)
+    # TX: conference mix (minus own) → SIPSink (auto-resampled)
+    tx_sink = SIPSink(session)
+    leg._sink_id = call.mixer.add_sink(tx_sink, mute_source=leg._src_id)
 
-    leg._src_id = None  # set by ConferenceLeg.stream_pcm24k
-    leg._conf_leg = conf_leg  # for hangup cancellation
-
-    # Run terminal sink in background — drives the entire pipeline
-    def _run():
-        try:
-            sink.run()
-        except Exception as e:
-            _LOGGER.warning("Leg %s pipeline error: %s", leg.leg_id, e)
-
-    leg._pipeline_thread = threading.Thread(
-        target=_run, daemon=True, name=f"leg-{leg.leg_id}")
-    leg._pipeline_thread.start()
-
-    # Queue monitor — find where delay accumulates
-    def _queue_mon():
-        while leg.status == "in-progress" and not session.hungup.is_set():
-            rx_q = session.rx_queue.qsize()
-            in_q = getattr(conf_leg, '_in_q', None)
-            in_qs = in_q.qsize() if in_q else '?'
-            out_q = conf_leg._out_q
-            out_qs = out_q.qsize() if out_q else '?'
-            _LOGGER.info("QUEUES %s: rx=%s in_q=%s out_q=%s",
-                         leg.leg_id, rx_q, in_qs, out_qs)
-            time.sleep(2)
-
-    threading.Thread(target=_queue_mon, daemon=True,
-                     name=f"qmon-{leg.leg_id}").start()
-
-    _LOGGER.info("Leg %s bridged to call %s (ConferenceLeg pipeline)",
-                 leg.leg_id, call.call_id)
+    _LOGGER.info("Leg %s bridged to call %s (src=%s sink=%s mute=%s)",
+                 leg.leg_id, call.call_id, leg._src_id, leg._sink_id, leg._src_id)
 
     # Monitor for DTMF digits from caller → fire subscriber callback
     def _dtmf_monitor():
@@ -224,10 +194,11 @@ def bridge_to_call(leg: Leg, call) -> None:
             time.sleep(0.5)
 
         leg.status = "completed"
-        session.hungup.set()
         duration = time.time() - leg.answered_at if leg.answered_at else 0
         try:
-            conf_leg.cancel()
+            call.mixer.kill_source(leg._src_id)
+            if leg._sink_id:
+                call.mixer.remove_sink(leg._sink_id)
         except Exception:
             pass
         call.unregister_participant(leg.leg_id)
@@ -300,7 +271,6 @@ def _create_sip_stack_session(leg: Leg, reg: dict):
 
     _LOGGER.info("Originate %s to device %s", leg.number, reg.get("contact_uri", "?"))
     sip_call = sip_stack.call_device(leg.number, reg)
-    leg._sip_call = sip_call  # store early so hangup() can CANCEL during ringing
 
     # Wait for answer (up to 30s)
     deadline = time.time() + 30
@@ -363,65 +333,13 @@ def _create_pyvoip_session(leg: Leg, pbx_entry: dict):
 # ---------------------------------------------------------------------------
 
 class _CallSession:
-    """Adapter so SIPSource/SIPSink can use a raw pyVoIP call.
-
-    Provides rx_queue (same pattern as AudioSocketSession) —
-    a pump thread reads from pyVoIP and fills the queue.
-    """
+    """Minimal adapter so SIPSource/SIPSink can use a raw pyVoIP call."""
 
     def __init__(self, voip_call):
-        import audioop
-        import queue as _queue
         self._call = voip_call
         self.connected = threading.Event()
         self.hungup = threading.Event()
         self.connected.set()
-        self.rx_queue: _queue.Queue = _queue.Queue(maxsize=10)
-
-        # Setup pyVoIP RTP: ring buffer + encode bypass + timing fix
-        try:
-            import pyVoIP
-            pyVoIP.TRANSMIT_DELAY_REDUCTION = 1.0
-        except ImportError:
-            pass
-
-        if hasattr(voip_call, 'RTPClients') and voip_call.RTPClients:
-            from speech_pipeline.SIPSink import _RingBuffer
-            rtp = voip_call.RTPClients[0]
-            try:
-                from pyVoIP.RTP import PayloadType
-                silence = 0xd5 if rtp.preference == PayloadType.PCMA else 0xff
-            except Exception:
-                silence = 0xff
-            rb = _RingBuffer(silence_byte=silence)
-            rtp.pmout = rb
-            rtp.encode_packet = lambda data: data
-
-        # Pump: pyVoIP read_audio → decode u8→s16le → upsample 8k→48k → rx_queue
-        def _rx_pump():
-            resample_state = None
-            while not self.hungup.is_set():
-                try:
-                    frame = voip_call.read_audio(length=160, blocking=True)
-                    if not frame:
-                        continue
-                    # u8 → s16le
-                    signed = audioop.bias(frame, 1, -128)
-                    s16 = audioop.lin2lin(signed, 1, 2)
-                    # 8kHz → 48kHz
-                    s16_48k, resample_state = audioop.ratecv(
-                        s16, 2, 1, 8000, 48000, resample_state)
-                    try:
-                        self.rx_queue.put_nowait(s16_48k)
-                    except _queue.Full:
-                        pass  # drop — bounded delay
-                except Exception as e:
-                    if not self.hungup.is_set():
-                        _LOGGER.warning("rx_pump died: %s", e, exc_info=True)
-                        break
-
-        threading.Thread(target=_rx_pump, daemon=True,
-                         name="pyvoip-rx").start()
 
     @property
     def call(self):

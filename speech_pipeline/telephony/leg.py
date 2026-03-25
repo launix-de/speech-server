@@ -318,6 +318,7 @@ def _create_sip_stack_session(leg: Leg, reg: dict):
 
     _LOGGER.info("Originate %s to device %s", leg.number, reg.get("contact_uri", "?"))
     sip_call = sip_stack.call_device(leg.number, reg)
+    leg._sip_call = sip_call  # set IMMEDIATELY so hangup() can CANCEL during ringing
 
     # Wait for answer (up to 30s)
     deadline = time.time() + 30

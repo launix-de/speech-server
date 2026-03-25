@@ -198,13 +198,26 @@ class CallPipeExecutor:
         # otherwise create _CallSession (pyVoIP legs need rx_queue pump)
         session = getattr(leg, '_sip_session', None) or leg_mod._CallSession(leg.voip_call)
 
-        # RX: SIPSource → mixer (auto-converts 8k→48k via pipe)
+        # ConferenceLeg: bidirectional bridge via the mixer's own sync
+        # SIPSource → ConferenceLeg → SIPSink, pipe() handles format conversion
+        from speech_pipeline.ConferenceLeg import ConferenceLeg
         rx = SIPSource(session)
-        leg._src_id = mixer.add_source(rx)
-
-        # TX: mixer → SIPSink (auto-converts 48k→8k via pipe, mix-minus)
+        conf_leg = ConferenceLeg(sample_rate=mixer.sample_rate)
+        conf_leg.attach(mixer)
         tx = SIPSink(session)
-        leg._sink_id = mixer.add_sink(tx, mute_source=leg._src_id)
+        rx.pipe(conf_leg).pipe(tx)
+
+        # ConferenceLeg sets _src_id internally when stream starts
+        leg._conf_leg = conf_leg
+
+        # Start pipeline in background thread (SIPSink.run drives it)
+        def _run_pipeline():
+            try:
+                tx.run()
+            except Exception as e:
+                _LOGGER.warning("Leg %s pipeline error: %s", leg_id, e)
+        threading.Thread(target=_run_pipeline, daemon=True,
+                         name=f"leg-{leg_id}").start()
 
         # DTMF monitor
         def _dtmf():
@@ -241,12 +254,12 @@ class CallPipeExecutor:
 
             leg.status = "completed"
             dur = time.time() - leg.answered_at if leg.answered_at else 0
-            try:
-                mixer.kill_source(leg._src_id)
-                if leg._sink_id:
-                    mixer.remove_sink(leg._sink_id)
-            except Exception:
-                pass
+            # Cancel ConferenceLeg — it handles mixer cleanup internally
+            if hasattr(leg, '_conf_leg') and leg._conf_leg:
+                try:
+                    leg._conf_leg.cancel()
+                except Exception:
+                    pass
             self.call.unregister_participant(leg.leg_id)
             leg_mod._fire_callback(leg, "completed", duration=dur)
             _LOGGER.info("Leg %s ended (duration=%.1fs)", leg_id, dur)

@@ -322,6 +322,16 @@ class ConferenceMixer(Stage):
                 else:
                     frames[sid] = silence
 
+            # Debug: track active sources (every 2s)
+            if not hasattr(self, '_dbg_n'):
+                self._dbg_n = 0
+            self._dbg_n += 1
+            if self._dbg_n % 100 == 0:
+                active = [s for s, f in frames.items() if f != silence]
+                bufs = {s: len(src.buffer) for s, src in sources.items()}
+                _LOGGER.debug("Mixer tick %d: active=%s bufs=%s",
+                              self._dbg_n, active, bufs)
+
             # Step 2: full mix
             full_mix = silence
             for frame in frames.values():

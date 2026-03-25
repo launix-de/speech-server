@@ -54,7 +54,7 @@ class ConferenceLeg(Stage):
             return
 
         # Register as full participant (input + auto mix-minus output)
-        in_q = queue.Queue(maxsize=200)
+        in_q = queue.Queue(maxsize=5)  # tight backpressure — prevents drift
         self._in_q = in_q
         self._src_id, self._out_q = self._mixer.add_participant(in_q)
 
@@ -75,9 +75,9 @@ class ConferenceLeg(Stage):
                     if self.cancelled:
                         break
                     try:
-                        in_q.put(chunk, timeout=1)
+                        in_q.put(chunk, timeout=0.1)
                     except queue.Full:
-                        pass
+                        pass  # drop — backpressure from mixer
             except Exception as e:
                 _LOGGER.warning("ConferenceLeg pump error: %s", e)
             finally:

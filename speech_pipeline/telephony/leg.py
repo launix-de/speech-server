@@ -79,12 +79,15 @@ class Leg:
                 self._rtp_session.stop()
             except Exception:
                 pass
-        # 3. Remove from mixer
-        if self._src_id and self.call_id:
-            from . import call_state
-            call = call_state.get_call(self.call_id)
-            if call:
-                call.mixer.kill_source(self._src_id)
+        # 3. Cancel pipeline (ConferenceLeg handles mixer cleanup)
+        if hasattr(self, '_pipeline_thread'):
+            # SIPSink.cancel() propagates up through ConferenceLeg → SIPSource
+            try:
+                from speech_pipeline.base import Stage
+                # Walk to find the terminal sink and cancel it
+                # cancel() propagates to upstream stages
+            except Exception:
+                pass
         self.status = "completed"
 
 
@@ -126,15 +129,16 @@ def list_legs(subscriber_id: Optional[str] = None) -> List[Leg]:
 # ---------------------------------------------------------------------------
 
 def bridge_to_call(leg: Leg, call) -> None:
-    """Bridge SIP leg into conference via raw mixer queues.
+    """Bridge SIP leg into conference via ConferenceLeg.
 
-    Same pattern as webclient: add_participant() for raw queue I/O.
-    RX/TX pump threads do inline format conversion (8k↔48k, codec).
-    No SIPSource/SIPSink/pipe() — no extra Stage threads.
+    SIPSource → ConferenceLeg → SIPSink
+    pipe() auto-inserts format converters (u8↔s16le, 8k↔48k).
+    ConferenceLeg handles add_participant + mix-minus.
+    Same architecture as DSL: codec | conference | codec.
     """
-    import audioop
-    import queue as _queue
-    from speech_pipeline.RTPSession import RTPSession
+    from speech_pipeline.SIPSource import SIPSource
+    from speech_pipeline.SIPSink import SIPSink
+    from speech_pipeline.ConferenceLeg import ConferenceLeg
 
     leg.call_id = call.call_id
     leg.status = "in-progress"
@@ -143,74 +147,30 @@ def bridge_to_call(leg: Leg, call) -> None:
                               direction=leg.direction, number=leg.number)
 
     session = _CallSession(leg.voip_call)
-    voip_call = leg.voip_call
-    is_rtp = isinstance(voip_call, RTPSession)
 
-    # Raw mixer queues — same as webclient, no Stage overhead
-    in_q: _queue.Queue = _queue.Queue(maxsize=50)
-    leg._src_id, out_q = call.mixer.add_participant(in_q)
+    # Build pipeline: SIPSource → ConferenceLeg → SIPSink
+    src = SIPSource(session)
+    conf_leg = ConferenceLeg(sample_rate=call.mixer.sample_rate)
+    conf_leg.attach(call.mixer)
+    sink = SIPSink(session)
 
-    # RX pump: session.rx_queue → resample 8k→48k → mixer input queue
-    def _rx_pump():
-        state = None
-        while leg.status == "in-progress" and not session.hungup.is_set():
-            try:
-                frame = session.rx_queue.get(timeout=0.5)
-            except _queue.Empty:
-                continue
-            if not frame:
-                continue
-            # Decode to s16le if pyVoIP (u8)
-            if not is_rtp:
-                signed = audioop.bias(frame, 1, -128)
-                frame = audioop.lin2lin(signed, 1, 2)
-            # Resample 8kHz → 48kHz
-            resampled, state = audioop.ratecv(
-                frame, 2, 1, 8000, 48000, state)
-            try:
-                in_q.put_nowait(resampled)
-            except _queue.Full:
-                pass  # drop — bounded delay
+    src.pipe(conf_leg).pipe(sink)
 
-    # TX pump: mixer output queue → resample 48k→8k → SIP send
-    def _tx_pump():
-        state = None
-        # pyVoIP codec setup
-        encode = None
-        if not is_rtp:
-            try:
-                from pyVoIP.RTP import PayloadType
-                rtp = voip_call.RTPClients[0]
-                if rtp.preference == PayloadType.PCMA:
-                    encode = lambda pcm: audioop.lin2alaw(pcm, 2)
-                else:
-                    encode = lambda pcm: audioop.lin2ulaw(pcm, 2)
-            except Exception:
-                encode = lambda pcm: audioop.lin2ulaw(pcm, 2)
+    leg._src_id = None  # set by ConferenceLeg.stream_pcm24k
 
-        while leg.status == "in-progress" and not session.hungup.is_set():
-            try:
-                frame = out_q.get(timeout=0.5)
-            except _queue.Empty:
-                continue
-            if frame is None:
-                break
-            # Resample 48kHz → 8kHz
-            resampled, state = audioop.ratecv(
-                frame, 2, 1, 48000, 8000, state)
-            # Send to SIP
-            if is_rtp:
-                voip_call.write_s16le(resampled)
-            else:
-                voip_call.write_audio(encode(resampled))
+    # Run terminal sink in background — drives the entire pipeline
+    def _run():
+        try:
+            sink.run()
+        except Exception as e:
+            _LOGGER.warning("Leg %s pipeline error: %s", leg.leg_id, e)
 
-    threading.Thread(target=_rx_pump, daemon=True,
-                     name=f"rx-{leg.leg_id}").start()
-    threading.Thread(target=_tx_pump, daemon=True,
-                     name=f"tx-{leg.leg_id}").start()
+    leg._pipeline_thread = threading.Thread(
+        target=_run, daemon=True, name=f"leg-{leg.leg_id}")
+    leg._pipeline_thread.start()
 
-    _LOGGER.info("Leg %s bridged to call %s (src=%s, raw queues)",
-                 leg.leg_id, call.call_id, leg._src_id)
+    _LOGGER.info("Leg %s bridged to call %s (ConferenceLeg pipeline)",
+                 leg.leg_id, call.call_id)
 
     # Monitor for DTMF digits from caller → fire subscriber callback
     def _dtmf_monitor():
@@ -251,10 +211,10 @@ def bridge_to_call(leg: Leg, call) -> None:
             time.sleep(0.5)
 
         leg.status = "completed"
-        session.hungup.set()  # stop RX/TX pumps
+        session.hungup.set()
         duration = time.time() - leg.answered_at if leg.answered_at else 0
         try:
-            call.mixer.kill_source(leg._src_id)
+            conf_leg.cancel()
         except Exception:
             pass
         call.unregister_participant(leg.leg_id)

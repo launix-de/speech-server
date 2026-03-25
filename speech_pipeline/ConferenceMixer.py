@@ -86,7 +86,7 @@ class ConferenceMixer(Stage):
         mixer.  Returns a source ID for use with ``mute_source``.
         """
         src_id = _next_id("src")
-        in_q: queue.Queue = queue.Queue(maxsize=5)
+        in_q: queue.Queue = queue.Queue(maxsize=200)
         sink = QueueSink(in_q, self.sample_rate, "s16le")
         stage.pipe(sink)
 
@@ -116,7 +116,7 @@ class ConferenceMixer(Stage):
         Used by PipelineBuilder's ``tee:NAME`` element.
         """
         src_id = _next_id("src")
-        in_q: queue.Queue = queue.Queue(maxsize=50)
+        in_q: queue.Queue = queue.Queue(maxsize=200)
         entry = _Source(id=src_id, queue=in_q, sink=None)
         with self._lock:
             self._sources[src_id] = entry
@@ -195,7 +195,7 @@ class ConferenceMixer(Stage):
         Returns a sink ID.
         """
         sink_id = _next_id("sink")
-        out_q: queue.Queue = queue.Queue(maxsize=50)
+        out_q: queue.Queue = queue.Queue(maxsize=200)
         src = QueueSource(out_q, self.sample_rate, "s16le")
         src.pipe(stage)
 
@@ -218,7 +218,7 @@ class ConferenceMixer(Stage):
         Used by PipelineBuilder's ``mix:NAME`` element.
         """
         sink_id = _next_id("out")
-        out_q: queue.Queue = queue.Queue(maxsize=50)
+        out_q: queue.Queue = queue.Queue(maxsize=200)
         entry = _Sink(id=sink_id, stage=None, queue=out_q,
                       source=None, mute_source=mute_source, thread=None)
         with self._lock:
@@ -285,88 +285,62 @@ class ConferenceMixer(Stage):
         frame_interval = self.frame_ms / 1000.0
         next_tick = time.monotonic()
 
-        _dbg_tick = 0
-
         while not self.cancelled:
-            # Fixed-rate loop — proven to work for webclient path.
+            # Real-time pacing: one frame per frame_interval
             now = time.monotonic()
             wait = next_tick - now
             if wait > 0:
                 time.sleep(wait)
-            next_tick = max(next_tick + frame_interval,
-                           time.monotonic())  # never fall behind
+            next_tick += frame_interval
 
-            for _ in range(1):
-                with self._lock:
-                    sources = dict(self._sources)
+            with self._lock:
+                sources = dict(self._sources)
 
-                if not sources:
+            if not sources:
+                continue
+
+            # Step 1: drain queues, extract one frame per source
+            frames: Dict[str, bytes] = {}
+            for sid, src in sources.items():
+                if src.finished and len(src.buffer) < self.frame_bytes:
+                    frames[sid] = silence
+                    src.done.set()
                     continue
-
-                # Step 1: drain queues, extract one frame per source
-                frames: Dict[str, bytes] = {}
-                for sid, src in sources.items():
-                    if src.finished and len(src.buffer) < self.frame_bytes:
-                        frames[sid] = silence
-                        src.done.set()
-                        continue
-                    while True:
-                        try:
-                            chunk = src.queue.get_nowait()
-                        except queue.Empty:
-                            break
-                        if chunk is None:
-                            src.finished = True
-                            break
-                        src.buffer.extend(chunk)
-
-                    buffered = len(src.buffer)
-                    if buffered >= self.frame_bytes:
-                        if buffered <= self.frame_bytes * 2:
-                            # Normal: extract one frame
-                            frames[sid] = bytes(src.buffer[:self.frame_bytes])
-                            del src.buffer[:self.frame_bytes]
-                        else:
-                            # Catch-up: time-compress entire buffer → 1 frame
-                            # audioop.ratecv squeezes N samples into frame_samples
-                            # → slight tempo increase, no audible click
-                            raw = bytes(src.buffer)
-                            src.buffer.clear()
-                            in_samples = buffered // 2  # s16le → sample count
-                            out_samples = self.frame_samples
-                            compressed, _ = audioop.ratecv(
-                                raw, 2, 1, in_samples, out_samples, None)
-                            frames[sid] = compressed[:self.frame_bytes]
-                    else:
-                        frames[sid] = silence
-
-                # Step 2: full mix
-                full_mix = silence
-                for frame in frames.values():
-                    full_mix = audioop.add(full_mix, frame, 2)
-
-                # Step 3: per-sink mix-minus and distribute
-                with self._lock:
-                    sinks = list(self._sinks)
-
-                _dbg_tick += 1
-                if _dbg_tick % 100 == 0:
-                    active = [sid for sid, f in frames.items() if f != silence]
-                    mutes = {e.id: e.mute_source for e in sinks}
-                    _LOGGER.debug("Mixer '%s' tick %d: sources=%s active=%s sinks=%s",
-                                  self.name, _dbg_tick,
-                                  list(frames.keys()), active, mutes)
-
-                for entry in sinks:
-                    if entry.mute_source and entry.mute_source in frames:
-                        negated = audioop.mul(frames[entry.mute_source], 2, -1)
-                        out = audioop.add(full_mix, negated, 2)
-                    else:
-                        out = full_mix
+                while True:
                     try:
-                        entry.queue.put_nowait(out)
-                    except queue.Full:
-                        pass
+                        chunk = src.queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if chunk is None:
+                        src.finished = True
+                        break
+                    src.buffer.extend(chunk)
+
+                if len(src.buffer) >= self.frame_bytes:
+                    frames[sid] = bytes(src.buffer[:self.frame_bytes])
+                    del src.buffer[:self.frame_bytes]
+                else:
+                    frames[sid] = silence
+
+            # Step 2: full mix
+            full_mix = silence
+            for frame in frames.values():
+                full_mix = audioop.add(full_mix, frame, 2)
+
+            # Step 3: per-sink mix-minus and distribute
+            with self._lock:
+                sinks = list(self._sinks)
+
+            for entry in sinks:
+                if entry.mute_source and entry.mute_source in frames:
+                    negated = audioop.mul(frames[entry.mute_source], 2, -1)
+                    out = audioop.add(full_mix, negated, 2)
+                else:
+                    out = full_mix
+                try:
+                    entry.queue.put_nowait(out)
+                except queue.Full:
+                    pass
 
         # EOF to all sinks
         with self._lock:

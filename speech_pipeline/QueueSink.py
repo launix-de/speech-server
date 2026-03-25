@@ -32,9 +32,9 @@ class QueueSink(Stage):
                 if self.cancelled:
                     break
                 try:
-                    self.q.put_nowait(chunk)
+                    self.q.put(chunk, timeout=1)
                 except queue.Full:
-                    pass  # drop — real-time source overtook mixer
+                    _LOGGER.warning("QueueSink: queue full, dropping")
         finally:
             try:
                 self.q.put(None, timeout=1)  # EOF sentinel

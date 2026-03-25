@@ -86,7 +86,7 @@ class ConferenceMixer(Stage):
         mixer.  Returns a source ID for use with ``mute_source``.
         """
         src_id = _next_id("src")
-        in_q: queue.Queue = queue.Queue(maxsize=50)
+        in_q: queue.Queue = queue.Queue(maxsize=5)
         sink = QueueSink(in_q, self.sample_rate, "s16le")
         stage.pipe(sink)
 
@@ -288,22 +288,15 @@ class ConferenceMixer(Stage):
         _dbg_tick = 0
 
         while not self.cancelled:
-            # Sleep until next tick (GIL may overshoot)
+            # Fixed-rate loop — proven to work for webclient path.
             now = time.monotonic()
             wait = next_tick - now
             if wait > 0:
                 time.sleep(wait)
+            next_tick = max(next_tick + frame_interval,
+                           time.monotonic())  # never fall behind
 
-            # Process ALL pending ticks — catches up after GIL delays
-            ticks = 0
-            while next_tick <= time.monotonic():
-                next_tick += frame_interval
-                ticks += 1
-            if ticks == 0:
-                ticks = 1
-                next_tick += frame_interval
-
-            for _ in range(ticks):
+            for _ in range(1):
                 with self._lock:
                     sources = dict(self._sources)
 
@@ -327,9 +320,23 @@ class ConferenceMixer(Stage):
                             break
                         src.buffer.extend(chunk)
 
-                    if len(src.buffer) >= self.frame_bytes:
-                        frames[sid] = bytes(src.buffer[:self.frame_bytes])
-                        del src.buffer[:self.frame_bytes]
+                    buffered = len(src.buffer)
+                    if buffered >= self.frame_bytes:
+                        if buffered <= self.frame_bytes * 2:
+                            # Normal: extract one frame
+                            frames[sid] = bytes(src.buffer[:self.frame_bytes])
+                            del src.buffer[:self.frame_bytes]
+                        else:
+                            # Catch-up: time-compress entire buffer → 1 frame
+                            # audioop.ratecv squeezes N samples into frame_samples
+                            # → slight tempo increase, no audible click
+                            raw = bytes(src.buffer)
+                            src.buffer.clear()
+                            in_samples = buffered // 2  # s16le → sample count
+                            out_samples = self.frame_samples
+                            compressed, _ = audioop.ratecv(
+                                raw, 2, 1, in_samples, out_samples, None)
+                            frames[sid] = compressed[:self.frame_bytes]
                     else:
                         frames[sid] = silence
 

@@ -339,12 +339,18 @@ class CallPipeExecutor:
                 has_output = not is_last
 
                 if has_input and has_output:
-                    # Bidirectional: ConferenceLeg with mix-minus
-                    conf_leg = ConferenceLeg(sample_rate=mixer.sample_rate)
-                    conf_leg.attach(mixer)
-                    prev_stage.pipe(conf_leg)
-                    pipeline_stages.append(conf_leg)
-                    prev_stage = conf_leg
+                    # Bidirectional: add_source (input) + add_sink (output)
+                    # Same pattern as e2e97ca bridge_to_call — proven to work.
+                    # pipe() auto-inserts format converters (8k↔48k etc.)
+                    src_id = mixer.add_source(prev_stage)
+                    if pipeline_stages:
+                        pipeline_stages[0]._src_id = src_id
+                    # Output: next element will be piped from a QueueSource
+                    from speech_pipeline.QueueSource import QueueSource
+                    out_q = mixer.add_output(mute_source=src_id)
+                    qs = QueueSource(out_q, mixer.sample_rate, "s16le")
+                    pipeline_stages.append(qs)
+                    prev_stage = qs
 
                 elif has_input and not has_output:
                     # Source-only: pipe into mixer via add_source

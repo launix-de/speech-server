@@ -211,15 +211,12 @@ def bridge_to_call(leg: Leg, call) -> None:
                      name=f"mon-{leg.leg_id}").start()
 
 
-def originate_and_bridge(leg: Leg, call, pbx_entry: dict) -> None:
-    """Originate an outbound SIP call and bridge into conference.
+def originate_only(leg: Leg, pbx_entry: dict) -> None:
+    """Originate an outbound SIP call — fires callbacks, does NOT bridge.
 
-    Routing:
-    - SIP URI with @ + registered device → sip_stack direct INVITE + RTPSession
-    - Phone number or unregistered → pyVoIP trunk (SIPSession)
-
-    Both paths produce a session compatible with SIPSource/SIPSink,
-    then feed through the same bridge_to_call → ConferenceMixer pipeline.
+    The CRM bridges the leg into the conference via POST /pipes
+    after receiving the 'answered' callback. This keeps originate
+    non-blocking and DSL-compatible.
     """
     _fire_callback(leg, "ringing")
 
@@ -228,18 +225,68 @@ def originate_and_bridge(leg: Leg, call, pbx_entry: dict) -> None:
     except Exception as e:
         _LOGGER.warning("Originate %s failed: %s", leg.number, e)
         leg.status = "failed"
-        _LOGGER.info("Firing failed callback for leg %s (callbacks=%s, sub=%s)",
-                     leg.leg_id, list(leg.callbacks.keys()), leg.subscriber_id)
         _fire_callback(leg, "failed", error=str(e))
         delete_leg(leg.leg_id)
         return
 
-    # Bridge into conference — bridge_to_call spawns a monitor thread
-    # that handles cleanup + completed callback when the SIP call ends.
-    # We do NOT do our own cleanup here to avoid double-fire.
+    # Store session on leg so pipe_executor can use it later
     leg.voip_call = session.call
-    bridge_to_call(leg, call)
+    leg._sip_session = session
+    leg.status = "answered"
+    leg.answered_at = time.time()
     _fire_callback(leg, "answered")
+
+    # Monitor for remote hangup — fire completed callback + cleanup
+    def _monitor():
+        while leg.status == "answered" or leg.status == "in-progress":
+            ended = False
+            if leg.voip_call and hasattr(leg.voip_call, 'state'):
+                try:
+                    from pyVoIP.VoIP.VoIP import CallState
+                    if leg.voip_call.state == CallState.ENDED:
+                        ended = True
+                except Exception:
+                    pass
+            if hasattr(leg, '_sip_call') and leg._sip_call:
+                if leg._sip_call.state == "ended":
+                    ended = True
+            if session.hungup.is_set():
+                ended = True
+            if ended:
+                break
+            time.sleep(0.5)
+
+        if leg.status != "completed":
+            leg.status = "completed"
+            duration = time.time() - leg.answered_at if leg.answered_at else 0
+            _fire_callback(leg, "completed", duration=duration)
+            _LOGGER.info("Leg %s ended (duration=%.1fs)", leg.leg_id, duration)
+            # Cleanup mixer sources/sinks
+            if leg._src_id and leg.call_id:
+                from . import call_state
+                call = call_state.get_call(leg.call_id)
+                if call:
+                    call.mixer.kill_source(leg._src_id)
+                    if leg._sink_id:
+                        call.mixer.remove_sink(leg._sink_id)
+            delete_leg(leg.leg_id)
+
+    threading.Thread(target=_monitor, daemon=True,
+                     name=f"mon-{leg.leg_id}").start()
+
+
+# Keep old originate_and_bridge for backward compat with examples
+def originate_and_bridge(leg: Leg, call, pbx_entry: dict) -> None:
+    """Legacy: originate + auto-bridge. Use originate_only + /pipes instead."""
+    originate_only(leg, pbx_entry)
+    # Wait for answer
+    deadline = time.time() + 30
+    while leg.status not in ("answered", "failed", "completed"):
+        if time.time() > deadline:
+            break
+        time.sleep(0.5)
+    if leg.status == "answered":
+        bridge_to_call(leg, call)
 
 
 def _create_sip_session(leg: Leg, pbx_entry: dict):

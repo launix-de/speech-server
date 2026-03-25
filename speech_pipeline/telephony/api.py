@@ -505,10 +505,11 @@ def originate_leg():
     leg.callbacks = callbacks
     leg.call_id = call_id  # set early so delete_call can find ringing legs
 
-    # Originate in background (blocks until answered)
+    # Originate in background — fires ringing/answered/failed callbacks.
+    # CRM bridges the leg via POST /pipes after receiving answered callback.
     threading.Thread(
-        target=leg_mod.originate_and_bridge,
-        args=(leg, call, pbx_entry),
+        target=leg_mod.originate_only,
+        args=(leg, pbx_entry),
         daemon=True,
         name=f"orig-{leg.leg_id}",
     ).start()

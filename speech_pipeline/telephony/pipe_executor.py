@@ -194,8 +194,9 @@ class CallPipeExecutor:
                                        direction=leg.direction,
                                        number=leg.number)
 
-        # Create session adapter (same as e2e97ca _CallSession — simple)
-        session = leg_mod._CallSession(leg.voip_call)
+        # Use existing session if available (RTPCallSession for sip_stack legs),
+        # otherwise create _CallSession (pyVoIP legs need rx_queue pump)
+        session = getattr(leg, '_sip_session', None) or leg_mod._CallSession(leg.voip_call)
 
         # RX: SIPSource → mixer (auto-converts 8k→48k via pipe)
         rx = SIPSource(session)

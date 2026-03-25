@@ -47,7 +47,7 @@ class Call:
 
         self.mixer = ConferenceMixer(name=self.call_id,
                                      sample_rate=MIXER_SAMPLE_RATE,
-                                     frame_samples=1024)
+                                     frame_samples=960)  # 20ms@48kHz — aligns with RTP timing
         self._participants: Dict[str, dict] = {}
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None

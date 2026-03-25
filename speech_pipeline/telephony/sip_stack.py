@@ -1454,6 +1454,7 @@ def call_device(sip_user: str, reg: dict) -> SIPCall:
     sdp = _build_sdp(_local_ip, rtp_port)
     branch = _gen_branch()
     call_obj._cseq = 1
+    call_obj._via_branch = branch  # needed for CANCEL (must match INVITE branch)
 
     from_uri = f"sip:conference@{_local_ip}"
     to_uri = contact_uri

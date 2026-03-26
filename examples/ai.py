@@ -8,7 +8,7 @@ No custom telephony commands — only standard library building blocks.
 Pipelines per room:
   1. Webclient (user-controlled DSL with tee for per-user STT):
      codec:{session} | tee:stt | conference:{call} | codec:{session}
-     mix:stt | resample:48000:16000 | stt:de | webhook:http://localhost:PORT/stt
+     mix:stt | stt:de | webhook:http://localhost:PORT/stt
   2. Streaming TTS (created via pipeline API):
      text_input | tts:VOICE | conference:CALL_ID
      Text fed via POST /api/pipelines/<pid>/input

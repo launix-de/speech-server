@@ -21,6 +21,40 @@ _LOGGER = logging.getLogger("telephony.sip-listener")
 RING_TIMEOUT = 30  # seconds to wait for subscriber to bridge via API
 
 _phones: Dict[str, object] = {}  # pbx_id -> VoIPPhone
+_INBOUND_DIALOG_TTL = 300.0
+_inbound_dialogs: Dict[tuple[str, str], float] = {}
+_inbound_dialogs_lock = threading.Lock()
+
+
+def _claim_inbound_dialog(pbx_id: str, dialog_id: str) -> bool:
+    """Deduplicate retransmitted inbound INVITEs/dialog callbacks."""
+    now = time.time()
+    key = (pbx_id, dialog_id)
+    with _inbound_dialogs_lock:
+        stale = [
+            existing
+            for existing, ts in _inbound_dialogs.items()
+            if now - ts > _INBOUND_DIALOG_TTL
+        ]
+        for existing in stale:
+            _inbound_dialogs.pop(existing, None)
+        if key in _inbound_dialogs:
+            return False
+        _inbound_dialogs[key] = now
+        return True
+
+
+def _extract_request_call_id(voip_call) -> str:
+    req = getattr(voip_call, "request", None)
+    headers = getattr(req, "headers", {}) if req is not None else {}
+    if not isinstance(headers, dict):
+        return ""
+    for name, value in headers.items():
+        if str(name).lower() == "call-id":
+            if isinstance(value, dict):
+                return str(value.get("raw", "") or value.get("value", "")).strip()
+            return str(value).strip()
+    return ""
 
 
 def start_listener(pbx_id: str, pbx_entry: dict) -> None:
@@ -96,6 +130,12 @@ def stop_all() -> None:
 def _handle_incoming(pbx_id: str, voip_call) -> None:
     """Handle one incoming SIP call."""
     from pyVoIP.VoIP.VoIP import CallState
+
+    sip_call_id = _extract_request_call_id(voip_call)
+    if sip_call_id and not _claim_inbound_dialog(pbx_id, sip_call_id):
+        _LOGGER.info("Ignoring duplicate inbound SIP callback on %s (call-id=%s)",
+                     pbx_id, sip_call_id)
+        return
 
     # Extract caller/callee
     try:
@@ -229,6 +269,14 @@ def _monitor_hangup(leg, voip_call) -> None:
 def _handle_trunk_call(pbx_id: str, caller: str, callee: str,
                        sip_msg: dict, addr, rtp_port: int) -> None:
     """Handle incoming call from trunk via built-in SIP stack (no pyVoIP)."""
+    from . import sip_stack
+
+    sip_call_id = sip_stack._get_header(sip_msg, "call-id")
+    if sip_call_id and not _claim_inbound_dialog(pbx_id, sip_call_id):
+        _LOGGER.info("Ignoring duplicate inbound trunk callback on %s (call-id=%s)",
+                     pbx_id, sip_call_id)
+        return
+
     _LOGGER.info("Trunk call on %s: %s → %s", pbx_id, caller, callee)
 
     # Find subscriber
@@ -245,7 +293,6 @@ def _handle_trunk_call(pbx_id: str, caller: str, callee: str,
         return
 
     # Create RTPSession for inbound audio (Early Media capable)
-    from . import sip_stack
     from speech_pipeline.RTPSession import RTPSession, RTPCallSession
     from speech_pipeline.rtp_codec import codec_for_pt
 
@@ -271,6 +318,10 @@ def _handle_trunk_call(pbx_id: str, caller: str, callee: str,
     leg._sip_session = session  # so pipe_executor uses RTPCallSession directly
     # Store SIP Call-ID for deferred answer (Early Media → 200 OK)
     leg._sip_call_id = sip_stack._get_header(sip_msg, "call-id")
+    if leg._sip_call_id in sip_stack._trunk_dialogs:
+        sip_stack._trunk_dialogs[leg._sip_call_id]["session"] = session
+        sip_stack._trunk_dialogs[leg._sip_call_id]["rtp_session"] = rtp
+        sip_stack._trunk_dialogs[leg._sip_call_id]["leg_id"] = leg.leg_id
 
     # Fire incoming event asynchronously
     threading.Thread(

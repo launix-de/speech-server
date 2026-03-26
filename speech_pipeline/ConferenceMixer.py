@@ -139,17 +139,21 @@ class ConferenceMixer(Stage):
     def add_participant(self, in_q: queue.Queue) -> tuple:
         """Add a full participant (input + auto-muted output).
 
-        Returns ``(src_id, out_queue)``.  The output automatically
+        Returns ``(src_id, sink_id, out_queue)``.  The output automatically
         subtracts this participant's own input (mix-minus).
         """
         src_id = _next_id("src")
         entry = _Source(id=src_id, queue=in_q, sink=None)
+        sink_id = _next_id("out")
+        out_q: queue.Queue = queue.Queue(maxsize=200)
+        sink_entry = _Sink(id=sink_id, stage=None, queue=out_q,
+                           source=None, mute_source=src_id, thread=None)
         with self._lock:
             self._sources[src_id] = entry
+            self._sinks.append(sink_entry)
         self._has_sources.set()
-        out_q = self.add_output(mute_source=src_id)
         _LOGGER.info("ConferenceMixer '%s': +participant %s", self.name, src_id)
-        return src_id, out_q
+        return src_id, sink_id, out_q
 
     def wait_source(self, src_id: str, timeout: float = None) -> bool:
         """Block until a source is fully consumed (buffer drained).
@@ -237,7 +241,8 @@ class ConferenceMixer(Stage):
             for i, entry in enumerate(self._sinks):
                 if entry.id == sink_id:
                     self._sinks.pop(i)
-                    entry.source.cancel()
+                    if entry.source is not None:
+                        entry.source.cancel()
                     try:
                         entry.queue.put_nowait(None)
                     except queue.Full:

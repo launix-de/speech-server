@@ -41,6 +41,7 @@ class ConferenceLeg(Stage):
         self.output_format = fmt
         self._mixer = None
         self._src_id: Optional[str] = None
+        self._sink_id: Optional[str] = None
         self._out_q: Optional[queue.Queue] = None
         self.on_attached = None   # callable, fired when leg is live
         self.on_detached = None   # callable, fired when leg disconnects
@@ -56,7 +57,7 @@ class ConferenceLeg(Stage):
         # Register as full participant (input + auto mix-minus output)
         in_q = queue.Queue(maxsize=5)  # tight backpressure — prevents drift
         self._in_q = in_q
-        self._src_id, self._out_q = self._mixer.add_participant(in_q)
+        self._src_id, self._sink_id, self._out_q = self._mixer.add_participant(in_q)
 
         _LOGGER.info("ConferenceLeg: attached (src=%s)", self._src_id)
 
@@ -109,6 +110,8 @@ class ConferenceLeg(Stage):
                 yield frame
         finally:
             self._mixer.remove_input(in_q)
+            if self._sink_id:
+                self._mixer.remove_sink(self._sink_id)
             t.join(timeout=3)
             _LOGGER.info("ConferenceLeg: detached (src=%s)", self._src_id)
             if self.on_detached:

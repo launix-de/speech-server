@@ -293,6 +293,13 @@ class CallPipeExecutor:
         """Existing tee:ID as first element — add remaining as sidechain."""
         tee_id = elements[0][1]
         tee = self._tees.get(tee_id)
+        if tee and getattr(tee, "cancelled", False):
+            with self._lock:
+                self._tees.pop(tee_id, None)
+                self._sidechain_specs = {
+                    spec for spec in self._sidechain_specs if spec[0] != tee_id
+                }
+            tee = None
         if not tee:
             raise ValueError(f"Tee {tee_id} not found")
         signature = (
@@ -334,8 +341,15 @@ class CallPipeExecutor:
         # -- tee: get or create --
         if typ == "tee":
             with self._lock:
-                if elem_id in self._tees:
-                    return self._tees[elem_id]
+                existing = self._tees.get(elem_id)
+                if existing and getattr(existing, "cancelled", False):
+                    self._tees.pop(elem_id, None)
+                    self._sidechain_specs = {
+                        spec for spec in self._sidechain_specs if spec[0] != elem_id
+                    }
+                    existing = None
+                if existing:
+                    return existing
             from speech_pipeline.AudioTee import AudioTee
             tee = AudioTee(48000, "s16le")
             with self._lock:

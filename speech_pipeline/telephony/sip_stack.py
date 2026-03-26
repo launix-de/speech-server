@@ -1092,6 +1092,24 @@ def _handle_trunk_invite(msg: dict, addr: Tuple[str, int], pbx_id: str) -> None:
 
     _LOGGER.info("Trunk INVITE on %s: %s → %s", pbx_id, caller, callee)
 
+    # SIP trunks retransmit the same INVITE until they get a final answer.
+    # Re-send our existing provisional/final response, but do not spawn a
+    # second inbound leg or a second CRM incoming webhook.
+    existing = _trunk_dialogs.get(call_id)
+    if existing:
+        code = 200 if existing.get("answered") else 183
+        phrase = "OK" if code == 200 else "Session Progress"
+        resp = _build_response(
+            code,
+            phrase,
+            msg,
+            to_tag=existing["to_tag"],
+            body=existing["sdp"],
+        )
+        _send(resp, addr)
+        _LOGGER.info("Trunk INVITE %s: resent %d %s", call_id, code, phrase)
+        return
+
     # Parse remote's codec preference from INVITE SDP
     _, _, remote_pt = _parse_sdp(msg.get("body", ""))
     from speech_pipeline.rtp_codec import codec_for_pt, PCMU
@@ -1223,6 +1241,8 @@ def _handle_inbound_bye(msg: dict, addr: Tuple[str, int]) -> None:
     """Handle BYE from remote party."""
     call_id = _get_header(msg, "call-id")
 
+    trunk_dialog = _trunk_dialogs.pop(call_id, None)
+
     with _calls_lock:
         call_obj = _calls.get(call_id)
 
@@ -1231,6 +1251,21 @@ def _handle_inbound_bye(msg: dict, addr: Tuple[str, int]) -> None:
         call_obj._set_state("ended")
         with _calls_lock:
             _calls.pop(call_id, None)
+
+    if trunk_dialog:
+        _LOGGER.info("Trunk dialog %s: received BYE", call_id)
+        session = trunk_dialog.get("session")
+        if session is not None and hasattr(session, "hungup"):
+            try:
+                session.hungup.set()
+            except Exception:
+                pass
+        rtp = trunk_dialog.get("rtp_session")
+        if rtp is not None:
+            try:
+                rtp.stop()
+            except Exception:
+                pass
 
     # Always reply 200 OK to BYE
     resp = _build_response(200, "OK", msg, to_tag=_gen_tag())
@@ -1241,6 +1276,8 @@ def _handle_inbound_cancel(msg: dict, addr: Tuple[str, int]) -> None:
     """Handle CANCEL from remote party."""
     call_id = _get_header(msg, "call-id")
 
+    trunk_dialog = _trunk_dialogs.pop(call_id, None)
+
     with _calls_lock:
         call_obj = _calls.get(call_id)
 
@@ -1249,6 +1286,21 @@ def _handle_inbound_cancel(msg: dict, addr: Tuple[str, int]) -> None:
         call_obj._set_state("ended")
         with _calls_lock:
             _calls.pop(call_id, None)
+
+    if trunk_dialog:
+        _LOGGER.info("Trunk dialog %s: received CANCEL", call_id)
+        session = trunk_dialog.get("session")
+        if session is not None and hasattr(session, "hungup"):
+            try:
+                session.hungup.set()
+            except Exception:
+                pass
+        rtp = trunk_dialog.get("rtp_session")
+        if rtp is not None:
+            try:
+                rtp.stop()
+            except Exception:
+                pass
 
     # Reply 200 OK to CANCEL
     resp = _build_response(200, "OK", msg, to_tag=_gen_tag())

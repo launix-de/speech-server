@@ -148,9 +148,24 @@ class AudioTee(Stage):
 
     @staticmethod
     def _run_sink(sink: Stage) -> None:
-        """Run a side-chain sink in a background thread."""
+        """Run a side-chain sink in a background thread.
+
+        Walks downstream to find the terminal sink (has run()).
+        If no terminal found, drains via stream_pcm24k (yield-based).
+        """
+        # Walk to terminal sink
+        current = sink
+        while current.downstream is not None:
+            current = current.downstream
         try:
-            sink.run()
+            if hasattr(current, 'run') and current is not sink:
+                current.run()
+            elif hasattr(sink, 'run'):
+                sink.run()
+            else:
+                # No run() anywhere — drain via yield
+                for _ in sink.stream_pcm24k():
+                    pass
         except Exception as e:
             _LOGGER.warning("AudioTee side-chain error: %s", e)
 

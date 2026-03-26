@@ -130,11 +130,10 @@ class CallPipeExecutor:
         # Phase 1: fill in missing IDs (sip without ID = first sip predecessor)
         self._fill_ids(elements)
 
-        # Phase 2: delegate non-telephony pipes to PipelineBuilder
-        # (mix, stt, webhook, resample, etc. are standard DSL elements)
-        first_typ = elements[0][0]
-        if first_typ not in ("sip", "play", "tts"):
-            self._delegate_to_pipeline_builder(elements)
+        # Phase 2: existing tee as first element → sidechain mode
+        first_typ, first_id, first_params = elements[0]
+        if first_typ == "tee" and first_id in self._tees:
+            self._add_sidechain(elements)
             return
 
         # Phase 3: resolve all elements to Stage objects
@@ -177,47 +176,26 @@ class CallPipeExecutor:
                 if typ in seen:
                     elements[i] = (typ, seen[typ], params)
 
-    # -- Delegate to PipelineBuilder ---------------------------------------
+    # -- Sidechain: tee:ID -> stage -> stage -> ...  -------------------------
 
-    def _delegate_to_pipeline_builder(self, elements):
-        """Delegate non-telephony pipes (mix, stt, webhook, etc.) to PipelineBuilder.
+    def _add_sidechain(self, elements):
+        """Existing tee:ID as first element — add remaining as sidechain."""
+        tee_id = elements[0][1]
+        tee = self._tees.get(tee_id)
+        if not tee:
+            raise ValueError(f"Tee {tee_id} not found")
 
-        Reconstructs the DSL string with | separators (PipelineBuilder format)
-        and injects the mixer references from our tees.
-        """
-        from speech_pipeline.PipelineBuilder import PipelineBuilder, inject_conference_mixers
+        # Build sidechain chain: create stages, pipe() them
+        chain = []
+        for typ, elem_id, params in elements[1:]:
+            stage = self._create_stage(typ, elem_id, params)
+            chain.append(stage)
+        for i in range(len(chain) - 1):
+            chain[i].pipe(chain[i + 1])
 
-        # Reconstruct DSL string in PipelineBuilder format (| separated, : params)
-        parts = []
-        for typ, elem_id, params in elements:
-            part = f"{typ}:{elem_id}" if elem_id else typ
-            parts.append(part)
-        dsl = " | ".join(parts)
-
-        # Build pipeline via PipelineBuilder
-        from . import _shared
-        builder = PipelineBuilder(ws=None, registry=self._tts_registry,
-                                   args=_shared.args if hasattr(_shared, 'args') else None)
-
-        # Inject our mixer references (tees create named AudioMixers)
-        for tee_id, tee in self._tees.items():
-            if hasattr(tee, '_named_mixer'):
-                builder._mixers[tee_id] = tee._named_mixer
-
-        # Inject conference mixers
-        inject_conference_mixers(builder, dsl)
-
-        run = builder.build(dsl)
-
-        # Start in background
-        def _run():
-            try:
-                run.run()
-            except Exception as e:
-                _LOGGER.warning("Delegated pipe error: %s", e)
-        threading.Thread(target=_run, daemon=True,
-                         name=f"dsl-{secrets.token_urlsafe(4)}").start()
-        _LOGGER.info("Delegated to PipelineBuilder: %s", dsl)
+        if chain:
+            tee.add_sidechain(chain[0])
+            _LOGGER.info("Tee %s: sidechain added (%d stages)", tee_id, len(chain))
 
     # -- Stage creation ----------------------------------------------------
 
@@ -235,14 +213,7 @@ class CallPipeExecutor:
                 if elem_id in self._tees:
                     return self._tees[elem_id]
             from speech_pipeline.AudioTee import AudioTee
-            from speech_pipeline.AudioMixer import AudioMixer
-            import queue as _queue
             tee = AudioTee(48000, "s16le")
-            # Create named mixer feed (so mix:NAME can read from it)
-            mixer = AudioMixer(name=f"tee-{elem_id}", sample_rate=48000)
-            mixer_q = mixer.add_input()
-            tee.add_mixer_feed(mixer_q)
-            tee._named_mixer = mixer  # for PipelineBuilder delegation
             with self._lock:
                 self._tees[elem_id] = tee
             return tee
@@ -259,7 +230,16 @@ class CallPipeExecutor:
         if typ == "tts":
             return self._create_tts(elem_id, params)
 
-        # stt, webhook, mix, resample — delegated to PipelineBuilder
+        if typ == "stt":
+            lang = elem_id or "de"
+            from speech_pipeline.WhisperSTT import WhisperTranscriber
+            return WhisperTranscriber(model_size=params.get("model", "base"),
+                                      language=lang)
+
+        if typ == "webhook":
+            from speech_pipeline.WebhookSink import WebhookSink
+            bearer = self._subscriber.get("bearer_token", "") if self._subscriber else ""
+            return WebhookSink(elem_id, bearer_token=bearer)
 
         raise ValueError(f"Unknown element type: {typ}")
 

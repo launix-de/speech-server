@@ -353,6 +353,21 @@ class CallPipeExecutor:
                     _LOGGER.warning("Terminal error: %s", e)
             threading.Thread(target=_run, daemon=True,
                              name=f"terminal-{typ}-{elem_id}").start()
+        else:
+            # No terminal sink — last stage might be ConferenceLeg (source-only).
+            # Drain its output to activate the pump thread.
+            last_typ, last_id, last_params, last_stage = resolved[-1]
+            from speech_pipeline.ConferenceLeg import ConferenceLeg
+            if isinstance(last_stage, ConferenceLeg):
+                def _drain():
+                    try:
+                        for _ in last_stage.stream_pcm24k():
+                            if last_stage.cancelled:
+                                break
+                    except Exception:
+                        pass
+                threading.Thread(target=_drain, daemon=True,
+                                 name=f"drain-confleg").start()
 
         # Start SIP monitors for all sip legs
         for typ, elem_id, params, stage in resolved:

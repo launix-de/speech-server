@@ -239,7 +239,7 @@ class CallPipeExecutor:
             import queue as _queue
             tee = AudioTee(48000, "s16le")
             # Create named mixer feed (so mix:NAME can read from it)
-            mixer = AudioMixer(sample_rate=48000)
+            mixer = AudioMixer(name=f"tee-{elem_id}", sample_rate=48000)
             mixer_q = mixer.add_input()
             tee.add_mixer_feed(mixer_q)
             tee._named_mixer = mixer  # for PipelineBuilder delegation

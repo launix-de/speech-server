@@ -128,14 +128,16 @@ class RTPSession:
     # ----- TX loop -----
 
     def _tx_loop(self) -> None:
-        """Send RTP packets as data arrives — no sleep pacing.
+        """Send RTP packets with codec pacing.
 
-        The mixer clock drives the timing (same as WebSocket path).
-        RTP timestamps increment correctly; the receiver's jitter
-        buffer handles any timing irregularities.
+        Feeding bursts into the remote jitter buffer causes audible
+        lag and choppiness on SIP legs, so we transmit one codec frame
+        per frame duration.
         """
         frame_bytes = self.codec.frame_bytes
+        frame_duration = self.codec.frame_samples / float(self.codec.sample_rate)
         buf = b""
+        next_send = time.monotonic()
 
         while self._running:
             # Block until data arrives
@@ -152,8 +154,15 @@ class RTPSession:
             except queue.Empty:
                 pass
 
-            # Send all complete frames immediately
+            # Send complete frames at real-time cadence.
             while len(buf) >= frame_bytes:
+                now = time.monotonic()
+                if next_send > now:
+                    time.sleep(next_send - now)
+                elif now - next_send > frame_duration * 4:
+                    # After underruns, resume pacing from "now" instead
+                    # of trying to catch up with a burst.
+                    next_send = now
                 packet = self._build_rtp_packet(buf[:frame_bytes])
                 buf = buf[frame_bytes:]
                 try:
@@ -162,8 +171,7 @@ class RTPSession:
                     pass
                 self._tx_seq = (self._tx_seq + 1) & 0xFFFF
                 self._tx_ts += self.codec.frame_samples
-            else:
-                next_send = time.monotonic()  # catch up
+                next_send += frame_duration
 
     def hangup(self) -> None:
         """Stop the session (called by leg cleanup)."""

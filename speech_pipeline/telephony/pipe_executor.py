@@ -21,6 +21,9 @@ from typing import Any, Dict, List, Tuple
 
 _LOGGER = logging.getLogger("telephony.pipe-executor")
 
+_PLAY_CHUNK_SECONDS = 0.05
+_TTS_CHUNK_SECONDS = 0.10
+
 # ---------------------------------------------------------------------------
 # DSL Parser
 # ---------------------------------------------------------------------------
@@ -367,7 +370,7 @@ class CallPipeExecutor:
         with self._lock:
             self._stages[stage_id] = handle
 
-        reader = AudioReader(url, chunk_seconds=0.5)
+        reader = AudioReader(url, chunk_seconds=_PLAY_CHUNK_SECONDS)
         source = reader
         if volume != 100:
             from speech_pipeline.GainStage import GainStage
@@ -389,7 +392,13 @@ class CallPipeExecutor:
         from speech_pipeline.TTSProducer import TTSProducer
         voice = self._tts_registry.ensure_loaded(voice_name)
         syn = self._tts_registry.create_synthesis_config(voice, {})
-        return TTSProducer(voice, syn, text, sentence_silence=0.0)
+        return TTSProducer(
+            voice,
+            syn,
+            text,
+            sentence_silence=0.0,
+            chunk_seconds=_TTS_CHUNK_SECONDS,
+        )
 
     # -- SIP wrapping ------------------------------------------------------
 
@@ -573,7 +582,7 @@ class CallPipeExecutor:
                 max_i = (int(loop) if isinstance(loop, (int, float)) and loop > 1
                          else (999999 if loop else 1))
                 while iters < max_i and not stop.is_set() and not mixer.cancelled:
-                    reader = AudioReader(url, chunk_seconds=0.5)
+                    reader = AudioReader(url, chunk_seconds=_PLAY_CHUNK_SECONDS)
                     stage = reader
                     if volume != 100:
                         from speech_pipeline.GainStage import GainStage

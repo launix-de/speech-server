@@ -84,6 +84,28 @@ class SIPSink(Stage):
         else:
             self.input_format = AudioFormat(8000, "s16le")
 
+    def _session_writer_lock(self):
+        lock = getattr(self.session, "_sink_writer_lock", None)
+        if lock is None:
+            lock = threading.Lock()
+            self.session._sink_writer_lock = lock
+        return lock
+
+    def _claim_session_writer(self) -> None:
+        with self._session_writer_lock():
+            current = getattr(self.session, "_active_sink_writer", None)
+            if current and current is not self:
+                current.cancel()
+            self.session._active_sink_writer = self
+
+    def _owns_session_writer(self) -> bool:
+        return getattr(self.session, "_active_sink_writer", None) is self
+
+    def _release_session_writer(self) -> None:
+        with self._session_writer_lock():
+            if getattr(self.session, "_active_sink_writer", None) is self:
+                self.session._active_sink_writer = None
+
     def run(self) -> None:
         if not self.upstream:
             return
@@ -97,13 +119,17 @@ class SIPSink(Stage):
             return
 
         call = self.session.call
+        self._claim_session_writer()
 
         # Detect call type: RTPSession (has codec) or pyVoIP (has RTPClients)
         from speech_pipeline.RTPSession import RTPSession
-        if isinstance(call, RTPSession):
-            self._run_rtp_session(call)
-        else:
-            self._run_pyvoip(call)
+        try:
+            if isinstance(call, RTPSession):
+                self._run_rtp_session(call)
+            else:
+                self._run_pyvoip(call)
+        finally:
+            self._release_session_writer()
 
     def _run_rtp_session(self, rtp_session) -> None:
         """Direct RTP: pass s16le to RTPSession, codec handles encoding."""
@@ -112,7 +138,11 @@ class SIPSink(Stage):
                      rtp_session.remote_port)
         try:
             for pcm in self.upstream.stream_pcm24k():
-                if self.cancelled or self.session.hungup.is_set():
+                if (
+                    self.cancelled
+                    or self.session.hungup.is_set()
+                    or not self._owns_session_writer()
+                ):
                     break
                 rtp_session.write_s16le(pcm)
         except Exception as e:
@@ -158,7 +188,11 @@ class SIPSink(Stage):
 
         try:
             for pcm in self.upstream.stream_pcm24k():
-                if self.cancelled or self.session.hungup.is_set():
+                if (
+                    self.cancelled
+                    or self.session.hungup.is_set()
+                    or not self._owns_session_writer()
+                ):
                     break
                 call.write_audio(encode(pcm))
         except Exception as e:

@@ -181,13 +181,14 @@ class CallPipeExecutor:
         # Phase 4: wrap SIP sessions with SIPSource/SIPSink
         resolved = self._wrap_sip(resolved)
 
-        # Phase 5: link play handles to their ConferenceLeg (for kill_stage)
+        # Phase 5: link play handles to their terminal stage (for kill_stage)
         for i in range(len(resolved) - 1):
-            l_typ, _, _, l_stage = resolved[i]
-            r_typ, _, _, r_stage = resolved[i + 1]
+            _, _, _, l_stage = resolved[i]
+            _, _, _, r_stage = resolved[i + 1]
             play_handle = getattr(l_stage, '_play_handle', None)
             from speech_pipeline.ConferenceLeg import ConferenceLeg
-            if play_handle and isinstance(r_stage, ConferenceLeg):
+            from speech_pipeline.SIPSink import SIPSink
+            if play_handle and isinstance(r_stage, (ConferenceLeg, SIPSink)):
                 play_handle._stage = r_stage
 
         # Phase 6: chain via pipe()
@@ -203,7 +204,9 @@ class CallPipeExecutor:
                 continue
             l_stage.pipe(r_stage)
 
-        # Phase 6: start terminal + monitors
+        self._register_bridge_handles(resolved)
+
+        # Phase 7: start terminal + monitors
         self._start_all(resolved)
 
     # -- Fill missing IDs --------------------------------------------------
@@ -244,13 +247,20 @@ class CallPipeExecutor:
         if first_typ == "tee":
             raise ValueError("tee may only start a pipe when attaching to an existing tee sidechain")
 
-        sip_ids = [elem_id for typ, elem_id, _ in elements if typ == "sip"]
+        sip_positions = [(i, elem_id) for i, (typ, elem_id, _) in enumerate(elements) if typ == "sip"]
+        sip_ids = [elem_id for _, elem_id in sip_positions]
         if len(sip_ids) > 2:
             raise ValueError("At most two sip stages are allowed per pipe")
         if len(sip_ids) == 2 and sip_ids[0] != sip_ids[1]:
             raise ValueError("Bidirectional sip pipes must use the same leg on both sides")
         if sip_ids and not call_positions:
-            raise ValueError("sip pipes require a call stage")
+            if len(sip_ids) != 1 or sip_positions[0][0] != len(elements) - 1:
+                raise ValueError("Without call, sip may only appear once as the terminal sink")
+            if len(elements) < 2:
+                raise ValueError("Direct sip output requires an upstream source")
+            if elements[0][0] == "sip":
+                raise ValueError("Direct sip output requires a non-sip source")
+            return
 
         if call_positions:
             call_pos = call_positions[0]
@@ -432,13 +442,20 @@ class CallPipeExecutor:
 
         result = []
         sip_seen = {}  # leg_id -> "source" created
+        sip_counts = {}
+        for typ, elem_id, _, _ in resolved:
+            if typ == "sip":
+                sip_counts[elem_id] = sip_counts.get(elem_id, 0) + 1
 
         for i, (typ, elem_id, params, stage) in enumerate(resolved):
             if typ != "sip":
                 result.append((typ, elem_id, params, stage))
                 continue
 
-            if elem_id not in sip_seen:
+            if sip_counts.get(elem_id, 0) == 1:
+                sink = SIPSink(stage)
+                result.append(("sip_sink", elem_id, params, sink))
+            elif elem_id not in sip_seen:
                 # First occurrence: SIPSource
                 src = SIPSource(stage)
                 result.append(("sip_source", elem_id, params, src))
@@ -449,6 +466,46 @@ class CallPipeExecutor:
                 result.append(("sip_sink", elem_id, params, sink))
 
         return result
+
+    def _register_bridge_handles(self, resolved):
+        """Register bidirectional SIP bridges so they can be detached live."""
+        from speech_pipeline.ConferenceLeg import ConferenceLeg
+
+        bridge_leg_id = None
+        conf_leg = None
+        for typ, elem_id, _, stage in resolved:
+            if typ == "sip_source" and bridge_leg_id is None:
+                bridge_leg_id = elem_id
+            if isinstance(stage, ConferenceLeg):
+                conf_leg = stage
+                break
+
+        if not bridge_leg_id or conf_leg is None:
+            return
+
+        leg = self._sessions.get(f"_leg:{bridge_leg_id}")
+        if not leg:
+            return
+
+        def _on_attached(conf):
+            leg._conf_leg = conf
+            leg._src_id = getattr(conf, "_src_id", None)
+
+        def _on_detached(conf):
+            if getattr(leg, "_conf_leg", None) is conf:
+                leg._conf_leg = None
+                leg._src_id = None
+
+        conf_leg.on_attached = _on_attached
+        conf_leg.on_detached = _on_detached
+
+        handle = type("_BridgeHandle", (), {
+            "_stage": conf_leg,
+            "_current_src": None,
+            "_stop": None,
+        })()
+        with self._lock:
+            self._stages[f"bridge:{bridge_leg_id}"] = handle
 
     def _start_all(self, resolved):
         """Start terminal sink + SIP monitors + play loops."""

@@ -96,8 +96,15 @@ class CallPipeExecutor:
             handle = self._stages.pop(stage_id, None)
         if not handle:
             return False
+        # Signal stop event (for legacy play loops)
         stop = getattr(handle, '_stop', None)
         if stop: stop.set()
+        # Cancel the stage itself (stops AudioReader/ConferenceLeg pipeline)
+        stage = getattr(handle, '_stage', None)
+        if stage and hasattr(stage, 'cancel'):
+            try: stage.cancel()
+            except: pass
+        # Kill mixer source directly
         src_id = getattr(handle, '_current_src', None)
         if src_id:
             try: self.call.mixer.kill_source(src_id)
@@ -138,7 +145,16 @@ class CallPipeExecutor:
         # Phase 4: wrap SIP sessions with SIPSource/SIPSink
         resolved = self._wrap_sip(resolved)
 
-        # Phase 5: chain via pipe()
+        # Phase 5: link play handles to their ConferenceLeg (for kill_stage)
+        for i in range(len(resolved) - 1):
+            l_typ, _, _, l_stage = resolved[i]
+            r_typ, _, _, r_stage = resolved[i + 1]
+            play_handle = getattr(l_stage, '_play_handle', None)
+            from speech_pipeline.ConferenceLeg import ConferenceLeg
+            if play_handle and isinstance(r_stage, ConferenceLeg):
+                play_handle._stage = r_stage
+
+        # Phase 6: chain via pipe()
         for i in range(len(resolved) - 1):
             _, _, _, l_stage = resolved[i]
             _, _, _, r_stage = resolved[i + 1]

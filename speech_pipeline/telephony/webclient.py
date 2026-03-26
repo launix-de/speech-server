@@ -73,6 +73,35 @@ def remove_webclient_session(session_id: str) -> None:
     _sessions.pop(session_id, None)
 
 
+def close_webclient_session(session_id: str) -> None:
+    entry = _sessions.pop(session_id, None)
+    if not entry:
+        return
+
+    nonce = entry.get("nonce")
+    if nonce:
+        try:
+            auth.revoke_nonce(nonce)
+        except Exception:
+            pass
+
+    try:
+        from speech_pipeline.CodecSocketSession import get_session as get_codec_session
+        codec_session = get_codec_session(session_id)
+        if codec_session:
+            codec_session.close()
+    except Exception:
+        pass
+
+    _LOGGER.info("WebClient session %s closed", session_id)
+
+
+def close_call_sessions(call_id: str) -> None:
+    for session_id, entry in list(_sessions.items()):
+        if entry.get("call_id") == call_id:
+            close_webclient_session(session_id)
+
+
 def get_mixer_for_session(session_id: str):
     """Called by pipe pre-hook to inject the conference mixer."""
     entry = _sessions.get(session_id)

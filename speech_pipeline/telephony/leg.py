@@ -43,6 +43,7 @@ class Leg:
         self._src_id: Optional[str] = None
         self._sink_id: Optional[str] = None
         self._sip_session = None
+        self._completion_monitor_started = False
 
     def to_dict(self) -> dict:
         return {
@@ -184,6 +185,7 @@ def originate_only(leg: Leg, pbx_entry: dict) -> None:
                         call.mixer.remove_sink(leg._sink_id)
             delete_leg(leg.leg_id)
 
+    leg._completion_monitor_started = True
     threading.Thread(target=_monitor, daemon=True,
                      name=f"mon-{leg.leg_id}").start()
 

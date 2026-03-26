@@ -120,6 +120,9 @@ def get_call(call_id: str) -> Optional[Call]:
 def delete_call(call_id: str) -> bool:
     call = _calls.get(call_id)
     if call:
+        from . import webclient as webclient_mod
+        webclient_mod.close_call_sessions(call_id)
+
         # Hang up all SIP legs associated with this call
         from . import leg as leg_mod
         for lg in leg_mod.list_legs():

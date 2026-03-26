@@ -224,5 +224,16 @@ class CodecSocketSession:
     def close(self) -> None:
         self.closed.set()
         self.connected.set()
+        try:
+            self.tx_queue.put_nowait(None)
+        except Exception:
+            pass
+        ws = self._ws
+        self._ws = None
+        if ws is not None:
+            try:
+                ws.close()
+            except Exception:
+                pass
         with _sessions_lock:
             _sessions.pop(self.session_id, None)

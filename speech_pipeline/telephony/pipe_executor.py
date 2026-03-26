@@ -531,6 +531,10 @@ class CallPipeExecutor:
                     time.sleep(0.1)
         threading.Thread(target=_dtmf, daemon=True, name=f"dtmf-{leg_id}").start()
 
+        if getattr(leg, "_completion_monitor_started", False):
+            _LOGGER.info("SIP leg %s wired", leg_id)
+            return
+
         def _monitor():
             while leg.status == "in-progress":
                 ended = False
@@ -558,6 +562,7 @@ class CallPipeExecutor:
             leg_mod._fire_callback(leg, "completed", duration=dur)
             _LOGGER.info("Leg %s ended (%.1fs)", leg_id, dur)
             leg_mod.delete_leg(leg_id)
+        leg._completion_monitor_started = True
         threading.Thread(target=_monitor, daemon=True, name=f"mon-{leg_id}").start()
 
         _LOGGER.info("SIP leg %s wired", leg_id)

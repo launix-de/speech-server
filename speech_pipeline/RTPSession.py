@@ -84,6 +84,10 @@ class RTPSession:
         """Stop the session and close the socket."""
         self._running = False
         try:
+            self.codec.close()
+        except Exception:
+            pass
+        try:
             self._sock.close()
         except Exception:
             pass
@@ -170,7 +174,7 @@ class RTPSession:
                 except Exception:
                     pass
                 self._tx_seq = (self._tx_seq + 1) & 0xFFFF
-                self._tx_ts += self.codec.frame_samples
+                self._tx_ts += self.codec.timestamp_step
                 next_send += frame_duration
 
     def hangup(self) -> None:

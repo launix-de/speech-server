@@ -182,17 +182,21 @@ def _find_free_port() -> int:
     return port
 
 
-def _build_sdp(ip: str, rtp_port: int) -> str:
+def _build_sdp(ip: str, rtp_port: int, codec=None) -> str:
+    from speech_pipeline.rtp_codec import CODEC_PREFERENCE
+
     session_id = str(random.randint(100000, 999999))
+    codecs = [codec] if codec is not None else CODEC_PREFERENCE
+    payloads = " ".join(str(c.payload_type) for c in codecs)
+    rtpmap = "".join(c.sdp_rtpmap for c in codecs)
     return (
         "v=0\r\n"
         f"o=tts-piper {session_id} {session_id} IN IP4 {ip}\r\n"
         "s=tts-piper\r\n"
         f"c=IN IP4 {ip}\r\n"
         "t=0 0\r\n"
-        f"m=audio {rtp_port} RTP/AVP 0 8 101\r\n"
-        "a=rtpmap:0 PCMU/8000\r\n"
-        "a=rtpmap:8 PCMA/8000\r\n"
+        f"m=audio {rtp_port} RTP/AVP {payloads} 101\r\n"
+        f"{rtpmap}"
         "a=rtpmap:101 telephone-event/8000\r\n"
         "a=fmtp:101 0-16\r\n"
         "a=sendrecv\r\n"
@@ -206,11 +210,12 @@ def _parse_sdp(sdp: str) -> Tuple[str, int, int]:
     The payload type is the first codec in the m-line that we support.
     Falls back to 0 (PCMU) if none match.
     """
-    from speech_pipeline.rtp_codec import CODECS_BY_PT
+    from speech_pipeline.rtp_codec import negotiate_payload_type
 
     host = "0.0.0.0"
     port = 0
     payload_type = 0
+    remote_pts = []
     for line in sdp.splitlines():
         line = line.strip()
         if line.startswith("c=IN IP4 "):
@@ -218,12 +223,8 @@ def _parse_sdp(sdp: str) -> Tuple[str, int, int]:
         m = re.match(r"m=audio\s+(\d+)\s+\S+\s+([\d\s]+)", line)
         if m:
             port = int(m.group(1))
-            # Pick first supported PT from remote's offer/answer
-            for pt_str in m.group(2).split():
-                pt = int(pt_str)
-                if pt in CODECS_BY_PT:
-                    payload_type = pt
-                    break
+            remote_pts = [int(pt_str) for pt_str in m.group(2).split()]
+            payload_type = negotiate_payload_type(remote_pts)
     return host, port, payload_type
 
 
@@ -1091,17 +1092,23 @@ def _handle_trunk_invite(msg: dict, addr: Tuple[str, int], pbx_id: str) -> None:
 
     _LOGGER.info("Trunk INVITE on %s: %s → %s", pbx_id, caller, callee)
 
+    # Parse remote's codec preference from INVITE SDP
+    _, _, remote_pt = _parse_sdp(msg.get("body", ""))
+    from speech_pipeline.rtp_codec import codec_for_pt, PCMU
+    negotiated_codec = codec_for_pt(remote_pt) or PCMU
+
     to_tag = _gen_tag()
     rtp_port = _find_free_port()
-    sdp = _build_sdp(_local_ip, rtp_port)
+    sdp = _build_sdp(_local_ip, rtp_port, codec=negotiated_codec)
 
     # Send 183 Session Progress with SDP — starts Early Media RTP
     resp = _build_response(183, "Session Progress", msg, to_tag=to_tag, body=sdp)
     _send(resp, addr)
-    _LOGGER.info("Trunk INVITE: sent 183 Session Progress (Early Media RTP :%d)", rtp_port)
-
-    # Parse remote's codec preference from INVITE SDP
-    _, _, remote_pt = _parse_sdp(msg.get("body", ""))
+    _LOGGER.info(
+        "Trunk INVITE: sent 183 Session Progress (Early Media RTP :%d, codec=%s)",
+        rtp_port,
+        negotiated_codec,
+    )
 
     # Store the dialog info so we can send 200 OK later via answer_trunk_leg()
     _trunk_dialogs[call_id] = {
@@ -1112,7 +1119,7 @@ def _handle_trunk_invite(msg: dict, addr: Tuple[str, int], pbx_id: str) -> None:
         "sdp": sdp,
         "pbx_id": pbx_id,
         "answered": False,
-        "negotiated_pt": remote_pt,
+        "negotiated_pt": negotiated_codec.payload_type,
     }
 
     # Delegate to sip_listener

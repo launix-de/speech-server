@@ -1,11 +1,10 @@
 """RTP codec abstraction — encode/decode between s16le PCM and wire format.
 
-Supported codecs: PCMU (G.711 µ-law), PCMA (G.711 A-law).
-Prepared for G.722 (wideband, 16 kHz).
+Supported codecs: G.722, PCMU (G.711 µ-law), PCMA (G.711 A-law).
 
 Usage::
 
-    from speech_pipeline.rtp_codec import PCMU, PCMA, codec_for_pt
+    from speech_pipeline.rtp_codec import PCMU, PCMA, G722, codec_for_pt
 
     codec = PCMU
     wire = codec.encode(s16le_pcm)   # s16le → wire bytes
@@ -14,6 +13,11 @@ Usage::
 from __future__ import annotations
 
 import audioop
+import io
+import queue
+import threading
+
+import av
 
 
 class RTPCodec:
@@ -40,6 +44,21 @@ class RTPCodec:
     def decode(self, wire: bytes) -> bytes:
         """Decode wire format → s16le PCM."""
         raise NotImplementedError
+
+    def close(self) -> None:
+        """Release codec resources held by a live RTP session."""
+
+    def new_session_codec(self) -> RTPCodec:
+        """Return a codec instance safe to bind to one RTP session."""
+        return self
+
+    @property
+    def timestamp_step(self) -> int:
+        return int(self.clock_rate * self.frame_samples / self.sample_rate)
+
+    @property
+    def sdp_rtpmap(self) -> str:
+        return f"a=rtpmap:{self.payload_type} {self.name}/{self.clock_rate}\r\n"
 
     def __repr__(self) -> str:
         return f"{self.name}(PT={self.payload_type}, {self.sample_rate}Hz)"
@@ -69,20 +88,177 @@ class _PCMA(RTPCodec):
         return audioop.alaw2lin(wire, 2)
 
 
+class _QueueReader(io.RawIOBase):
+    """Blocking byte stream for PyAV raw demuxers."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._queue: queue.Queue[bytes | None] = queue.Queue()
+        self._buf = bytearray()
+        self._closed = False
+
+    def readable(self) -> bool:
+        return True
+
+    def feed(self, chunk: bytes) -> None:
+        if chunk:
+            self._queue.put(chunk)
+
+    def close_input(self) -> None:
+        if not self._closed:
+            self._closed = True
+            self._queue.put(None)
+
+    def read(self, size: int = -1) -> bytes:
+        while not self._buf and not self._closed:
+            item = self._queue.get()
+            if item is None:
+                self._closed = True
+                break
+            self._buf.extend(item)
+
+        if size is None or size < 0:
+            size = len(self._buf)
+        out = bytes(self._buf[:size])
+        del self._buf[:size]
+        return out
+
+
+class _G722(RTPCodec):
+    __slots__ = RTPCodec.__slots__ + (
+        "_encoder",
+        "_decoder_in",
+        "_decoder_out",
+        "_decoder_thread",
+        "_decoder_error",
+        "_decoder_ready",
+        "_encode_lock",
+    )
+
+    def __init__(self, runtime: bool = False) -> None:
+        # RTP payload type 9 keeps an 8kHz RTP clock although the decoded
+        # PCM is 16kHz wideband audio (RFC 3551 compatibility quirk).
+        super().__init__("G722", 9, 8000, 16000, 320, 160, 0x00)
+        self._encoder = None
+        self._decoder_in = None
+        self._decoder_out = None
+        self._decoder_thread = None
+        self._decoder_error = None
+        self._decoder_ready = threading.Event()
+        self._encode_lock = threading.Lock()
+        if runtime:
+            self._init_runtime()
+
+    def new_session_codec(self) -> RTPCodec:
+        return _G722(runtime=True)
+
+    def _init_runtime(self) -> None:
+        if self._encoder is not None:
+            return
+
+        self._encoder = av.codec.CodecContext.create("g722", "w")
+        self._encoder.sample_rate = self.sample_rate
+        self._encoder.layout = "mono"
+        self._encoder.format = "s16"
+
+        self._decoder_in = _QueueReader()
+        self._decoder_out = queue.Queue()
+        self._decoder_thread = threading.Thread(
+            target=self._run_decoder,
+            daemon=True,
+            name="g722-decoder",
+        )
+        self._decoder_thread.start()
+        self._decoder_ready.wait(timeout=1.0)
+        if self._decoder_error is not None:
+            raise RuntimeError(f"G.722 decoder init failed: {self._decoder_error}")
+
+    def _run_decoder(self) -> None:
+        try:
+            container = av.open(
+                self._decoder_in,
+                mode="r",
+                format="g722",
+                options={
+                    "probesize": "32",
+                    "analyzeduration": "0",
+                    "fflags": "nobuffer",
+                },
+            )
+            self._decoder_ready.set()
+            for packet in container.demux():
+                for frame in packet.decode():
+                    self._decoder_out.put(bytes(frame.planes[0]))
+        except Exception as exc:
+            self._decoder_error = exc
+            self._decoder_ready.set()
+        finally:
+            if self._decoder_out is not None:
+                self._decoder_out.put(None)
+
+    def encode(self, s16le: bytes) -> bytes:
+        self._init_runtime()
+        if not s16le:
+            return b""
+        frame = av.AudioFrame(
+            format="s16",
+            layout="mono",
+            samples=len(s16le) // 2,
+        )
+        frame.sample_rate = self.sample_rate
+        frame.planes[0].update(s16le)
+        with self._encode_lock:
+            packets = self._encoder.encode(frame)
+        return b"".join(bytes(packet) for packet in packets)
+
+    def decode(self, wire: bytes) -> bytes:
+        self._init_runtime()
+        if not wire:
+            return b""
+        self._decoder_in.feed(wire)
+        try:
+            out = self._decoder_out.get(timeout=0.05)
+        except queue.Empty as exc:
+            if self._decoder_error is None:
+                return b"\x00" * (self.frame_samples * 2)
+            raise RuntimeError("G.722 decoder timed out") from exc
+        if out is None:
+            if self._decoder_error is not None:
+                raise RuntimeError(f"G.722 decoder failed: {self._decoder_error}")
+            return b""
+        return out
+
+    def close(self) -> None:
+        if self._decoder_in is not None:
+            self._decoder_in.close_input()
+        if self._decoder_thread is not None:
+            self._decoder_thread.join(timeout=1.0)
+
+
 # Module-level singletons
+G722 = _G722()
 PCMU = _PCMU()
 PCMA = _PCMA()
 
-CODECS_BY_PT = {0: PCMU, 8: PCMA}
-CODECS_BY_NAME = {"PCMU": PCMU, "PCMA": PCMA}
+CODECS_BY_PT = {9: G722, 0: PCMU, 8: PCMA}
+CODECS_BY_NAME = {"G722": G722, "PCMU": PCMU, "PCMA": PCMA}
 
 # SDP offer preference order
-CODEC_PREFERENCE = [PCMU, PCMA]
+CODEC_PREFERENCE = [G722, PCMU, PCMA]
 
 
 def codec_for_pt(pt: int) -> RTPCodec | None:
     """Look up codec by RTP payload type."""
-    return CODECS_BY_PT.get(pt)
+    codec = CODECS_BY_PT.get(pt)
+    return codec.new_session_codec() if codec is not None else None
+
+
+def negotiate_payload_type(remote_pts: list[int]) -> int:
+    """Pick best supported payload type from a remote SDP offer."""
+    for codec in CODEC_PREFERENCE:
+        if codec.payload_type in remote_pts:
+            return codec.payload_type
+    return PCMU.payload_type
 
 
 def negotiate_codec(remote_pts: list[int]) -> RTPCodec:
@@ -91,7 +267,4 @@ def negotiate_codec(remote_pts: list[int]) -> RTPCodec:
     Returns our preferred codec that the remote also supports.
     Falls back to PCMU if nothing matches.
     """
-    for codec in CODEC_PREFERENCE:
-        if codec.payload_type in remote_pts:
-            return codec
-    return PCMU
+    return codec_for_pt(negotiate_payload_type(remote_pts)) or PCMU

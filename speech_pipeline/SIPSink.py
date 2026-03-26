@@ -77,7 +77,12 @@ class SIPSink(Stage):
     def __init__(self, session) -> None:
         super().__init__()
         self.session = session
-        self.input_format = AudioFormat(8000, "s16le")
+        from speech_pipeline.RTPSession import RTPSession
+        call = session.call if hasattr(session, "call") else None
+        if isinstance(call, RTPSession):
+            self.input_format = AudioFormat(call.codec.sample_rate, "s16le")
+        else:
+            self.input_format = AudioFormat(8000, "s16le")
 
     def run(self) -> None:
         if not self.upstream:

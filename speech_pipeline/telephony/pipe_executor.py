@@ -43,24 +43,38 @@ def _consume_json(s, pos):
                 depth -= 1
                 if depth == 0:
                     pos += 1
-                    try: return json.loads(s[start:pos]), pos
-                    except: return {}, pos
+                    try:
+                        return json.loads(s[start:pos]), pos
+                    except json.JSONDecodeError as e:
+                        raise ValueError(f"Invalid JSON params: {e.msg}") from e
         pos += 1
-    return {}, pos
+    raise ValueError("Unterminated JSON params")
 
 def parse_dsl(dsl: str) -> List[Tuple[str, str, dict]]:
     elements = []
     pos = 0
     s = dsl.strip()
+    expect_element = True
     while pos < len(s):
-        m = _ARROW.match(s, pos)
-        if m: pos = m.end(); continue
-        m = _ELEMENT.match(s, pos)
-        if not m: pos += 1; continue
-        typ, elem_id = m.group(1), m.group(2) or ""
-        pos = m.end()
-        params, pos = _consume_json(s, pos)
-        elements.append((typ, elem_id, params))
+        if expect_element:
+            m = _ELEMENT.match(s, pos)
+            if not m:
+                snippet = s[pos:pos + 32]
+                raise ValueError(f"Invalid DSL syntax near: {snippet!r}")
+            typ, elem_id = m.group(1), m.group(2) or ""
+            pos = m.end()
+            params, pos = _consume_json(s, pos)
+            elements.append((typ, elem_id, params))
+            expect_element = False
+        else:
+            m = _ARROW.match(s, pos)
+            if not m:
+                snippet = s[pos:pos + 32]
+                raise ValueError(f"Expected pipe separator near: {snippet!r}")
+            pos = m.end()
+            expect_element = True
+    if expect_element and elements:
+        raise ValueError("DSL must not end with a pipe separator")
     return elements
 
 # ---------------------------------------------------------------------------
@@ -129,6 +143,7 @@ class CallPipeExecutor:
 
         # Phase 1: fill in missing IDs (sip without ID = first sip predecessor)
         self._fill_ids(elements)
+        self._validate_elements(elements)
 
         # Phase 2: existing tee as first element → sidechain mode
         first_typ, first_id, first_params = elements[0]
@@ -154,13 +169,17 @@ class CallPipeExecutor:
             if play_handle and isinstance(r_stage, ConferenceLeg):
                 play_handle._stage = r_stage
 
-        # Phase 6: chain via pipe() — skip play→ConferenceLeg (play uses mixer directly)
+        # Phase 6: chain via pipe()
+        # Skip source→ConferenceLeg ONLY when ConferenceLeg is the LAST element
+        # (source-only pipe like play:→call: or tts:→call:).
+        # For bidirectional pipes (sip:→call:→sip:), pipe() must connect everything.
         from speech_pipeline.ConferenceLeg import ConferenceLeg as _CL
         for i in range(len(resolved) - 1):
             l_typ, _, _, l_stage = resolved[i]
             _, _, _, r_stage = resolved[i + 1]
-            if l_typ == "play" and isinstance(r_stage, _CL):
-                continue  # play: -> call: → registered via mixer.add_source in _start_all
+            if isinstance(r_stage, _CL) and i + 1 == len(resolved) - 1:
+                # Last element is ConferenceLeg → source-only, use mixer.add_source
+                continue
             l_stage.pipe(r_stage)
 
         # Phase 6: start terminal + monitors
@@ -169,15 +188,65 @@ class CallPipeExecutor:
     # -- Fill missing IDs --------------------------------------------------
 
     def _fill_ids(self, elements):
-        """Fill in missing IDs: sip/codec without ID = reuse first predecessor."""
-        seen = {}  # typ -> first ID
+        """Fill in missing IDs: sip without ID = reuse first predecessor."""
+        seen = {}
         for i, (typ, elem_id, params) in enumerate(elements):
+            if typ != "sip":
+                continue
             if elem_id:
-                if typ not in seen:
-                    seen[typ] = elem_id
-            else:
-                if typ in seen:
-                    elements[i] = (typ, seen[typ], params)
+                seen.setdefault(typ, elem_id)
+            elif typ in seen:
+                elements[i] = (typ, seen[typ], params)
+
+    def _validate_elements(self, elements):
+        """Reject malformed or ambiguous telephony DSL before dispatch."""
+        if not elements:
+            raise ValueError("Empty pipe")
+
+        call_positions = [i for i, (typ, _, _) in enumerate(elements) if typ == "call"]
+        if len(call_positions) > 1:
+            raise ValueError("Only one call stage is allowed per pipe")
+
+        webhook_positions = [i for i, (typ, _, _) in enumerate(elements) if typ == "webhook"]
+        if webhook_positions and webhook_positions[-1] != len(elements) - 1:
+            raise ValueError("webhook must be the final stage in a pipe")
+
+        first_typ, first_id, _ = elements[0]
+        sidechain_mode = first_typ == "tee" and first_id in self._tees
+        if sidechain_mode:
+            if len(elements) < 2:
+                raise ValueError("tee sidechain requires at least one downstream stage")
+            for typ, _, _ in elements[1:]:
+                if typ in {"call", "sip", "play", "tts"}:
+                    raise ValueError(f"{typ} is not allowed inside tee sidechains")
+            return
+        if first_typ == "tee":
+            raise ValueError("tee may only start a pipe when attaching to an existing tee sidechain")
+
+        sip_ids = [elem_id for typ, elem_id, _ in elements if typ == "sip"]
+        if len(sip_ids) > 2:
+            raise ValueError("At most two sip stages are allowed per pipe")
+        if len(sip_ids) == 2 and sip_ids[0] != sip_ids[1]:
+            raise ValueError("Bidirectional sip pipes must use the same leg on both sides")
+        if sip_ids and not call_positions:
+            raise ValueError("sip pipes require a call stage")
+
+        if call_positions:
+            call_pos = call_positions[0]
+            call_id = elements[call_pos][1]
+            if not call_id:
+                raise ValueError("call requires a call id")
+            if call_id and call_id != self.call.call_id:
+                raise ValueError(
+                    f"Pipe targets call {call_id}, but executor is bound to {self.call.call_id}"
+                )
+            if call_pos == 0:
+                raise ValueError("call stage cannot be the first element")
+            if call_pos != len(elements) - 1:
+                if call_pos != len(elements) - 2 or elements[-1][0] != "sip":
+                    raise ValueError("call may only be followed by a single terminal sip stage")
+            if sip_ids and len(sip_ids) == 1 and call_pos != len(elements) - 2:
+                raise ValueError("A single sip stage is only valid as terminal sink after call")
 
     # -- Sidechain: tee:ID -> stage -> stage -> ...  -------------------------
 
@@ -240,6 +309,8 @@ class CallPipeExecutor:
                                       language=lang)
 
         if typ == "webhook":
+            if not elem_id:
+                raise ValueError("webhook requires a target URL")
             from speech_pipeline.WebhookSink import WebhookSink
             bearer = self._subscriber.get("bearer_token", "") if self._subscriber else ""
             return WebhookSink(elem_id, bearer_token=bearer)
@@ -249,6 +320,9 @@ class CallPipeExecutor:
     def _create_sip(self, leg_id, params):
         """Resolve SIP leg. Returns session (SIPSource/SIPSink wrap via pipe)."""
         from . import leg as leg_mod
+
+        if not leg_id:
+            raise ValueError("sip requires a leg id")
 
         # Check if we already have a session for this leg
         session_key = f"sip:{leg_id}"
@@ -304,7 +378,9 @@ class CallPipeExecutor:
         return source
 
     def _create_tts(self, voice_name, params):
-        voice_name = voice_name or "de_DE-thorsten-medium"
+        # Allow language shortcut: tts:de → de_DE-thorsten-medium
+        if not voice_name or voice_name == "de":
+            voice_name = "de_DE-thorsten-medium"
         text = params.get("text", "")
         if not text:
             raise ValueError("tts requires text")
@@ -386,17 +462,48 @@ class CallPipeExecutor:
                 if leg and session:
                     self._start_sip_monitors(leg, session)
 
-        # Start play sources via mixer.add_source (auto-resamples via pipe())
-        for typ, elem_id, params, stage in resolved:
-            if typ != "play":
-                continue
-            handle = getattr(stage, '_play_handle', None)
-            if not handle:
-                continue
-            src_id = self.call.mixer.add_source(stage)
-            handle._current_src = src_id
-            if handle._loop:
-                self._start_play_loop(handle, src_id)
+        # Any non-ConferenceLeg stage directly before a terminal ConferenceLeg → mixer.add_source
+        from speech_pipeline.ConferenceLeg import ConferenceLeg as _CL
+        for i in range(len(resolved) - 1):
+            l_typ, l_id, l_params, l_stage = resolved[i]
+            _, _, _, r_stage = resolved[i + 1]
+            if isinstance(r_stage, _CL) and i + 1 == len(resolved) - 1:
+                src_id = self.call.mixer.add_source(l_stage)
+                # Wire play loop if applicable
+                handle = getattr(l_stage, '_play_handle', None)
+                if handle:
+                    handle._current_src = src_id
+                    if handle._loop:
+                        self._start_play_loop(handle, src_id)
+                # Fire completed callback when source finishes
+                completed_cb = l_params.get("completed", "") if l_params else ""
+                if completed_cb:
+                    self._start_source_completed_monitor(src_id, completed_cb)
+
+    # -- Source completed monitor ------------------------------------------
+
+    def _start_source_completed_monitor(self, src_id, callback_path):
+        """Wait for a mixer source to finish, then fire a webhook callback."""
+        from . import subscriber as sub_mod
+
+        sub = sub_mod.get(self.call.subscriber_id) if self.call.subscriber_id else None
+        if not sub:
+            return
+
+        def _monitor():
+            self.call.mixer.wait_source(src_id)
+            url = sub["base_url"].rstrip("/") + "/" + callback_path.lstrip("/")
+            try:
+                import requests
+                requests.post(url, json={"call_id": self.call.call_id, "source": src_id},
+                              headers={"Authorization": f"Bearer {sub['bearer_token']}"},
+                              timeout=10)
+                _LOGGER.info("Source %s completed → %s", src_id, callback_path)
+            except Exception as e:
+                _LOGGER.warning("Source completed callback failed: %s", e)
+
+        threading.Thread(target=_monitor, daemon=True,
+                         name=f"src-done-{src_id}").start()
 
     # -- SIP monitors ------------------------------------------------------
 

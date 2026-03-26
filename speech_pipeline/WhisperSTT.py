@@ -148,6 +148,7 @@ class WhisperTranscriber(Stage):
         import numpy as np
         samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         segments, _ = model.transcribe(samples, language=self.language, beam_size=5,
+                                       no_speech_threshold=0.9,
                                        vad_filter=True,
                                        vad_parameters={"threshold": 0.55,
                                                        "min_speech_duration_ms": 250})

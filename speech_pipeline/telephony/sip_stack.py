@@ -83,6 +83,7 @@ class SIPCall:
     _local_tag: str = ""
     _contact_uri: str = ""
     _route: str = ""
+    _caller_id: str = ""
 
     def _set_state(self, new_state: str) -> None:
         self.state = new_state
@@ -563,7 +564,7 @@ def _handle_register_response(trunk: _Trunk, msg: dict) -> None:
 
 def _send_invite(
     trunk: _Trunk, target: str, call_obj: SIPCall,
-    auth_header: str = "",
+    auth_header: str = "", caller_id: str = "",
 ) -> None:
     """Send INVITE through a trunk to dial a target."""
     # Determine target URI
@@ -578,7 +579,8 @@ def _send_invite(
     call_obj._via_branch = branch
     call_obj._remote_addr = (trunk.server, trunk.port)
 
-    from_h = (f"<sip:{trunk.username}@{trunk.server}>"
+    from_user = caller_id or trunk.username
+    from_h = (f"<sip:{from_user}@{trunk.server}>"
               f";tag={call_obj._local_tag}")
     to_h = f"<{to_uri}>"
     call_obj._from_header = from_h
@@ -749,7 +751,8 @@ def _handle_invite_response(
             "Proxy-Authorization" if status == 407 else "Authorization",
             trunk.username, trunk.password,
             challenge, "INVITE", to_uri)
-        _send_invite(trunk, to_uri.replace("sip:", ""), call_obj, auth_val)
+        _send_invite(trunk, to_uri.replace("sip:", ""), call_obj, auth_val,
+                     caller_id=call_obj._caller_id)
 
     elif status >= 400:
         _LOGGER.warning("Call %s: INVITE failed %d %s",
@@ -1389,12 +1392,13 @@ def unregister_trunk(pbx_id: str) -> None:
     _LOGGER.info("Trunk %s: unregistered from %s", pbx_id, trunk.server)
 
 
-def call(pbx_id: str, target: str) -> SIPCall:
+def call(pbx_id: str, target: str, caller_id: str = "") -> SIPCall:
     """Originate an outbound call via a trunk.
 
     Args:
         pbx_id: Which PBX trunk to use.
         target: Phone number (+491747712705) or SIP URI (user@domain).
+        caller_id: Optional caller ID (phone number) for From header.
 
     Returns:
         SIPCall handle.  Monitor ``state`` and ``state_event`` for progress.
@@ -1418,9 +1422,10 @@ def call(pbx_id: str, target: str) -> SIPCall:
     with _calls_lock:
         _calls[call_id] = call_obj
 
-    _send_invite(trunk, target, call_obj)
-    _LOGGER.info("Call %s: INVITE sent to %s via trunk %s",
-                 call_id, target, pbx_id)
+    call_obj._caller_id = caller_id
+    _send_invite(trunk, target, call_obj, caller_id=caller_id)
+    _LOGGER.info("Call %s: INVITE sent to %s via trunk %s (caller_id=%s)",
+                 call_id, target, pbx_id, caller_id or trunk.username)
     return call_obj
 
 

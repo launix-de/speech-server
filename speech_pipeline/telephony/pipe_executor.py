@@ -154,10 +154,13 @@ class CallPipeExecutor:
             if play_handle and isinstance(r_stage, ConferenceLeg):
                 play_handle._stage = r_stage
 
-        # Phase 6: chain via pipe()
+        # Phase 6: chain via pipe() — skip play→ConferenceLeg (play uses mixer directly)
+        from speech_pipeline.ConferenceLeg import ConferenceLeg as _CL
         for i in range(len(resolved) - 1):
-            _, _, _, l_stage = resolved[i]
+            l_typ, _, _, l_stage = resolved[i]
             _, _, _, r_stage = resolved[i + 1]
+            if l_typ == "play" and isinstance(r_stage, _CL):
+                continue  # play: -> call: → registered via mixer.add_source in _start_all
             l_stage.pipe(r_stage)
 
         # Phase 6: start terminal + monitors
@@ -233,7 +236,7 @@ class CallPipeExecutor:
         if typ == "stt":
             lang = elem_id or "de"
             from speech_pipeline.WhisperSTT import WhisperTranscriber
-            return WhisperTranscriber(model_size=params.get("model", "base"),
+            return WhisperTranscriber(model_size=params.get("model", "medium"),
                                       language=lang)
 
         if typ == "webhook":
@@ -383,12 +386,17 @@ class CallPipeExecutor:
                 if leg and session:
                     self._start_sip_monitors(leg, session)
 
-        # Start play loops
+        # Start play sources via mixer.add_source (auto-resamples via pipe())
         for typ, elem_id, params, stage in resolved:
-            if typ in ("play",):
-                handle = getattr(stage, '_play_handle', None)
-                if handle and handle._current_src:
-                    self._start_play_loop(handle, handle._current_src)
+            if typ != "play":
+                continue
+            handle = getattr(stage, '_play_handle', None)
+            if not handle:
+                continue
+            src_id = self.call.mixer.add_source(stage)
+            handle._current_src = src_id
+            if handle._loop:
+                self._start_play_loop(handle, src_id)
 
     # -- SIP monitors ------------------------------------------------------
 

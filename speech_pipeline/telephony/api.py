@@ -72,8 +72,7 @@ def _body() -> dict:
 def put_pbx(pbx_id: str):
     body = _body()
     entry = pbx.put(pbx_id, body)
-    # pyVoIP handles trunk (has RTP, proven to work)
-    # sip_stack handles registrar only (client devices)
+    # pbx.put() auto-registers trunk with sip_stack for outbound PSTN calls
     pbx_data = pbx.get(pbx_id)
     from . import sip_listener
     try:

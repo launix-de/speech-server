@@ -268,6 +268,7 @@ def _handle_trunk_call(pbx_id: str, caller: str, callee: str,
     leg._sip_addr = addr
     leg._rtp_port = rtp_port
     leg._rtp_session = rtp
+    leg._sip_session = session  # so pipe_executor uses RTPCallSession directly
     # Store SIP Call-ID for deferred answer (Early Media → 200 OK)
     leg._sip_call_id = sip_stack._get_header(sip_msg, "call-id")
 

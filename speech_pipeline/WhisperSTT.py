@@ -149,15 +149,26 @@ class WhisperTranscriber(Stage):
         samples = np.frombuffer(pcm_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         segments, _ = model.transcribe(samples, language=self.language, beam_size=5,
                                        no_speech_threshold=0.9,
+                                       condition_on_previous_text=False,
+                                       hallucination_silence_threshold=1.0,
                                        vad_filter=True,
                                        vad_parameters={"threshold": 0.55,
                                                        "min_speech_duration_ms": 250})
         for seg in segments:
             text = seg.text.strip()
-            if text:
-                obj = {"text": text,
-                       "start": round(seg.start + time_offset, 3),
-                       "end": round(seg.end + time_offset, 3)}
-                yield (json.dumps(obj, ensure_ascii=False) + "\n").encode()
+            if not text:
+                continue
+            # Filter hallucinations: high no_speech_prob or very low confidence
+            if seg.no_speech_prob > 0.7:
+                _LOGGER.debug("Skipping (no_speech_prob=%.2f): %s", seg.no_speech_prob, text)
+                continue
+            if seg.avg_logprob < -1.0:
+                _LOGGER.debug("Skipping (avg_logprob=%.2f): %s", seg.avg_logprob, text)
+                continue
+            obj = {"text": text,
+                   "start": round(seg.start + time_offset, 3),
+                   "end": round(seg.end + time_offset, 3)}
+            _LOGGER.info("STT [p=%.2f, ns=%.2f]: %s", seg.avg_logprob, seg.no_speech_prob, text)
+            yield (json.dumps(obj, ensure_ascii=False) + "\n").encode()
 
 

@@ -30,6 +30,23 @@ def put(pbx_id: str, data: dict) -> dict:
     }
     _pbx_list[pbx_id] = entry
     _LOGGER.info("PBX registered: %s (proxy=%s)", pbx_id, entry["sip_proxy"])
+
+    # Auto-register as SIP trunk for outbound calls
+    if entry["sip_proxy"] and entry["sip_user"]:
+        try:
+            from . import sip_stack
+            if sip_stack._running:
+                sip_stack.register_trunk(
+                    pbx_id,
+                    server=entry["sip_proxy"],
+                    port=entry["sip_port"],
+                    username=entry["sip_user"],
+                    password=entry["sip_password"],
+                )
+                _LOGGER.info("PBX %s: trunk registered with sip_stack", pbx_id)
+        except Exception as e:
+            _LOGGER.warning("PBX %s: trunk registration failed: %s", pbx_id, e)
+
     return _public(entry)
 
 

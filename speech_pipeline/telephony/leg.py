@@ -192,12 +192,15 @@ def _create_sip_session(leg: Leg, pbx_entry: dict):
     """Create a SIP session — returns a session object with .call, .connected, .hungup.
 
     For registered SIP devices: uses sip_stack signaling + RTPSession for media.
-    For phone numbers: uses pyVoIP (full SIP+RTP stack).
+    For phone numbers: uses sip_stack trunk (INVITE via PBX to PSTN).
     """
     from . import sip_stack
 
+    if not sip_stack._running:
+        raise RuntimeError("SIP stack not running")
+
     # Check if target is a registered SIP device
-    if sip_stack._running and "@" in leg.number:
+    if "@" in leg.number:
         from urllib.parse import unquote
         sip_user = unquote(leg.number)
         reg = sip_stack.get_registration(sip_user)
@@ -205,18 +208,35 @@ def _create_sip_session(leg: Leg, pbx_entry: dict):
             return _create_sip_stack_session(leg, reg)
         raise RuntimeError(f"SIP device {sip_user} not registered")
 
-    # Phone number → pyVoIP trunk
-    return _create_pyvoip_session(leg, pbx_entry)
+    # Phone number → route via trunk to PSTN
+    return _create_trunk_call_session(leg)
 
 
 def _create_sip_stack_session(leg: Leg, reg: dict):
-    """Originate via sip_stack + RTPSession for audio."""
+    """Originate via sip_stack directly to a registered device."""
+    from . import sip_stack
+
+    _LOGGER.info("Originate %s to device %s", leg.number, reg.get("contact_uri", "?"))
+    sip_call = sip_stack.call_device(leg.number, reg)
+    return _wait_and_setup_rtp(leg, sip_call)
+
+
+def _create_trunk_call_session(leg: Leg):
+    """Originate via sip_stack trunk to PSTN."""
+    from . import sip_stack
+
+    caller_id = leg.callbacks.get("caller_id", "")
+    _LOGGER.info("Originate %s via trunk on PBX %s (caller_id=%s)", leg.number, leg.pbx_id, caller_id or "default")
+    sip_call = sip_stack.call(leg.pbx_id, leg.number, caller_id=caller_id)
+    return _wait_and_setup_rtp(leg, sip_call)
+
+
+def _wait_and_setup_rtp(leg: Leg, sip_call):
+    """Wait for SIP answer, then create RTPSession + RTPCallSession."""
     from . import sip_stack
     from speech_pipeline.RTPSession import RTPSession, RTPCallSession
     from speech_pipeline.rtp_codec import codec_for_pt, PCMU
 
-    _LOGGER.info("Originate %s to device %s", leg.number, reg.get("contact_uri", "?"))
-    sip_call = sip_stack.call_device(leg.number, reg)
     leg._sip_call = sip_call  # set IMMEDIATELY so hangup() can CANCEL during ringing
 
     # Wait for answer (up to 30s)

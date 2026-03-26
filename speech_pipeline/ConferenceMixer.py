@@ -99,6 +99,10 @@ class ConferenceMixer(Stage):
             except Exception as e:
                 _LOGGER.warning("ConferenceMixer '%s' source %s error: %s",
                                 self.name, src_id, e)
+            finally:
+                entry.finished = True
+                # Don't set done yet — mixer timer will set it
+                # when buffer is drained (so audio is actually played)
 
         entry.thread = threading.Thread(target=_pump, daemon=True,
                                         name=f"csrc-{src_id}")
@@ -302,10 +306,6 @@ class ConferenceMixer(Stage):
             # Step 1: drain queues, extract one frame per source
             frames: Dict[str, bytes] = {}
             for sid, src in sources.items():
-                if src.finished and len(src.buffer) < self.frame_bytes:
-                    frames[sid] = silence
-                    src.done.set()
-                    continue
                 while True:
                     try:
                         chunk = src.queue.get_nowait()
@@ -319,8 +319,14 @@ class ConferenceMixer(Stage):
                 if len(src.buffer) >= self.frame_bytes:
                     frames[sid] = bytes(src.buffer[:self.frame_bytes])
                     del src.buffer[:self.frame_bytes]
+                elif src.finished and src.buffer:
+                    # Flush the final short tail once instead of dropping it.
+                    frames[sid] = bytes(src.buffer) + (b"\x00" * (self.frame_bytes - len(src.buffer)))
+                    src.buffer.clear()
                 else:
                     frames[sid] = silence
+                    if src.finished:
+                        src.done.set()
 
             # Step 2: full mix
             full_mix = silence

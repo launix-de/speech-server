@@ -92,6 +92,7 @@ class CallPipeExecutor:
         self._subscriber = subscriber
         self._stages: Dict[str, Any] = {}   # play handles for kill
         self._tees: Dict[str, Any] = {}     # tee_id -> AudioTee
+        self._sidechain_specs: set[tuple] = set()
         self._sessions: Dict[str, Any] = {} # typ -> first session (for ID reuse)
         self._lock = threading.Lock()
 
@@ -114,6 +115,12 @@ class CallPipeExecutor:
             handle = self._stages.pop(stage_id, None)
         if not handle:
             return False
+        cleanup = getattr(handle, '_cleanup', None)
+        if cleanup:
+            try:
+                cleanup()
+            except Exception:
+                pass
         # Signal stop event (for legacy play loops)
         stop = getattr(handle, '_stop', None)
         if stop: stop.set()
@@ -145,6 +152,7 @@ class CallPipeExecutor:
             stage_ids = list(self._stages)
             tees = list(self._tees.values())
             self._tees.clear()
+            self._sidechain_specs.clear()
             self._sessions.clear()
 
         for stage_id in stage_ids:
@@ -287,6 +295,17 @@ class CallPipeExecutor:
         tee = self._tees.get(tee_id)
         if not tee:
             raise ValueError(f"Tee {tee_id} not found")
+        signature = (
+            tee_id,
+            tuple(
+                (typ, elem_id, json.dumps(params, sort_keys=True))
+                for typ, elem_id, params in elements[1:]
+            ),
+        )
+        with self._lock:
+            if signature in self._sidechain_specs:
+                _LOGGER.info("Tee %s: sidechain already attached", tee_id)
+                return
 
         # Build sidechain chain: create stages, pipe() them
         chain = []
@@ -298,6 +317,8 @@ class CallPipeExecutor:
 
         if chain:
             tee.add_sidechain(chain[0])
+            with self._lock:
+                self._sidechain_specs.add(signature)
             _LOGGER.info("Tee %s: sidechain added (%d stages)", tee_id, len(chain))
 
     # -- Stage creation ----------------------------------------------------
@@ -355,11 +376,6 @@ class CallPipeExecutor:
         if not leg_id:
             raise ValueError("sip requires a leg id")
 
-        # Check if we already have a session for this leg
-        session_key = f"sip:{leg_id}"
-        if session_key in self._sessions:
-            return self._sessions[session_key]
-
         leg = leg_mod.get_leg(leg_id)
         if not leg:
             raise ValueError(f"Leg {leg_id} not found")
@@ -375,6 +391,12 @@ class CallPipeExecutor:
         self.call.register_participant(leg.leg_id, type="sip",
                                        direction=leg.direction,
                                        number=leg.number)
+
+        # Check if we already have a session for this leg
+        session_key = f"sip:{leg_id}"
+        if session_key in self._sessions:
+            self._sessions[f"_leg:{leg_id}"] = leg
+            return self._sessions[session_key]
 
         session = getattr(leg, '_sip_session', None) or leg_mod._CallSession(leg.voip_call)
         self._sessions[session_key] = session
@@ -473,9 +495,12 @@ class CallPipeExecutor:
 
         bridge_leg_id = None
         conf_leg = None
+        tee_ids = []
         for typ, elem_id, _, stage in resolved:
             if typ == "sip_source" and bridge_leg_id is None:
                 bridge_leg_id = elem_id
+            if typ == "tee":
+                tee_ids.append(elem_id)
             if isinstance(stage, ConferenceLeg):
                 conf_leg = stage
                 break
@@ -499,10 +524,25 @@ class CallPipeExecutor:
         conf_leg.on_attached = _on_attached
         conf_leg.on_detached = _on_detached
 
+        def _cleanup():
+            with self._lock:
+                for tee_id in tee_ids:
+                    tee = self._tees.pop(tee_id, None)
+                    if tee:
+                        try:
+                            tee.cancel()
+                        except Exception:
+                            pass
+                self._sidechain_specs = {
+                    spec for spec in self._sidechain_specs
+                    if spec[0] not in tee_ids
+                }
+
         handle = type("_BridgeHandle", (), {
             "_stage": conf_leg,
             "_current_src": None,
             "_stop": None,
+            "_cleanup": _cleanup,
         })()
         with self._lock:
             self._stages[f"bridge:{bridge_leg_id}"] = handle

@@ -119,29 +119,31 @@ def get_call(call_id: str) -> Optional[Call]:
 
 def delete_call(call_id: str) -> bool:
     call = _calls.get(call_id)
-    if call:
-        pipe_executor = getattr(call, "pipe_executor", None)
-        if pipe_executor:
+    if not call:
+        return False
+
+    pipe_executor = getattr(call, "pipe_executor", None)
+    if pipe_executor:
+        try:
+            pipe_executor.shutdown()
+        except Exception:
+            pass
+
+    from . import webclient as webclient_mod
+    webclient_mod.close_call_sessions(call_id)
+
+    # Hang up all SIP legs associated with this call
+    from . import leg as leg_mod
+    for lg in leg_mod.list_legs():
+        if lg.call_id == call_id:
             try:
-                pipe_executor.shutdown()
+                lg.status = "completed"
+                leg_mod.delete_leg(lg.leg_id)
             except Exception:
                 pass
-
-        from . import webclient as webclient_mod
-        webclient_mod.close_call_sessions(call_id)
-
-        # Hang up all SIP legs associated with this call
-        from . import leg as leg_mod
-        for lg in leg_mod.list_legs():
-            if lg.call_id == call_id:
-                try:
-                    leg_mod.delete_leg(lg.leg_id)
-                except Exception:
-                    pass
-        call.end()
-        del _calls[call_id]
-        return True
-    return False
+    call.end()
+    _calls.pop(call_id, None)
+    return True
 
 def list_calls(account_id: Optional[str] = None) -> List[Call]:
     if account_id:

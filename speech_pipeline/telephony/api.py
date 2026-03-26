@@ -360,6 +360,7 @@ def delete_call(call_id: str):
                      hasattr(leg, '_sip_call') and leg._sip_call is not None)
         if leg.call_id == call_id and leg.status != "completed":
             _LOGGER.info("  -> deleting leg %s", leg.leg_id)
+            leg.status = "completed"
             leg_mod.delete_leg(leg.leg_id)
 
     call.status = "completed"

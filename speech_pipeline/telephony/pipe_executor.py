@@ -217,7 +217,7 @@ class CallPipeExecutor:
         lang = lang or "de"
         from speech_pipeline.WhisperSTT import WhisperTranscriber
         return WhisperTranscriber(
-            model_name=params.get("model", "base"),
+            model_size=params.get("model", "base"),
             language=lang)
 
     def _make_webhook(self, url: str, params: dict):
@@ -250,7 +250,7 @@ class CallPipeExecutor:
               r_typ, r_id, r_params, r_node, is_last):
         """Wire left → right. Returns the new source_stage for the next pair."""
 
-        # -- Left is tee (multi-output): add sidechain --
+        # -- Left is tee (multi-output): add sidechain or pass through --
         if l_typ == "tee":
             tee = l_node
             if source_stage is None:
@@ -261,9 +261,8 @@ class CallPipeExecutor:
                     _LOGGER.info("Tee %s: added sidechain %s", l_id, r_typ)
                 return None
             else:
-                # tee in middle of chain: pipe source into tee, continue
-                source_stage.pipe(tee)
-                return tee  # tee passes through to next element
+                # tee in middle of chain: already piped, just pass through
+                return source_stage  # tee IS the source_stage, continue to next
 
         # -- Right is call (multi-input via ConferenceLeg) --
         if r_typ == "call":

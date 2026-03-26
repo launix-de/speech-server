@@ -120,6 +120,13 @@ def get_call(call_id: str) -> Optional[Call]:
 def delete_call(call_id: str) -> bool:
     call = _calls.get(call_id)
     if call:
+        pipe_executor = getattr(call, "pipe_executor", None)
+        if pipe_executor:
+            try:
+                pipe_executor.shutdown()
+            except Exception:
+                pass
+
         from . import webclient as webclient_mod
         webclient_mod.close_call_sessions(call_id)
 

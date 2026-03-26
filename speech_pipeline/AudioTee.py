@@ -10,9 +10,11 @@ from .QueueSource import QueueSource
 
 _LOGGER = logging.getLogger("audio-tee")
 
-# Bounded queue size — ~4 seconds at 16kHz/20ms frames.
+# Bounded queue size — allow sidechains to lag behind briefly without
+# dropping audio immediately. Transcript/STT sidechains are not
+# latency-critical, but dropping chunks hurts recognition quality.
 # put_nowait() drops on full so the main pipeline never blocks.
-_QUEUE_MAXSIZE = 200
+_QUEUE_MAXSIZE = 750
 
 
 class AudioTee(Stage):
@@ -172,9 +174,18 @@ class AudioTee(Stage):
     def cancel(self) -> None:
         super().cancel()
         with self._lock:
+            queues = list(self._sidechain_queues) + list(self._mixer_queues)
             sinks = list(self._sidechain_sinks)
+            threads = list(self._threads)
+        for q in queues:
+            try:
+                q.put_nowait(None)
+            except Exception:
+                pass
         for sink in sinks:
             try:
                 sink.cancel()
             except Exception:
                 pass
+        for t in threads:
+            t.join(timeout=1.0)

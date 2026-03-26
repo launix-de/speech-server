@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Tuple
 _LOGGER = logging.getLogger("telephony.pipe-executor")
 
 _PLAY_CHUNK_SECONDS = 0.05
+_PLAY_PREFILL_SECONDS = 0.12
 _TTS_CHUNK_SECONDS = 0.10
 
 # ---------------------------------------------------------------------------
@@ -137,6 +138,23 @@ class CallPipeExecutor:
     def list_stages(self) -> List[dict]:
         with self._lock:
             return [{"id": k} for k in self._stages]
+
+    def shutdown(self) -> None:
+        """Cancel all live pipe resources for this call."""
+        with self._lock:
+            stage_ids = list(self._stages)
+            tees = list(self._tees.values())
+            self._tees.clear()
+            self._sessions.clear()
+
+        for stage_id in stage_ids:
+            self.kill_stage(stage_id)
+
+        for tee in tees:
+            try:
+                tee.cancel()
+            except Exception:
+                pass
 
     # -- Pipe execution ----------------------------------------------------
 
@@ -308,7 +326,7 @@ class CallPipeExecutor:
         if typ == "stt":
             lang = elem_id or "de"
             from speech_pipeline.WhisperSTT import WhisperTranscriber
-            return WhisperTranscriber(model_size=params.get("model", "medium"),
+            return WhisperTranscriber(model_size=params.get("model", "small"),
                                       language=lang)
 
         if typ == "webhook":
@@ -370,7 +388,12 @@ class CallPipeExecutor:
         with self._lock:
             self._stages[stage_id] = handle
 
-        reader = AudioReader(url, chunk_seconds=_PLAY_CHUNK_SECONDS)
+        reader = AudioReader(
+            url,
+            chunk_seconds=_PLAY_CHUNK_SECONDS,
+            realtime=True,
+            prefill_seconds=_PLAY_PREFILL_SECONDS,
+        )
         source = reader
         if volume != 100:
             from speech_pipeline.GainStage import GainStage
@@ -587,7 +610,12 @@ class CallPipeExecutor:
                 max_i = (int(loop) if isinstance(loop, (int, float)) and loop > 1
                          else (999999 if loop else 1))
                 while iters < max_i and not stop.is_set() and not mixer.cancelled:
-                    reader = AudioReader(url, chunk_seconds=_PLAY_CHUNK_SECONDS)
+                    reader = AudioReader(
+                        url,
+                        chunk_seconds=_PLAY_CHUNK_SECONDS,
+                        realtime=True,
+                        prefill_seconds=_PLAY_PREFILL_SECONDS,
+                    )
                     stage = reader
                     if volume != 100:
                         from speech_pipeline.GainStage import GainStage

@@ -120,7 +120,12 @@ def _cmd_play(call: call_state.Call, cmd: dict) -> None:
             max_iter = int(loop) if isinstance(loop, (int, float)) and loop > 1 else (999999 if loop else 1)
 
             while iterations < max_iter and not stop_event.is_set() and not call.mixer.cancelled:
-                reader = AudioReader(url, chunk_seconds=0.5)
+                reader = AudioReader(
+                    url,
+                    chunk_seconds=0.05,
+                    realtime=True,
+                    prefill_seconds=0.12,
+                )
                 source_stage = reader
                 if volume != 100:
                     from speech_pipeline.GainStage import GainStage

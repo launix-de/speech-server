@@ -349,11 +349,6 @@ def delete_call(call_id: str):
     if aid and call.account_id != aid:
         return ("Forbidden\n", 403)
 
-    # Kill all pipe_executor stages (play, tts, etc.)
-    if hasattr(call, 'pipe_executor') and call.pipe_executor:
-        for stage in call.pipe_executor.list_stages():
-            call.pipe_executor.kill_stage(stage["id"])
-
     # Hangup ALL legs for this call (BYE/CANCEL, Twilio semantics)
     from . import leg as leg_mod
     all_legs = list(leg_mod.list_legs())

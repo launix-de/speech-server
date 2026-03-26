@@ -1,105 +1,101 @@
-"""DSL pipe executor for telephony calls.
+"""Generic DSL pipe executor for telephony calls.
 
-All wiring is done directly via mixer.add_source/add_sink — no
-delegation to legacy klumpen-functions (bridge_to_call, _cmd_play).
+Left-to-right parser consumes elements and arrows. Each element is
+resolved to a stage/mixer/tee. Wiring follows 3x3 rules based on
+output cardinality of left and input cardinality of right:
 
-DSL syntax::
+  Output side: call/tee = multi-output, else single-output
+  Input side:  call = multi-input, else single-input
 
-    sip:leg-abc{"completed":"/hook"} -> call:call-xyz -> sip:leg-abc
-    play:hold_music{"url":"https://example.com/music.mp3","loop":true} -> call:call-xyz
-    tts:welcome{"text":"Willkommen"} -> call:call-xyz
-
-Element format: ``type:id{json_params}``
+Element syntax: ``type:id{json_params}``
 Separator: ``->`` or ``|``
 """
 from __future__ import annotations
 
 import json
 import logging
+import re
 import secrets
 import threading
 import time
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 _LOGGER = logging.getLogger("telephony.pipe-executor")
 
 
 # ---------------------------------------------------------------------------
-# DSL Parser
+# DSL Parser — left-to-right regex consumer
 # ---------------------------------------------------------------------------
 
-def parse_dsl(dsl: str) -> List[Tuple[str, str, dict]]:
-    """Parse ``'type:id{json} -> type:id'`` into [(type, id, params), ...]."""
-    elements = []
-    pos = 0
-    s = dsl.strip()
+_ARROW = re.compile(r'\s*(->|\|)\s*')
+_ELEMENT = re.compile(r'\s*([a-z_]+)(?::([^{\s|>]+))?')
+# JSON block: { ... } with balanced braces
+def _consume_json(s: str, pos: int) -> Tuple[dict, int]:
+    if pos >= len(s) or s[pos] != '{':
+        return {}, pos
+    depth, in_str, esc, start = 0, False, False, pos
     while pos < len(s):
-        while pos < len(s) and s[pos] in ' \t':
-            pos += 1
-        if pos >= len(s):
-            break
-        if s[pos:pos+2] == '->':
-            pos += 2
+        ch = s[pos]
+        if esc: esc = False
+        elif ch == '\\' and in_str: esc = True
+        elif ch == '"' and not esc: in_str = not in_str
+        elif not in_str:
+            if ch == '{': depth += 1
+            elif ch == '}':
+                depth -= 1
+                if depth == 0:
+                    pos += 1
+                    try: return json.loads(s[start:pos]), pos
+                    except: return {}, pos
+        pos += 1
+    return {}, pos
+
+
+def parse_dsl(dsl: str) -> List[Tuple[str, str, dict]]:
+    """Parse DSL string into [(type, id, params), ...]."""
+    elements = []
+    s = dsl.strip()
+    pos = 0
+    while pos < len(s):
+        # skip arrows
+        m = _ARROW.match(s, pos)
+        if m:
+            pos = m.end()
             continue
-        if s[pos] == '|':
+        # match element
+        m = _ELEMENT.match(s, pos)
+        if not m:
             pos += 1
             continue
-        start = pos
-        while pos < len(s) and s[pos] not in ':{| \t':
-            if s[pos] == '-' and pos+1 < len(s) and s[pos+1] == '>':
-                break
-            pos += 1
-        typ = s[start:pos].strip()
-        elem_id = ""
-        if pos < len(s) and s[pos] == ':':
-            pos += 1
-            start = pos
-            while pos < len(s) and s[pos] not in '{| \t':
-                if s[pos] == '-' and pos+1 < len(s) and s[pos+1] == '>':
-                    break
-                pos += 1
-            elem_id = s[start:pos].strip()
-        params = {}
-        if pos < len(s) and s[pos] == '{':
-            json_start = pos
-            depth, in_str, esc = 0, False, False
-            while pos < len(s):
-                ch = s[pos]
-                if esc:
-                    esc = False
-                elif ch == '\\' and in_str:
-                    esc = True
-                elif ch == '"' and not esc:
-                    in_str = not in_str
-                elif not in_str:
-                    if ch == '{': depth += 1
-                    elif ch == '}':
-                        depth -= 1
-                        if depth == 0:
-                            pos += 1
-                            break
-                pos += 1
-            try:
-                params = json.loads(s[json_start:pos])
-            except json.JSONDecodeError as e:
-                _LOGGER.warning("JSON parse error in DSL: %s", e)
+        typ, elem_id = m.group(1), m.group(2) or ""
+        pos = m.end()
+        params, pos = _consume_json(s, pos)
         elements.append((typ, elem_id, params))
     return elements
 
 
 # ---------------------------------------------------------------------------
-# Pipe Executor
+# Stage factories
 # ---------------------------------------------------------------------------
 
+def _is_multi_output(typ: str) -> bool:
+    """call and tee can have multiple outputs."""
+    return typ in ("call", "tee")
+
+def _is_multi_input(typ: str) -> bool:
+    """call (conference mixer) can have multiple inputs."""
+    return typ == "call"
+
+
 class CallPipeExecutor:
-    """Executes DSL pipes for a Call. All wiring via mixer directly."""
+    """Generic DSL pipe executor. Left-to-right wiring via pipe()/ConferenceLeg/AudioTee."""
 
     def __init__(self, call, tts_registry=None, subscriber=None):
         self.call = call
         self._tts_registry = tts_registry
         self._subscriber = subscriber
-        # stage_id -> handle with _stop event and _current_src
-        self._stages: Dict[str, Any] = {}
+        self._stages: Dict[str, Any] = {}  # stage_id -> handle
+        self._tees: Dict[str, Any] = {}    # tee_id -> AudioTee instance
         self._lock = threading.Lock()
 
     # -- Public API --------------------------------------------------------
@@ -122,102 +118,239 @@ class CallPipeExecutor:
         if not handle:
             return False
         stop = getattr(handle, '_stop', None)
-        if stop:
-            stop.set()
+        if stop: stop.set()
         src_id = getattr(handle, '_current_src', None)
         if src_id:
-            try:
-                self.call.mixer.kill_source(src_id)
-            except Exception:
-                pass
+            try: self.call.mixer.kill_source(src_id)
+            except: pass
         _LOGGER.info("Killed stage %s", stage_id)
         return True
 
     def kill_all_play(self) -> int:
         with self._lock:
             keys = [k for k in self._stages if k.startswith("play:")]
-        killed = 0
-        for k in keys:
-            if self.kill_stage(k):
-                killed += 1
-        return killed
+        return sum(1 for k in keys if self.kill_stage(k))
 
     def list_stages(self) -> List[dict]:
         with self._lock:
             return [{"id": k} for k in self._stages]
 
-    # -- Pipe execution ----------------------------------------------------
+    # -- Generic pipe execution --------------------------------------------
 
-    def _execute_pipe(self, elements):
+    def _execute_pipe(self, elements: List[Tuple[str, str, dict]]):
+        """Walk elements left-to-right, wire each pair."""
         if not elements:
             return
-        types = [e[0] for e in elements]
 
-        if types == ["sip", "call", "sip"]:
-            self._pipe_sip_bridge(elements)
-        elif types == ["play", "call"]:
-            self._pipe_play(elements)
-        elif types == ["tts", "call"]:
-            self._pipe_tts(elements)
-        elif len(types) >= 2 and types[0] == "call" and "stt" in types:
-            self._pipe_stt(elements)
+        # Resolve first element
+        prev_typ, prev_id, prev_params = elements[0]
+        prev_node = self._resolve(prev_typ, prev_id, prev_params)
+
+        # For source-only elements (first in chain), create the source stage
+        source_stage = self._make_source(prev_typ, prev_id, prev_params, prev_node)
+
+        for i in range(1, len(elements)):
+            cur_typ, cur_id, cur_params = elements[i]
+            cur_node = self._resolve(cur_typ, cur_id, cur_params)
+            is_last = (i == len(elements) - 1)
+
+            # Wire prev → cur based on cardinality
+            source_stage = self._wire(
+                prev_typ, prev_id, prev_params, prev_node, source_stage,
+                cur_typ, cur_id, cur_params, cur_node, is_last)
+
+            prev_typ, prev_id, prev_params, prev_node = cur_typ, cur_id, cur_params, cur_node
+
+    # -- Resolution --------------------------------------------------------
+
+    def _resolve(self, typ: str, elem_id: str, params: dict):
+        """Resolve element to its underlying object (mixer, tee, leg, etc.)."""
+        if typ == "call":
+            return self.call.mixer
+        elif typ == "tee":
+            return self._get_or_create_tee(elem_id)
+        elif typ == "sip":
+            return self._resolve_sip(elem_id, params)
+        elif typ == "play":
+            return None  # handled in _make_source
+        elif typ == "tts":
+            return None  # handled in _make_source
+        elif typ == "stt":
+            return self._make_stt(elem_id, params)
+        elif typ == "webhook":
+            return self._make_webhook(elem_id, params)
         else:
-            _LOGGER.warning("Unknown pipe pattern: %s", " -> ".join(types))
+            raise ValueError(f"Unknown element type: {typ}")
 
-    # -- sip -> call -> sip ------------------------------------------------
-    # Direct add_source + add_sink (same wiring as e2e97ca bridge_to_call)
+    def _get_or_create_tee(self, tee_id: str):
+        with self._lock:
+            if tee_id in self._tees:
+                return self._tees[tee_id]
+        from speech_pipeline.AudioTee import AudioTee
+        tee = AudioTee(48000, "s16le")
+        with self._lock:
+            self._tees[tee_id] = tee
+        return tee
 
-    def _pipe_sip_bridge(self, elements):
+    def _resolve_sip(self, leg_id: str, params: dict):
+        """Resolve SIP leg — returns session object."""
         from . import leg as leg_mod
-        from speech_pipeline.SIPSource import SIPSource
-        from speech_pipeline.SIPSink import SIPSink
-
-        sip_typ, leg_id, sip_params = elements[0]
-        call_typ, call_id, call_params = elements[1]
-        mixer = self.call.mixer
-
         leg = leg_mod.get_leg(leg_id)
         if not leg:
             raise ValueError(f"Leg {leg_id} not found")
         if not leg.voip_call:
             raise ValueError(f"Leg {leg_id} has no SIP call")
-
-        # Attach webhook callbacks from DSL params
-        if sip_params:
-            leg.callbacks.update(sip_params)
-
-        # Mark as bridged so sip_listener._wait_for_bridge returns
+        if params:
+            leg.callbacks.update(params)
         leg.call_id = self.call.call_id
         leg.status = "in-progress"
         leg.answered_at = leg.answered_at or time.time()
         self.call.register_participant(leg.leg_id, type="sip",
                                        direction=leg.direction,
                                        number=leg.number)
+        session = getattr(leg, '_sip_session', None)
+        if not session:
+            session = leg_mod._CallSession(leg.voip_call)
+        return {"session": session, "leg": leg, "leg_id": leg_id}
 
-        # Use existing session if available (RTPCallSession for sip_stack legs),
-        # otherwise create _CallSession (pyVoIP legs need rx_queue pump)
-        session = getattr(leg, '_sip_session', None) or leg_mod._CallSession(leg.voip_call)
+    def _make_stt(self, lang: str, params: dict):
+        lang = lang or "de"
+        from speech_pipeline.WhisperSTT import WhisperTranscriber
+        return WhisperTranscriber(
+            model_name=params.get("model", "base"),
+            language=lang)
 
-        # ConferenceLeg: bidirectional bridge via the mixer's own sync
-        # SIPSource → ConferenceLeg → SIPSink, pipe() handles format conversion
-        from speech_pipeline.ConferenceLeg import ConferenceLeg
-        rx = SIPSource(session)
-        conf_leg = ConferenceLeg(sample_rate=mixer.sample_rate)
-        conf_leg.attach(mixer)
-        tx = SIPSink(session)
-        rx.pipe(conf_leg).pipe(tx)
+    def _make_webhook(self, url: str, params: dict):
+        from speech_pipeline.WebhookSink import WebhookSink
+        bearer = self._subscriber.get("bearer_token", "") if self._subscriber else ""
+        return WebhookSink(url, bearer_token=bearer)
 
-        # ConferenceLeg sets _src_id internally when stream starts
-        leg._conf_leg = conf_leg
+    # -- Source creation ---------------------------------------------------
 
-        # Start pipeline in background thread (SIPSink.run drives it)
-        def _run_pipeline():
+    def _make_source(self, typ, elem_id, params, node):
+        """Create a source Stage for the first element in a pipe."""
+        if typ == "sip":
+            from speech_pipeline.SIPSource import SIPSource
+            return SIPSource(node["session"])
+        elif typ == "tee":
+            # tee as first element = existing tee, next elements are sidechains
+            return None  # handled in _wire
+        elif typ == "call":
+            return None  # call as source = add_output, handled in _wire
+        elif typ == "play":
+            return self._start_play(elem_id, params)
+        elif typ == "tts":
+            return self._start_tts(elem_id, params)
+        else:
+            return None
+
+    # -- Wiring (the 3x3 matrix) ------------------------------------------
+
+    def _wire(self, l_typ, l_id, l_params, l_node, source_stage,
+              r_typ, r_id, r_params, r_node, is_last):
+        """Wire left → right. Returns the new source_stage for the next pair."""
+
+        # -- Left is tee (multi-output): add sidechain --
+        if l_typ == "tee":
+            tee = l_node
+            if source_stage is None:
+                # tee as first element: add sidechain from existing tee
+                sink = self._make_sink(r_typ, r_id, r_params, r_node, is_last)
+                if sink:
+                    tee.add_sidechain(sink)
+                    _LOGGER.info("Tee %s: added sidechain %s", l_id, r_typ)
+                return None
+            else:
+                # tee in middle of chain: pipe source into tee, continue
+                source_stage.pipe(tee)
+                return tee  # tee passes through to next element
+
+        # -- Right is call (multi-input via ConferenceLeg) --
+        if r_typ == "call":
+            mixer = r_node
+            if is_last and source_stage:
+                # source -> call (last): add_source to mixer
+                src_id = mixer.add_source(source_stage)
+                if l_typ == "play":
+                    self._track_play_source(l_id, src_id)
+                return None
+            elif source_stage:
+                # source -> call -> ... : ConferenceLeg (bidirectional)
+                from speech_pipeline.ConferenceLeg import ConferenceLeg
+                conf_leg = ConferenceLeg(sample_rate=mixer.sample_rate)
+                conf_leg.attach(mixer)
+                source_stage.pipe(conf_leg)
+                if l_typ == "sip":
+                    l_node["leg"]._conf_leg = conf_leg
+                return conf_leg
+            else:
+                # call as source (no left): not supported in this context
+                return None
+
+        # -- Right is sip (sink if last) --
+        if r_typ == "sip" and is_last:
+            from speech_pipeline.SIPSink import SIPSink
+            sink = SIPSink(r_node["session"])
+            if source_stage:
+                source_stage.pipe(sink)
+            # Start pipeline + monitors
+            self._start_sip_pipeline(sink, r_node, l_typ)
+            return None
+
+        # -- Right is stt/webhook (processor/sink) --
+        if r_typ in ("stt", "webhook"):
+            stage = r_node
+            if source_stage:
+                source_stage.pipe(stage)
+            if is_last and hasattr(stage, 'run'):
+                # Terminal sink — start in thread
+                threading.Thread(target=stage.run, daemon=True,
+                                 name=f"sink-{r_typ}").start()
+            return stage
+
+        # -- Right is tee (single input) --
+        if r_typ == "tee":
+            tee = r_node
+            if source_stage:
+                source_stage.pipe(tee)
+            return tee
+
+        _LOGGER.warning("Unhandled wire: %s -> %s", l_typ, r_typ)
+        return source_stage
+
+    # -- Sink creation -----------------------------------------------------
+
+    def _make_sink(self, typ, elem_id, params, node, is_last):
+        """Create a sink Stage for sidechain attachment."""
+        if typ == "stt":
+            cb_url = params.get("on_receive", "")
+            if cb_url:
+                from speech_pipeline.WebhookSink import WebhookSink
+                bearer = self._subscriber.get("bearer_token", "") if self._subscriber else ""
+                webhook = WebhookSink(cb_url, bearer_token=bearer)
+                node.pipe(webhook)
+                return node  # stt piped to webhook, return stt as sidechain root
+            return node
+        elif typ == "webhook":
+            return node
+        return node
+
+    # -- SIP pipeline + monitors -------------------------------------------
+
+    def _start_sip_pipeline(self, sink, sip_info, prev_typ):
+        """Start SIPSink in background + DTMF/hangup monitors."""
+        from . import leg as leg_mod
+        leg = sip_info["leg"]
+        leg_id = sip_info["leg_id"]
+        session = sip_info["session"]
+        mixer = self.call.mixer
+
+        def _run():
             try:
-                tx.run()
+                sink.run()
             except Exception as e:
                 _LOGGER.warning("Leg %s pipeline error: %s", leg_id, e)
-        threading.Thread(target=_run_pipeline, daemon=True,
-                         name=f"leg-{leg_id}").start()
+        threading.Thread(target=_run, daemon=True, name=f"leg-{leg_id}").start()
 
         # DTMF monitor
         def _dtmf():
@@ -229,8 +362,7 @@ class CallPipeExecutor:
                                                call_id=self.call.call_id)
                 except Exception:
                     time.sleep(0.1)
-        threading.Thread(target=_dtmf, daemon=True,
-                         name=f"dtmf-{leg_id}").start()
+        threading.Thread(target=_dtmf, daemon=True, name=f"dtmf-{leg_id}").start()
 
         # Hangup monitor
         def _monitor():
@@ -251,38 +383,27 @@ class CallPipeExecutor:
                 if ended:
                     break
                 time.sleep(0.5)
-
             leg.status = "completed"
             dur = time.time() - leg.answered_at if leg.answered_at else 0
-            # Cancel ConferenceLeg — it handles mixer cleanup internally
             if hasattr(leg, '_conf_leg') and leg._conf_leg:
-                try:
-                    leg._conf_leg.cancel()
-                except Exception:
-                    pass
+                try: leg._conf_leg.cancel()
+                except: pass
             self.call.unregister_participant(leg.leg_id)
             leg_mod._fire_callback(leg, "completed", duration=dur)
-            _LOGGER.info("Leg %s ended (duration=%.1fs)", leg_id, dur)
+            _LOGGER.info("Leg %s ended (%.1fs)", leg_id, dur)
             leg_mod.delete_leg(leg_id)
+        threading.Thread(target=_monitor, daemon=True, name=f"mon-{leg_id}").start()
 
-        threading.Thread(target=_monitor, daemon=True,
-                         name=f"mon-{leg_id}").start()
+        _LOGGER.info("SIP leg %s wired into call %s", leg_id, self.call.call_id)
 
-        _LOGGER.info("SIP bridge: %s -> call:%s (src=%s sink=%s)",
-                     leg_id, self.call.call_id, leg._src_id, leg._sink_id)
+    # -- Play --------------------------------------------------------------
 
-    # -- play -> call ------------------------------------------------------
-    # Direct AudioReader + loop + add_source (same logic as _cmd_play)
-
-    def _pipe_play(self, elements):
+    def _start_play(self, play_id, params):
+        """Start play source in background, return a dummy (source added to mixer later)."""
         from speech_pipeline.AudioReader import AudioReader
-
-        play_typ, play_id, params = elements[0]
-        call_typ, call_id, call_params = elements[1]
-
-        url = params.get("url", play_id)  # URL from params or from id
+        url = params.get("url", play_id)
         if not url:
-            raise ValueError("play requires url (in params or as id)")
+            raise ValueError("play requires url")
         loop = params.get("loop", False)
         volume = params.get("volume", 100)
         stage_id = f"play:{play_id or secrets.token_urlsafe(6)}"
@@ -292,11 +413,40 @@ class CallPipeExecutor:
         with self._lock:
             self._stages[stage_id] = handle
 
-        mixer = self.call.mixer
+        # Return a marker — actual source is created per-loop in the thread
+        handle._url = url
+        handle._loop = loop
+        handle._volume = volume
+        handle._stage_id = stage_id
+        return handle  # _wire will call _track_play_source or start the loop
 
+    def _track_play_source(self, play_id, src_id):
+        """Called when play source is added to mixer. Start the loop thread."""
+        stage_id = f"play:{play_id or ''}"
+        with self._lock:
+            handle = self._stages.get(stage_id)
+        if not handle:
+            return
+
+        mixer = self.call.mixer
+        url = handle._url
+        loop = handle._loop
+        volume = handle._volume
+        stop_event = handle._stop
+
+        # The first source was already added by _wire. Start loop for repeats.
         def _run():
+            from speech_pipeline.AudioReader import AudioReader
             try:
-                iters = 0
+                # First iteration already running via add_source
+                mixer.wait_source(src_id)
+                if stop_event.is_set():
+                    mixer.kill_source(src_id)
+                    return
+                mixer.remove_source(src_id)
+
+                # Loop remaining iterations
+                iters = 1
                 max_i = (int(loop) if isinstance(loop, (int, float)) and loop > 1
                          else (999999 if loop else 1))
                 while iters < max_i and not stop_event.is_set() and not mixer.cancelled:
@@ -308,13 +458,13 @@ class CallPipeExecutor:
                                       float(volume) / 100.0)
                         reader.pipe(g)
                         stage = g
-                    src_id = mixer.add_source(stage)
-                    handle._current_src = src_id
-                    mixer.wait_source(src_id)
+                    sid = mixer.add_source(stage)
+                    handle._current_src = sid
+                    mixer.wait_source(sid)
                     if stop_event.is_set():
-                        mixer.kill_source(src_id)
+                        mixer.kill_source(sid)
                     else:
-                        mixer.remove_source(src_id)
+                        mixer.remove_source(sid)
                     iters += 1
             except Exception as e:
                 _LOGGER.warning("Play %s failed: %s", stage_id, e)
@@ -324,69 +474,19 @@ class CallPipeExecutor:
 
         threading.Thread(target=_run, daemon=True,
                          name=f"play-{secrets.token_urlsafe(4)}").start()
-        _LOGGER.info("Play started: %s (url=%s loop=%s vol=%s)",
-                     stage_id, url, loop, volume)
+        _LOGGER.info("Play started: %s (loop=%s)", stage_id, loop)
 
-    # -- tts -> call -------------------------------------------------------
+    # -- TTS ---------------------------------------------------------------
 
-    def _pipe_tts(self, elements):
-        tts_typ, voice_name, params = elements[0]
+    def _start_tts(self, voice_name, params):
+        """Create TTSProducer stage."""
         voice_name = voice_name or "de_DE-thorsten-medium"
         text = params.get("text", "")
         if not text:
             raise ValueError("tts requires text param")
         if not self._tts_registry:
             raise ValueError("TTS not available")
-
         from speech_pipeline.TTSProducer import TTSProducer
         voice = self._tts_registry.ensure_loaded(voice_name)
         syn = self._tts_registry.create_synthesis_config(voice, {})
-        producer = TTSProducer(voice, syn, text, sentence_silence=0.0)
-        mixer = self.call.mixer
-
-        def _run():
-            try:
-                src_id = mixer.add_source(producer)
-                mixer.wait_source(src_id)
-                mixer.remove_source(src_id)
-            except Exception as e:
-                _LOGGER.warning("TTS failed: %s", e)
-
-        threading.Thread(target=_run, daemon=True,
-                         name=f"tts-{secrets.token_urlsafe(4)}").start()
-        _LOGGER.info("TTS: %s (voice=%s)", text[:40], voice_name)
-
-    # -- call -> stt -------------------------------------------------------
-
-    def _pipe_stt(self, elements):
-        call_typ, call_id, call_params = elements[0]
-        stt_elem = webhook_elem = None
-        for typ, eid, params in elements[1:]:
-            if typ == "stt":
-                stt_elem = (typ, eid, params)
-            elif typ == "webhook":
-                webhook_elem = (typ, eid, params)
-
-        if not stt_elem:
-            raise ValueError("No stt element")
-
-        lang = stt_elem[1] or "de"
-        stt_params = stt_elem[2]
-
-        from speech_pipeline.WhisperSTT import WhisperTranscriber
-        stt = WhisperTranscriber(
-            model_name=stt_params.get("model", "base"),
-            language=lang)
-
-        url = (webhook_elem[1] if webhook_elem
-               else stt_params.get("on_receive", ""))
-        if url:
-            from speech_pipeline.WebhookSink import WebhookSink
-            bearer = self._subscriber.get("bearer_token", "") if self._subscriber else ""
-            sink = WebhookSink(url, bearer_token=bearer)
-            stt.pipe(sink)
-            self.call.mixer.add_sink(sink)
-        else:
-            self.call.mixer.add_sink(stt)
-
-        _LOGGER.info("STT started: lang=%s", lang)
+        return TTSProducer(voice, syn, text, sentence_silence=0.0)

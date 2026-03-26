@@ -47,43 +47,6 @@ def execute_commands(call: call_state.Call, commands: list) -> None:
 # Commands
 # ---------------------------------------------------------------------------
 
-def _cmd_originate(call: call_state.Call, cmd: dict) -> None:
-    """Originate an outbound SIP leg and bridge into conference."""
-    from . import leg as leg_mod, pbx as pbx_reg
-
-    to = cmd.get("to", "")
-    callbacks = cmd.get("callbacks", {})
-    pbx_entry = pbx_reg.get(call.pbx_id)
-    if not pbx_entry:
-        _LOGGER.warning("No PBX %s for call %s", call.pbx_id, call.call_id)
-        return
-
-    leg = leg_mod.create_leg("outbound", to, call.pbx_id,
-                              call.subscriber_id)
-    leg.callbacks = callbacks
-
-    # Originate blocks until answered (or fails)
-    leg_mod.originate_and_bridge(leg, call, pbx_entry)
-
-
-def _cmd_add_leg(call: call_state.Call, cmd: dict) -> None:
-    """Add an existing leg (by ID) into this conference."""
-    from . import leg as leg_mod
-
-    leg_id = cmd.get("leg_id", "")
-    leg = leg_mod.get_leg(leg_id)
-    if not leg:
-        _LOGGER.warning("Leg %s not found", leg_id)
-        return
-    if not leg.voip_call:
-        _LOGGER.warning("Leg %s has no SIP call to bridge", leg_id)
-        return
-
-    callbacks = cmd.get("callbacks", {})
-    leg.callbacks.update(callbacks)
-    leg_mod.bridge_to_call(leg, call)
-
-
 def _cmd_tts(call: call_state.Call, cmd: dict) -> None:
     """TTS: fire-and-forget — runs in background, auto-cleanup."""
     from speech_pipeline.TTSProducer import TTSProducer
@@ -267,20 +230,28 @@ def _cmd_transfer(call: call_state.Call, cmd: dict) -> None:
         _LOGGER.warning("transfer: target call %s not found", target_call_id)
         return
 
-    # For SIP legs: kill source/sink on current mixer, re-bridge to target
+    # For SIP legs: cancel current pipeline, re-bridge to target via pipes
     leg = leg_mod.get_leg(pid)
-    if leg and leg._src_id:
-        call.mixer.kill_source(leg._src_id)
-        if leg._sink_id:
-            call.mixer.remove_sink(leg._sink_id)
+    if leg:
+        if hasattr(leg, '_conf_leg') and leg._conf_leg:
+            try: leg._conf_leg.cancel()
+            except: pass
         call.unregister_participant(pid)
-        leg_mod.bridge_to_call(leg, target_call)
+        # Re-bridge to target call via pipe_executor
+        from .pipe_executor import CallPipeExecutor
+        if not hasattr(target_call, 'pipe_executor') or not target_call.pipe_executor:
+            from . import _shared, subscriber
+            sub = subscriber.get(target_call.subscriber_id) if hasattr(target_call, 'subscriber_id') else None
+            target_call.pipe_executor = CallPipeExecutor(
+                target_call, tts_registry=_shared.tts_registry, subscriber=sub)
+        target_call.pipe_executor.add_pipes([
+            f"sip:{pid} -> call:{target_call_id} -> sip:{pid}"
+        ])
         _LOGGER.info("Transferred leg %s from %s to %s",
                      pid, call.call_id, target_call_id)
         return
 
-    # TODO: webclient transfer (needs DSL pipeline rebuild)
-    _LOGGER.warning("transfer not yet implemented for webclient participants")
+    _LOGGER.warning("transfer: leg %s not found", pid)
 
 
 def _cmd_dtmf(call: call_state.Call, cmd: dict) -> None:
@@ -481,8 +452,6 @@ def _send_callback(call: call_state.Call, callback_path: Optional[str],
 # ---------------------------------------------------------------------------
 
 _HANDLERS = {
-    "originate": _cmd_originate,
-    "add_leg": _cmd_add_leg,
     "tts": _cmd_tts,
     "play": _cmd_play,
     "stop_play": _cmd_stop_play,

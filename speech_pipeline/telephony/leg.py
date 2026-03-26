@@ -16,8 +16,6 @@ from typing import Dict, List, Optional
 
 import requests as http_requests
 
-from speech_pipeline.SIPSource import SIPSource
-from speech_pipeline.SIPSink import SIPSink
 
 _LOGGER = logging.getLogger("telephony.leg")
 
@@ -126,91 +124,6 @@ def list_legs(subscriber_id: Optional[str] = None) -> List[Leg]:
     return list(_legs.values())
 
 
-# ---------------------------------------------------------------------------
-# Bridge: connect a SIP leg to a conference via ConferenceMixer
-# ---------------------------------------------------------------------------
-
-def bridge_to_call(leg: Leg, call) -> None:
-    """Bridge SIP leg into conference using ConferenceMixer.
-
-    RX: SIPSource → conf.add_source (auto u8@8k → s16le@48k via pipe)
-    TX: conf.add_sink(SIPSink, mute_source=src_id) (auto 48k → 8k u8)
-    """
-    leg.call_id = call.call_id
-    leg.status = "in-progress"
-    leg.answered_at = time.time()
-    call.register_participant(leg.leg_id, type="sip",
-                              direction=leg.direction, number=leg.number)
-
-    session = _CallSession(leg.voip_call)
-
-    # RX: SIPSource → conference mixer (auto-resampled)
-    rx_source = SIPSource(session)
-    leg._src_id = call.mixer.add_source(rx_source)
-
-    # TX: conference mix (minus own) → SIPSink (auto-resampled)
-    tx_sink = SIPSink(session)
-    leg._sink_id = call.mixer.add_sink(tx_sink, mute_source=leg._src_id)
-
-    _LOGGER.info("Leg %s bridged to call %s (src=%s sink=%s mute=%s)",
-                 leg.leg_id, call.call_id, leg._src_id, leg._sink_id, leg._src_id)
-
-    # Monitor for DTMF digits from caller → fire subscriber callback
-    def _dtmf_monitor():
-        while leg.status == "in-progress":
-            try:
-                digit = leg.voip_call.get_dtmf(length=1)
-                if digit:
-                    _LOGGER.info("Leg %s DTMF received: %s", leg.leg_id, digit)
-                    _fire_callback(leg, "dtmf", digit=digit,
-                                   call_id=call.call_id)
-            except Exception:
-                time.sleep(0.1)
-
-    threading.Thread(target=_dtmf_monitor, daemon=True,
-                     name=f"dtmf-{leg.leg_id}").start()
-
-    # Monitor for SIP hangup — single cleanup point for all leg types
-    def _monitor():
-        while leg.status == "in-progress":
-            ended = False
-            # pyVoIP leg (has .state attribute with CallState enum)
-            if leg.voip_call and hasattr(leg.voip_call, 'state'):
-                try:
-                    from pyVoIP.VoIP.VoIP import CallState
-                    if leg.voip_call.state == CallState.ENDED:
-                        ended = True
-                except Exception:
-                    pass  # don't assume ended on error
-            # sip_stack device leg
-            if hasattr(leg, '_sip_call') and leg._sip_call:
-                if leg._sip_call.state == "ended":
-                    ended = True
-            # session hungup (RTPSession or SIPSession)
-            if session.hungup.is_set():
-                ended = True
-            if ended:
-                break
-            time.sleep(0.5)
-
-        leg.status = "completed"
-        duration = time.time() - leg.answered_at if leg.answered_at else 0
-        try:
-            call.mixer.kill_source(leg._src_id)
-            if leg._sink_id:
-                call.mixer.remove_sink(leg._sink_id)
-        except Exception:
-            pass
-        call.unregister_participant(leg.leg_id)
-
-        _fire_callback(leg, "completed", duration=duration)
-        _LOGGER.info("Leg %s ended (duration=%.1fs)", leg.leg_id, duration)
-        delete_leg(leg.leg_id)
-
-    threading.Thread(target=_monitor, daemon=True,
-                     name=f"mon-{leg.leg_id}").start()
-
-
 def originate_only(leg: Leg, pbx_entry: dict) -> None:
     """Originate an outbound SIP call — fires callbacks, does NOT bridge.
 
@@ -273,20 +186,6 @@ def originate_only(leg: Leg, pbx_entry: dict) -> None:
 
     threading.Thread(target=_monitor, daemon=True,
                      name=f"mon-{leg.leg_id}").start()
-
-
-# Keep old originate_and_bridge for backward compat with examples
-def originate_and_bridge(leg: Leg, call, pbx_entry: dict) -> None:
-    """Legacy: originate + auto-bridge. Use originate_only + /pipes instead."""
-    originate_only(leg, pbx_entry)
-    # Wait for answer
-    deadline = time.time() + 30
-    while leg.status not in ("answered", "failed", "completed"):
-        if time.time() > deadline:
-            break
-        time.sleep(0.5)
-    if leg.status == "answered":
-        bridge_to_call(leg, call)
 
 
 def _create_sip_session(leg: Leg, pbx_entry: dict):

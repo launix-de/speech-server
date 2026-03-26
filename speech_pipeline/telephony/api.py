@@ -475,7 +475,16 @@ def bridge_leg(leg_id: str):
             events=sub.get("events", {}) if sub else {},
         )
 
-    leg_mod.bridge_to_call(l, call)
+    # Bridge via pipe_executor (DSL: sip:LEG -> call:CALL -> sip:LEG)
+    from .pipe_executor import CallPipeExecutor
+    if not hasattr(call, 'pipe_executor') or call.pipe_executor is None:
+        sub = subscriber.get(call.subscriber_id) if hasattr(call, 'subscriber_id') else None
+        from . import _shared
+        call.pipe_executor = CallPipeExecutor(
+            call, tts_registry=_shared.tts_registry, subscriber=sub)
+    call.pipe_executor.add_pipes([
+        f"sip:{leg_id} -> call:{call.call_id} -> sip:{leg_id}"
+    ])
     return jsonify({"call_id": call.call_id, "leg_id": leg_id}), 200
 
 

@@ -271,8 +271,11 @@ class CallPipeExecutor:
             if is_last and source_stage:
                 # source -> call (last): add_source to mixer
                 src_id = mixer.add_source(source_stage)
-                if l_typ == "play":
-                    self._track_play_source(l_id, src_id)
+                # Start play loop if this is a play source
+                play_handle = getattr(source_stage, '_play_handle', None)
+                if play_handle:
+                    play_handle._current_src = src_id
+                    self._start_play_loop(play_handle, src_id)
                 return None
             elif source_stage:
                 # source -> call -> ... : ConferenceLeg (bidirectional)
@@ -399,57 +402,59 @@ class CallPipeExecutor:
     # -- Play --------------------------------------------------------------
 
     def _start_play(self, play_id, params):
-        """Start play source in background, return a dummy (source added to mixer later)."""
+        """Create first AudioReader and register play handle.
+        Returns the Stage for the first iteration. Loop continues in _wire."""
         from speech_pipeline.AudioReader import AudioReader
         url = params.get("url", play_id)
         if not url:
             raise ValueError("play requires url")
-        loop = params.get("loop", False)
         volume = params.get("volume", 100)
         stage_id = f"play:{play_id or secrets.token_urlsafe(6)}"
 
+        reader = AudioReader(url, chunk_seconds=0.5)
+        source_stage = reader
+        if volume != 100:
+            from speech_pipeline.GainStage import GainStage
+            g = GainStage(reader.output_format.sample_rate, float(volume) / 100.0)
+            reader.pipe(g)
+            source_stage = g
+
+        # Store handle for kill_stage + loop
         stop_event = threading.Event()
-        handle = type('_H', (), {'_stop': stop_event, '_current_src': None})()
+        handle = type('_H', (), {
+            '_stop': stop_event, '_current_src': None,
+            '_url': url, '_loop': params.get("loop", False),
+            '_volume': volume, '_stage_id': stage_id,
+        })()
         with self._lock:
             self._stages[stage_id] = handle
 
-        # Return a marker — actual source is created per-loop in the thread
-        handle._url = url
-        handle._loop = loop
-        handle._volume = volume
-        handle._stage_id = stage_id
-        return handle  # _wire will call _track_play_source or start the loop
+        # Tag the source so _wire can find the handle
+        source_stage._play_handle = handle
+        return source_stage
 
-    def _track_play_source(self, play_id, src_id):
-        """Called when play source is added to mixer. Start the loop thread."""
-        stage_id = f"play:{play_id or ''}"
-        with self._lock:
-            handle = self._stages.get(stage_id)
-        if not handle:
-            return
-
+    def _start_play_loop(self, handle, first_src_id):
+        """Wait for first iteration to finish, then loop if needed."""
         mixer = self.call.mixer
-        url = handle._url
-        loop = handle._loop
-        volume = handle._volume
-        stop_event = handle._stop
+        stop = handle._stop
+        url, loop, volume = handle._url, handle._loop, handle._volume
+        stage_id = handle._stage_id
 
-        # The first source was already added by _wire. Start loop for repeats.
         def _run():
             from speech_pipeline.AudioReader import AudioReader
             try:
-                # First iteration already running via add_source
-                mixer.wait_source(src_id)
-                if stop_event.is_set():
-                    mixer.kill_source(src_id)
+                # Wait for first iteration (already added to mixer)
+                mixer.wait_source(first_src_id)
+                if stop.is_set():
+                    mixer.kill_source(first_src_id)
                     return
-                mixer.remove_source(src_id)
+                mixer.remove_source(first_src_id)
 
-                # Loop remaining iterations
+                # Loop remaining
                 iters = 1
                 max_i = (int(loop) if isinstance(loop, (int, float)) and loop > 1
                          else (999999 if loop else 1))
-                while iters < max_i and not stop_event.is_set() and not mixer.cancelled:
+                while iters < max_i and not stop.is_set() and not mixer.cancelled:
                     reader = AudioReader(url, chunk_seconds=0.5)
                     stage = reader
                     if volume != 100:
@@ -461,7 +466,7 @@ class CallPipeExecutor:
                     sid = mixer.add_source(stage)
                     handle._current_src = sid
                     mixer.wait_source(sid)
-                    if stop_event.is_set():
+                    if stop.is_set():
                         mixer.kill_source(sid)
                     else:
                         mixer.remove_source(sid)

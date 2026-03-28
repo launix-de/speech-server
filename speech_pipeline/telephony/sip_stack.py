@@ -102,6 +102,9 @@ class _Registration:
     contact_uri: str        # where to reach the device
     expires: float          # absolute time when registration expires
     user_id: int = 0        # CRM user id
+    subscriber_id: str = "" # CRM subscriber this device belongs to
+    base_url: str = ""      # CRM base URL for callbacks/device dial
+    source_addr: Tuple[str, int] = ("", 0)  # actual REGISTER source tuple
 
 
 # ---------------------------------------------------------------------------
@@ -203,18 +206,10 @@ def _build_sdp(ip: str, rtp_port: int, codec=None) -> str:
     )
 
 
-def _parse_sdp(sdp: str) -> Tuple[str, int, int]:
-    """Extract remote RTP host, port, and preferred codec from SDP.
-
-    Returns (host, port, payload_type).
-    The payload type is the first codec in the m-line that we support.
-    Falls back to 0 (PCMU) if none match.
-    """
-    from speech_pipeline.rtp_codec import negotiate_payload_type
-
+def _parse_sdp_offer(sdp: str) -> Tuple[str, int, list[int]]:
+    """Extract remote RTP host, port and offered payload types from SDP."""
     host = "0.0.0.0"
     port = 0
-    payload_type = 0
     remote_pts = []
     for line in sdp.splitlines():
         line = line.strip()
@@ -224,7 +219,15 @@ def _parse_sdp(sdp: str) -> Tuple[str, int, int]:
         if m:
             port = int(m.group(1))
             remote_pts = [int(pt_str) for pt_str in m.group(2).split()]
-            payload_type = negotiate_payload_type(remote_pts)
+    return host, port, remote_pts
+
+
+def _parse_sdp(sdp: str) -> Tuple[str, int, int]:
+    """Extract remote RTP host, port, and preferred codec from SDP."""
+    from speech_pipeline.rtp_codec import negotiate_payload_type
+
+    host, port, remote_pts = _parse_sdp_offer(sdp)
+    payload_type = negotiate_payload_type(remote_pts)
     return host, port, payload_type
 
 
@@ -308,11 +311,6 @@ def _extract_user(uri: str) -> str:
     """Extract username from sip:user@host."""
     m = re.match(r"sip:([^@]+)@", uri)
     return m.group(1) if m else ""
-
-
-# ---------------------------------------------------------------------------
-# SIP Digest Auth helpers
-# ---------------------------------------------------------------------------
 
 
 def _parse_www_authenticate(header: str) -> dict:
@@ -894,7 +892,6 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
         return
 
     # Call CRM to get HA1
-    # Use the raw sip_user (as the SIP client sees it) for digest computation
     raw_sip_user = auth_params.get("username", sip_user)
     realm = auth_params.get("realm", "")
     ha1_info = _crm_login(subscriber, username, realm, raw_sip_user)
@@ -938,6 +935,9 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
             contact_uri=contact_uri,
             expires=time.time() + expires,
             user_id=ha1_info.get("user_id", 0),
+            subscriber_id=subscriber.get("id", ""),
+            base_url=subscriber.get("base_url", ""),
+            source_addr=addr,
         )
 
     _LOGGER.info("REGISTER: %s registered (contact=%s, expires=%d)",
@@ -1049,33 +1049,30 @@ def _handle_inbound_invite(msg: dict, addr: Tuple[str, int]) -> None:
         _handle_trunk_invite(msg, addr, pbx_id)
         return
 
-    # Otherwise: route to registered device
+    # Otherwise: either route to a registered device, or treat a registered
+    # SIP client dialing an external number as a CRM-orchestrated outbound call.
     to_h = _get_header(msg, "to")
     to_uri = _extract_uri(to_h)
     target_user = _extract_user(to_uri)
-
-    call_id = _get_header(msg, "call-id")
 
     # Send 100 Trying immediately
     resp = _build_response(100, "Trying", msg)
     _send(resp, addr)
 
-    # Look up registration
-    reg = None
-    with _registrations_lock:
-        reg = _registrations.get(target_user)
-        if reg and reg.expires < time.time():
-            del _registrations[target_user]
-            reg = None
-
-    if not reg:
-        _LOGGER.warning("INVITE for unregistered user %s", target_user)
-        resp = _build_response(404, "Not Found", msg, to_tag=_gen_tag())
-        _send(resp, addr)
+    reg = _get_registration(target_user)
+    if reg:
+        _LOGGER.info("Routing INVITE for %s to %s", target_user, reg.contact_uri)
+        _proxy_invite(msg, addr, reg)
         return
 
-    _LOGGER.info("Routing INVITE for %s to %s", target_user, reg.contact_uri)
-    _proxy_invite(msg, addr, reg)
+    source_user, source_reg = _find_source_registration(msg, addr)
+    if source_reg:
+        _handle_registered_client_invite(msg, addr, source_user, source_reg, target_user)
+        return
+
+    _LOGGER.warning("INVITE for unregistered user %s", target_user)
+    resp = _build_response(404, "Not Found", msg, to_tag=_gen_tag())
+    _send(resp, addr)
 
 
 def _handle_trunk_invite(msg: dict, addr: Tuple[str, int], pbx_id: str) -> None:
@@ -1168,6 +1165,159 @@ def answer_trunk_leg(sip_call_id: str) -> bool:
     dialog["answered"] = True
     _LOGGER.info("Trunk leg %s: sent 200 OK (answered)", sip_call_id)
     return True
+
+
+def _get_registration(sip_user: str) -> Optional[_Registration]:
+    with _registrations_lock:
+        reg = _registrations.get(sip_user)
+        if reg and reg.expires < time.time():
+            _registrations.pop(sip_user, None)
+            return None
+        return reg
+
+
+def _find_source_registration(msg: dict, addr: Tuple[str, int]) -> Tuple[str, Optional[_Registration]]:
+    """Resolve which registered client sent this INVITE."""
+    from_h = _get_header(msg, "from")
+    from_uri = _extract_uri(from_h)
+    from_user = _extract_user(from_uri)
+    reg = _get_registration(from_user)
+    if reg:
+        return from_user, reg
+
+    now = time.time()
+    stale = []
+    with _registrations_lock:
+        for sip_user, candidate in _registrations.items():
+            if candidate.expires < now:
+                stale.append(sip_user)
+                continue
+            if candidate.source_addr == addr:
+                for expired in stale:
+                    _registrations.pop(expired, None)
+                return sip_user, candidate
+            m = re.match(r"sip:([^@]+@)?([^:;>]+)(?::(\d+))?", candidate.contact_uri or "")
+            if not m:
+                continue
+            host = m.group(2)
+            port = int(m.group(3)) if m.group(3) else 5060
+            if host == addr[0] and port == addr[1]:
+                for expired in stale:
+                    _registrations.pop(expired, None)
+                return sip_user, candidate
+        for expired in stale:
+            _registrations.pop(expired, None)
+    return "", None
+
+
+def _handle_registered_client_invite(
+    msg: dict,
+    addr: Tuple[str, int],
+    source_user: str,
+    source_reg: _Registration,
+    target_user: str,
+) -> None:
+    """Forward a registered SIP client's external dial attempt to the CRM."""
+    from . import auth as auth_mod, dispatcher, leg as leg_mod, sip_listener
+    from speech_pipeline.RTPSession import RTPSession, RTPCallSession
+    from speech_pipeline.rtp_codec import PCMU, codec_for_pt, negotiate_payload_type
+
+    call_id = _get_header(msg, "call-id")
+    subscriber = None
+    if source_reg.subscriber_id:
+        subscriber = sub_mod.get(source_reg.subscriber_id)
+    if not subscriber and source_reg.base_url:
+        subscriber = _find_subscriber_by_base_url(source_reg.base_url)
+    if not subscriber:
+        _, base_url = _split_sip_user(source_user)
+        if base_url:
+            subscriber = _find_subscriber_by_base_url(base_url)
+    if not subscriber:
+        _LOGGER.warning("Registered INVITE from %s: no subscriber found", source_user)
+        resp = _build_response(403, "Forbidden", msg, to_tag=_gen_tag())
+        _send(resp, addr)
+        return
+
+    existing = _trunk_dialogs.get(call_id)
+    if existing:
+        code = 200 if existing.get("answered") else 183
+        phrase = "OK" if code == 200 else "Session Progress"
+        resp = _build_response(
+            code,
+            phrase,
+            msg,
+            to_tag=existing["to_tag"],
+            body=existing["sdp"],
+        )
+        _send(resp, addr)
+        _LOGGER.info("Registered INVITE %s: resent %d %s", call_id, code, phrase)
+        return
+
+    _LOGGER.info("Registered SIP device %s dials %s", source_user, target_user)
+
+    remote_host, remote_port, remote_pts = _parse_sdp_offer(msg.get("body", ""))
+    remote_pt = negotiate_payload_type(remote_pts)
+    negotiated_codec = codec_for_pt(remote_pt) or PCMU
+    to_tag = _gen_tag()
+    rtp_port = _find_free_port()
+    sdp = _build_sdp(_local_ip, rtp_port, codec=negotiated_codec)
+
+    resp = _build_response(183, "Session Progress", msg, to_tag=to_tag, body=sdp)
+    _send(resp, addr)
+
+    _trunk_dialogs[call_id] = {
+        "msg": msg,
+        "addr": addr,
+        "to_tag": to_tag,
+        "rtp_port": rtp_port,
+        "sdp": sdp,
+        "pbx_id": "",
+        "answered": False,
+        "negotiated_pt": negotiated_codec.payload_type if negotiated_codec else 0,
+        "source_user": source_user,
+    }
+
+    rtp = RTPSession(rtp_port, remote_host, remote_port, codec=negotiated_codec)
+    rtp.start()
+    session = RTPCallSession(rtp)
+
+    acct = auth_mod.get_account(subscriber["account_id"]) if subscriber["account_id"] != "__admin__" else None
+    pbx_id = acct.get("pbx", "") if acct else ""
+    leg = leg_mod.create_leg(
+        direction="inbound",
+        number=source_user,
+        pbx_id=pbx_id,
+        subscriber_id=subscriber["id"],
+        voip_call=rtp,
+    )
+    leg.status = "ringing"
+    leg._sip_msg = msg
+    leg._sip_addr = addr
+    leg._rtp_port = rtp_port
+    leg._rtp_session = rtp
+    leg._sip_session = session
+    leg._sip_call_id = call_id
+
+    _trunk_dialogs[call_id]["session"] = session
+    _trunk_dialogs[call_id]["rtp_session"] = rtp
+    _trunk_dialogs[call_id]["leg_id"] = leg.leg_id
+
+    dispatcher.fire_subscriber_event(subscriber, "device_dial", {
+        "callId": leg.leg_id,
+        "caller": source_user,
+        "callee": target_user,
+        "number": target_user,
+        "leg_id": leg.leg_id,
+        "sip_user": source_user,
+        "user_id": source_reg.user_id,
+    })
+
+    threading.Thread(
+        target=sip_listener._wait_for_bridge,
+        args=(leg, None),
+        daemon=True,
+        name=f"dial-bridge-{leg.leg_id}",
+    ).start()
 
 
 def _proxy_invite(
@@ -1405,6 +1555,14 @@ def register_trunk(
     pbx_id: str, server: str, port: int, username: str, password: str,
 ) -> None:
     """Register as a SIP client on an external PBX (for outbound calls)."""
+    _LOGGER.warning(
+        "Trunk %s: provisioning register to %s:%d as %s (password_len=%d)",
+        pbx_id,
+        server,
+        port,
+        username,
+        len(password or ""),
+    )
     trunk = _Trunk(
         pbx_id=pbx_id,
         server=server,

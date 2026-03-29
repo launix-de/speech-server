@@ -84,11 +84,18 @@ class SIPCall:
     _contact_uri: str = ""
     _route: str = ""
     _caller_id: str = ""
+    _cancel_requested: bool = False
 
     def _set_state(self, new_state: str) -> None:
         self.state = new_state
         self.state_event.set()
         self.state_event = threading.Event()
+
+
+def _finalize_call(call_obj: SIPCall) -> None:
+    call_obj._set_state("ended")
+    with _calls_lock:
+        _calls.pop(call_obj.call_id, None)
 
 
 # ---------------------------------------------------------------------------
@@ -686,7 +693,7 @@ def _handle_invite_response(
 
     elif status == 180 or status == 183:
         _LOGGER.info("Call %s: %d %s", call_id, status, msg.get("reason", ""))
-        if call_obj.state == "dialing":
+        if call_obj.state == "dialing" and not call_obj._cancel_requested:
             call_obj._set_state("ringing")
         # Store To tag for later ACK/BYE
         to_tag = _extract_tag(_get_header(msg, "to"))
@@ -719,6 +726,13 @@ def _handle_invite_response(
         rr = _get_header(msg, "record-route")
         if rr:
             call_obj._route = rr
+
+        if call_obj._cancel_requested:
+            _LOGGER.info("Call %s: 200 OK after CANCEL requested — sending ACK+BYE", call_id)
+            _send_ack(call_obj, msg)
+            _send_bye(call_obj)
+            _finalize_call(call_obj)
+            return
 
         _LOGGER.info("Call %s: answered (RTP %s:%d)",
                       call_id, call_obj.remote_rtp_host,
@@ -762,7 +776,31 @@ def _handle_invite_response(
                         call_id, status, msg.get("reason", ""))
         # Send ACK for error responses
         _send_ack(call_obj, msg)
-        call_obj._set_state("ended")
+        _finalize_call(call_obj)
+
+
+def _send_bye(call_obj: SIPCall) -> None:
+    call_obj._cseq += 1
+    branch = _gen_branch()
+
+    to_h = call_obj._to_header
+    if call_obj._to_tag and ";tag=" not in to_h:
+        to_h += f";tag={call_obj._to_tag}"
+
+    target_uri = call_obj._contact_uri or _extract_uri(to_h)
+    if not target_uri.startswith("sip:"):
+        target_uri = f"sip:{target_uri}"
+
+    msg = _build_request(
+        "BYE", target_uri,
+        call_id=call_obj.call_id,
+        from_header=call_obj._from_header,
+        to_header=to_h,
+        cseq=call_obj._cseq, via_branch=branch,
+        remote_addr=call_obj._remote_addr,
+    )
+    _send(msg, call_obj._remote_addr)
+    _LOGGER.info("Call %s: BYE sent", call_obj.call_id)
 
 
 def _send_ack(call_obj: SIPCall, response_msg: dict) -> None:
@@ -1170,6 +1208,81 @@ def answer_trunk_leg(sip_call_id: str) -> bool:
     _send(resp, dialog["addr"])
     dialog["answered"] = True
     _LOGGER.info("Trunk leg %s: sent 200 OK (answered)", sip_call_id)
+    return True
+
+
+def hangup_trunk_leg(sip_call_id: str) -> bool:
+    """End a deferred inbound dialog created via Early Media/183.
+
+    Used for both real trunk inbound legs and registered-client device_dial
+    legs, where the active SIP dialog is tracked in ``_trunk_dialogs`` rather
+    than as a standalone ``SIPCall`` object.
+    """
+    dialog = _trunk_dialogs.get(sip_call_id)
+    if not dialog:
+        return False
+
+    msg = dialog["msg"]
+    addr = dialog["addr"]
+    local_to_tag = dialog.get("to_tag", "")
+    answered = bool(dialog.get("answered"))
+
+    local_from = _get_header(msg, "to")
+    if local_to_tag and ";tag=" not in local_from:
+        local_from += f";tag={local_to_tag}"
+    remote_to = _get_header(msg, "from")
+
+    contact_h = _get_header(msg, "contact")
+    target_uri = _extract_uri(contact_h) if contact_h else _extract_uri(remote_to)
+    if not target_uri.startswith("sip:"):
+        target_uri = f"sip:{target_uri}"
+
+    cseq_h = _get_header(msg, "cseq")
+    try:
+        cseq_num = int((cseq_h.split()[0] if cseq_h else "1")) + 1
+    except Exception:
+        cseq_num = 2
+
+    if answered:
+        req = _build_request(
+            "BYE",
+            target_uri,
+            call_id=sip_call_id,
+            from_header=local_from,
+            to_header=remote_to,
+            cseq=cseq_num,
+            via_branch=_gen_branch(),
+            remote_addr=addr,
+        )
+        _send(req, addr)
+        _LOGGER.info("Trunk leg %s: BYE sent", sip_call_id)
+    else:
+        req = _build_request(
+            "CANCEL",
+            _extract_uri(_get_header(msg, "to")),
+            call_id=sip_call_id,
+            from_header=_get_header(msg, "from"),
+            to_header=_get_header(msg, "to"),
+            cseq=1,
+            via_branch=_extract_branch(_get_header(msg, "via")) or _gen_branch(),
+            remote_addr=addr,
+        )
+        _send(req, addr)
+        _LOGGER.info("Trunk leg %s: CANCEL sent", sip_call_id)
+
+    session = dialog.get("session")
+    if session is not None and hasattr(session, "hungup"):
+        try:
+            session.hungup.set()
+        except Exception:
+            pass
+    rtp = dialog.get("rtp_session")
+    if rtp is not None:
+        try:
+            rtp.stop()
+        except Exception:
+            pass
+    _trunk_dialogs.pop(sip_call_id, None)
     return True
 
 
@@ -1887,6 +2000,8 @@ def hangup(call_obj: SIPCall) -> None:
 
     if call_obj.state in ("dialing", "ringing"):
         # Not yet established — send CANCEL (RFC 3261 §9.1)
+        if call_obj._cancel_requested:
+            return
         branch = call_obj._via_branch
         msg = _build_request(
             "CANCEL", _extract_uri(call_obj._to_header),
@@ -1898,30 +2013,9 @@ def hangup(call_obj: SIPCall) -> None:
         )
         _send(msg, call_obj._remote_addr)
         _LOGGER.info("Call %s: CANCEL sent", call_obj.call_id)
+        call_obj._cancel_requested = True
+        return
     else:
         # Established — send BYE
-        call_obj._cseq += 1
-        branch = _gen_branch()
-
-        to_h = call_obj._to_header
-        if call_obj._to_tag and ";tag=" not in to_h:
-            to_h += f";tag={call_obj._to_tag}"
-
-        target_uri = call_obj._contact_uri or _extract_uri(to_h)
-        if not target_uri.startswith("sip:"):
-            target_uri = f"sip:{target_uri}"
-
-        msg = _build_request(
-            "BYE", target_uri,
-            call_id=call_obj.call_id,
-            from_header=call_obj._from_header,
-            to_header=to_h,
-            cseq=call_obj._cseq, via_branch=branch,
-            remote_addr=call_obj._remote_addr,
-        )
-        _send(msg, call_obj._remote_addr)
-        _LOGGER.info("Call %s: BYE sent", call_obj.call_id)
-
-    call_obj._set_state("ended")
-    with _calls_lock:
-        _calls.pop(call_obj.call_id, None)
+        _send_bye(call_obj)
+        _finalize_call(call_obj)

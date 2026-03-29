@@ -58,15 +58,24 @@ class Leg:
 
     def hangup(self) -> None:
         # 1. Send SIP BYE FIRST (before closing sockets)
+        sent_signaling = False
         if hasattr(self, '_sip_call') and self._sip_call:
             try:
                 from . import sip_stack
                 sip_stack.hangup(self._sip_call)
+                sent_signaling = True
+            except Exception:
+                pass
+        elif hasattr(self, '_sip_call_id') and self._sip_call_id:
+            try:
+                from . import sip_stack
+                sent_signaling = sip_stack.hangup_trunk_leg(self._sip_call_id)
             except Exception:
                 pass
         if self.voip_call:
             try:
-                self.voip_call.hangup()
+                if not sent_signaling:
+                    self.voip_call.hangup()
             except Exception:
                 pass
         if self._sip_session:

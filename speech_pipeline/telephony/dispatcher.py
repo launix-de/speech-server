@@ -42,16 +42,18 @@ def fire_subscriber_event(sub: dict, event_key: str, payload: dict) -> list:
     method, path = resolved
 
     url = sub["base_url"].rstrip("/") + "/" + path.lstrip("/")
+    event_payload = {"event": event_key, **payload}
 
-    def _send():
+    def _send() -> None:
         try:
-            http_requests.request(
+            resp = http_requests.request(
                 method,
                 url,
-                json={"event": event_key, **payload},
+                json=event_payload,
                 headers={"Authorization": f"Bearer {sub['bearer_token']}"},
                 timeout=30,
             )
+            _LOGGER.info("Event %s → %d", event_key, resp.status_code)
         except Exception as e:
             _LOGGER.warning("Event %s to %s failed: %s", event_key, url, e)
 

@@ -16,7 +16,6 @@ from typing import Dict, List, Optional
 
 import requests as http_requests
 
-
 _LOGGER = logging.getLogger("telephony.leg")
 
 _legs: Dict[str, "Leg"] = {}
@@ -201,25 +200,28 @@ def _create_sip_session(leg: Leg, pbx_entry: dict):
     if not sip_stack._running:
         raise RuntimeError("SIP stack not running")
 
-    # Check if target is a registered SIP device
+    # CRM-local SIP identities route to registered devices.
+    # Generic user@host targets remain real external SIP calls via trunk.
     if "@" in leg.number:
         from urllib.parse import unquote
         sip_user = unquote(leg.number)
-        reg = sip_stack.get_registration(sip_user)
-        if reg:
-            return _create_sip_stack_session(leg, reg)
-        raise RuntimeError(f"SIP device {sip_user} not registered")
+        if sip_stack.is_local_sip_user(sip_user):
+            return _create_local_sip_session(leg, sip_user)
+        return _create_trunk_call_session(leg)
 
     # Phone number → route via trunk to PSTN
     return _create_trunk_call_session(leg)
 
 
-def _create_sip_stack_session(leg: Leg, reg: dict):
-    """Originate via sip_stack directly to a registered device."""
+def _create_local_sip_session(leg: Leg, sip_user: str):
+    """Originate via sip_stack directly to all active contacts of a local SIP identity."""
     from . import sip_stack
 
-    _LOGGER.info("Originate %s to device %s", leg.number, reg.get("contact_uri", "?"))
-    sip_call = sip_stack.call_device(leg.number, reg)
+    regs = sip_stack.get_registrations(sip_user)
+    if not regs:
+        raise RuntimeError(f"SIP device {sip_user} not registered")
+    _LOGGER.info("Originate %s to %d registered contact(s)", leg.number, len(regs))
+    sip_call = sip_stack.call_registered_user(sip_user)
     return _wait_and_setup_rtp(leg, sip_call)
 
 
@@ -373,7 +375,6 @@ def _fire_callback(leg: Leg, event: str, **extra) -> list:
         except Exception as e:
             _LOGGER.warning("Leg callback %s → %s failed: %s", event, url, e)
 
-    # Fire async — don't block the caller
     _LOGGER.info("Leg callback %s → %s", event, url)
     threading.Thread(target=_send, daemon=True).start()
     return []

@@ -20,7 +20,7 @@ import string
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Callable, Dict, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import requests
 
@@ -47,8 +47,8 @@ _trunks_lock = threading.Lock()
 _calls: Dict[str, "SIPCall"] = {}
 _calls_lock = threading.Lock()
 
-# Client device registrations (registrar): sip_user -> _Registration
-_registrations: Dict[str, "_Registration"] = {}
+# Client device registrations (registrar): sip_user -> registration_key -> _Registration
+_registrations: Dict[str, Dict[str, "_Registration"]] = {}
 _registrations_lock = threading.Lock()
 
 # Pending transactions: (branch or call_id, method) -> callback
@@ -105,6 +105,10 @@ class _Registration:
     subscriber_id: str = "" # CRM subscriber this device belongs to
     base_url: str = ""      # CRM base URL for callbacks/device dial
     source_addr: Tuple[str, int] = ("", 0)  # actual REGISTER source tuple
+
+
+def _registration_key(contact_uri: str, addr: Tuple[str, int]) -> str:
+    return f"{addr[0]}:{addr[1]}|{contact_uri}"
 
 
 # ---------------------------------------------------------------------------
@@ -928,9 +932,11 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
     else:
         contact_uri = f"sip:{sip_user}@{addr[0]}:{addr[1]}"
 
-    # Store registration
+    # Store/update registration
+    reg_key = _registration_key(contact_uri, addr)
     with _registrations_lock:
-        _registrations[sip_user] = _Registration(
+        regs = _registrations.setdefault(sip_user, {})
+        regs[reg_key] = _Registration(
             sip_user=sip_user,
             contact_uri=contact_uri,
             expires=time.time() + expires,
@@ -1167,13 +1173,24 @@ def answer_trunk_leg(sip_call_id: str) -> bool:
     return True
 
 
-def _get_registration(sip_user: str) -> Optional[_Registration]:
+def _get_registrations(sip_user: str) -> List[_Registration]:
     with _registrations_lock:
-        reg = _registrations.get(sip_user)
-        if reg and reg.expires < time.time():
+        regs = _registrations.get(sip_user, {})
+        if not regs:
+            return []
+        now = time.time()
+        expired = [key for key, reg in regs.items() if reg.expires < now]
+        for key in expired:
+            regs.pop(key, None)
+        if not regs:
             _registrations.pop(sip_user, None)
-            return None
-        return reg
+            return []
+        return list(regs.values())
+
+
+def _get_registration(sip_user: str) -> Optional[_Registration]:
+    regs = _get_registrations(sip_user)
+    return regs[0] if regs else None
 
 
 def _find_source_registration(msg: dict, addr: Tuple[str, int]) -> Tuple[str, Optional[_Registration]]:
@@ -1181,32 +1198,48 @@ def _find_source_registration(msg: dict, addr: Tuple[str, int]) -> Tuple[str, Op
     from_h = _get_header(msg, "from")
     from_uri = _extract_uri(from_h)
     from_user = _extract_user(from_uri)
-    reg = _get_registration(from_user)
-    if reg:
-        return from_user, reg
+    regs = _get_registrations(from_user)
+    if regs:
+        for reg in regs:
+            if reg.source_addr == addr:
+                return from_user, reg
+        return from_user, regs[0]
 
     now = time.time()
-    stale = []
+    stale: List[Tuple[str, str]] = []
     with _registrations_lock:
-        for sip_user, candidate in _registrations.items():
-            if candidate.expires < now:
-                stale.append(sip_user)
-                continue
-            if candidate.source_addr == addr:
-                for expired in stale:
-                    _registrations.pop(expired, None)
-                return sip_user, candidate
-            m = re.match(r"sip:([^@]+@)?([^:;>]+)(?::(\d+))?", candidate.contact_uri or "")
-            if not m:
-                continue
-            host = m.group(2)
-            port = int(m.group(3)) if m.group(3) else 5060
-            if host == addr[0] and port == addr[1]:
-                for expired in stale:
-                    _registrations.pop(expired, None)
-                return sip_user, candidate
-        for expired in stale:
-            _registrations.pop(expired, None)
+        for sip_user, reg_map in list(_registrations.items()):
+            for reg_key, candidate in list(reg_map.items()):
+                if candidate.expires < now:
+                    stale.append((sip_user, reg_key))
+                    continue
+                if candidate.source_addr == addr:
+                    for stale_user, stale_key in stale:
+                        reg_bucket = _registrations.get(stale_user)
+                        if reg_bucket:
+                            reg_bucket.pop(stale_key, None)
+                            if not reg_bucket:
+                                _registrations.pop(stale_user, None)
+                    return sip_user, candidate
+                m = re.match(r"sip:([^@]+@)?([^:;>]+)(?::(\d+))?", candidate.contact_uri or "")
+                if not m:
+                    continue
+                host = m.group(2)
+                port = int(m.group(3)) if m.group(3) else 5060
+                if host == addr[0] and port == addr[1]:
+                    for stale_user, stale_key in stale:
+                        reg_bucket = _registrations.get(stale_user)
+                        if reg_bucket:
+                            reg_bucket.pop(stale_key, None)
+                            if not reg_bucket:
+                                _registrations.pop(stale_user, None)
+                    return sip_user, candidate
+        for stale_user, stale_key in stale:
+            reg_bucket = _registrations.get(stale_user)
+            if reg_bucket:
+                reg_bucket.pop(stale_key, None)
+                if not reg_bucket:
+                    _registrations.pop(stale_user, None)
     return "", None
 
 
@@ -1470,11 +1503,13 @@ def _cleanup_loop() -> None:
 
         # Expire registrations
         with _registrations_lock:
-            expired = [k for k, v in _registrations.items()
-                       if v.expires < now]
-            for k in expired:
-                _LOGGER.info("Registration expired: %s", k)
-                del _registrations[k]
+            for sip_user, reg_map in list(_registrations.items()):
+                expired = [key for key, reg in reg_map.items() if reg.expires < now]
+                for key in expired:
+                    _LOGGER.info("Registration expired: %s (%s)", sip_user, key)
+                    reg_map.pop(key, None)
+                if not reg_map:
+                    _registrations.pop(sip_user, None)
 
         # Expire nonces older than 5 minutes
         stale = [n for n, t in _nonces.items() if now - t > 300]
@@ -1646,12 +1681,8 @@ def call(pbx_id: str, target: str, caller_id: str = "") -> SIPCall:
     return call_obj
 
 
-def call_device(sip_user: str, reg: dict) -> SIPCall:
-    """Originate a call directly to a registered SIP device.
-
-    Sends INVITE to the device's contact URI (from registration).
-    No trunk needed — direct SIP signaling.
-    """
+def _call_device_to_registration(sip_user: str, reg: dict) -> SIPCall:
+    """Originate a call directly to a single registered SIP contact."""
     contact_uri = reg["contact_uri"]
     # Parse contact URI: sip:user@host:port
     m = re.match(r"sip:([^@]+)@([^:;>]+)(?::(\d+))?", contact_uri)
@@ -1704,38 +1735,154 @@ def call_device(sip_user: str, reg: dict) -> SIPCall:
     return call_obj
 
 
-def get_registration(sip_user: str) -> Optional[dict]:
-    """Look up a registered client device by SIP username.
+def call_device(sip_user: str, reg: dict) -> SIPCall:
+    """Backward-compatible single-contact device dial."""
+    return _call_device_to_registration(sip_user, reg)
 
-    Returns dict with keys: sip_user, contact_uri, expires, user_id
-    or None if not registered / expired.
+
+def call_registered_user(sip_user: str) -> SIPCall:
+    """Originate to all active registrations of a local SIP identity.
+
+    The first device that answers wins; all other ringing branches are
+    cancelled immediately.
     """
+    regs = get_registrations(sip_user)
+    if not regs:
+        raise RuntimeError(f"SIP device {sip_user} not registered")
+    if len(regs) == 1:
+        return _call_device_to_registration(sip_user, regs[0])
+
+    master = SIPCall(
+        call_id=_gen_call_id(),
+        local_rtp_port=0,
+        _local_tag=_gen_tag(),
+    )
+    master._fanout_children = []  # type: ignore[attr-defined]
+    master._fanout_winner = None  # type: ignore[attr-defined]
+    master._fanout_lock = threading.Lock()  # type: ignore[attr-defined]
+
+    def _copy_winner_state(child: SIPCall) -> None:
+        master.local_rtp_port = child.local_rtp_port
+        master.remote_rtp_host = child.remote_rtp_host
+        master.remote_rtp_port = child.remote_rtp_port
+        master.negotiated_pt = child.negotiated_pt
+        master._from_header = child._from_header
+        master._to_header = child._to_header
+        master._to_tag = child._to_tag
+        master._via_branch = child._via_branch
+        master._cseq = child._cseq
+        master._remote_addr = child._remote_addr
+        master._local_tag = child._local_tag
+        master._contact_uri = child._contact_uri
+        master._route = child._route
+        master._caller_id = child._caller_id
+
+    def _watch_child(child: SIPCall) -> None:
+        while child.state not in ("answered", "ended"):
+            child.state_event.wait(timeout=1.0)
+            child.state_event.clear()
+            if master.state == "ended":
+                return
+            if child.state == "ringing" and master.state == "dialing":
+                master._set_state("ringing")
+
+        if child.state == "answered":
+            with master._fanout_lock:  # type: ignore[attr-defined]
+                if master.state == "ended" or master._fanout_winner is not None:  # type: ignore[attr-defined]
+                    winner = False
+                else:
+                    master._fanout_winner = child  # type: ignore[attr-defined]
+                    _copy_winner_state(child)
+                    master._set_state("answered")
+                    winner = True
+            if winner:
+                for other in list(master._fanout_children):  # type: ignore[attr-defined]
+                    if other is child or other.state == "ended":
+                        continue
+                    try:
+                        hangup(other)
+                    except Exception:
+                        _LOGGER.debug("Failed to cancel losing branch for %s", sip_user, exc_info=True)
+            return
+
+        with master._fanout_lock:  # type: ignore[attr-defined]
+            if master._fanout_winner is None and all(c.state == "ended" for c in master._fanout_children):  # type: ignore[attr-defined]
+                master._set_state("ended")
+
+    for reg in regs:
+        child = _call_device_to_registration(sip_user, reg)
+        master._fanout_children.append(child)  # type: ignore[attr-defined]
+        threading.Thread(
+            target=_watch_child,
+            args=(child,),
+            daemon=True,
+            name=f"fork-{sip_user}-{child.call_id[:8]}",
+        ).start()
+
+    _LOGGER.info("Call %s: fanout INVITE sent to %d contacts for %s",
+                 master.call_id, len(regs), sip_user)
+    return master
+
+
+def get_registrations(sip_user: str) -> List[dict]:
+    """Look up all active registrations for a SIP username."""
     with _registrations_lock:
         from urllib.parse import unquote
         needle = unquote(sip_user)
-        reg = None
-        reg_key = None
-        for key, r in _registrations.items():
-            if unquote(key) == needle:
-                reg = r
-                reg_key = key
-                break
-        if not reg:
-            return None
-        if reg.expires < time.time():
-            del _registrations[reg_key]
-            return None
-        return {
-            "sip_user": reg.sip_user,
-            "contact_uri": reg.contact_uri,
-            "expires": reg.expires,
-            "user_id": reg.user_id,
-        }
+        result: List[dict] = []
+        for key, reg_map in list(_registrations.items()):
+            if unquote(key) != needle:
+                continue
+            expired = [reg_key for reg_key, reg in reg_map.items() if reg.expires < time.time()]
+            for reg_key in expired:
+                reg_map.pop(reg_key, None)
+            if not reg_map:
+                _registrations.pop(key, None)
+                continue
+            for reg in reg_map.values():
+                result.append({
+                    "sip_user": reg.sip_user,
+                    "contact_uri": reg.contact_uri,
+                    "expires": reg.expires,
+                    "user_id": reg.user_id,
+                    "subscriber_id": reg.subscriber_id,
+                    "base_url": reg.base_url,
+                    "source_addr": reg.source_addr,
+                })
+        return result
+
+
+def get_registration(sip_user: str) -> Optional[dict]:
+    """Backward-compatible lookup of the first active registration."""
+    regs = get_registrations(sip_user)
+    return regs[0] if regs else None
+
+
+def is_local_sip_user(sip_user: str) -> bool:
+    """Return True if the SIP identity belongs to a known CRM subscriber."""
+    if _get_registrations(sip_user):
+        return True
+    _, base_url = _split_sip_user(sip_user)
+    if not base_url:
+        return False
+    return _find_subscriber_by_base_url(base_url) is not None
 
 
 def hangup(call_obj: SIPCall) -> None:
     """Send BYE (established) or CANCEL (ringing) to end a call."""
     if call_obj.state == "ended":
+        return
+
+    children = getattr(call_obj, "_fanout_children", None)
+    if children is not None:
+        for child in list(children):
+            if child.state == "ended":
+                continue
+            try:
+                hangup(child)
+            except Exception:
+                _LOGGER.debug("Failed to hang up forked child call %s", child.call_id, exc_info=True)
+        call_obj._set_state("ended")
         return
 
     if call_obj.state in ("dialing", "ringing"):

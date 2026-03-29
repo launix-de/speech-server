@@ -138,8 +138,8 @@ body { font-family: system-ui, sans-serif; display: flex;
 .btn:active { transform: scale(0.9); }
 .btn-join { background: #4caf50; }
 .btn-leave { background: #f44336; }
-.btn-mute { background: #1f2937; }
-.btn-muted { background: #d97706; }
+.btn-mute { background: #4caf50; }
+.btn-muted { background: #f44336; }
 .row { display: flex; gap: .5rem; justify-content: center; margin-bottom: 12px; font-size: 13px; color: #888; }
 .controls { display: flex; gap: 12px; justify-content: center; align-items: center; }
 </style>

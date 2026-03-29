@@ -516,6 +516,32 @@ def originate_leg():
     if not pbx_entry:
         return (f"PBX {call.pbx_id} not found\n", 400)
 
+    if to.startswith("client:"):
+        from . import webclient as webclient_mod
+        import secrets
+
+        user = to[len("client:"):]
+        if not user:
+            return ("Invalid client target\n", 400)
+        leg_id = "leg-" + secrets.token_urlsafe(12)
+        ready_callback = body.get("webclient_callback", "")
+        if not ready_callback:
+            return ("'webclient_callback' is required for client targets\n", 400)
+        base_url = body.get("base_url", "").rstrip("/")
+        if not base_url:
+            return ("'base_url' is required for client targets\n", 400)
+
+        webclient_mod.create_webclient_leg(
+            call=call,
+            user=user,
+            leg_id=leg_id,
+            base_url=base_url,
+            ready_callback=ready_callback,
+            leg_callbacks=callbacks,
+            number=to,
+        )
+        return jsonify({"leg_id": leg_id, "call_id": call_id}), 202
+
     leg = leg_mod.create_leg("outbound", to, call.pbx_id,
                               call.subscriber_id)
     leg.callbacks = callbacks

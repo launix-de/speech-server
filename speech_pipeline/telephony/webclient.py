@@ -19,9 +19,10 @@ import logging
 import secrets
 from typing import Optional
 
-from flask import Blueprint, Response
+import requests as http_requests
+from flask import Blueprint, Response, jsonify, request
 
-from . import auth, call_state
+from . import auth, call_state, subscriber
 
 _LOGGER = logging.getLogger("telephony.webclient")
 
@@ -33,14 +34,15 @@ _sessions: dict = {}
 
 def register_webclient(call: call_state.Call, user: str,
                         nonce: str, dsl: str = None,
-                        pipes: list = None) -> dict:
+                        pipes: list = None,
+                        session_id: str | None = None) -> dict:
     """Register a webclient session. Returns session info with DSL.
 
     If *dsl* or *pipes* is given, ``{session_id}`` and ``{call_id}``
     placeholders are substituted.  Otherwise the default bidirectional
     codec-conference pipeline is used.
     """
-    session_id = "wc-" + secrets.token_urlsafe(8)
+    session_id = session_id or ("wc-" + secrets.token_urlsafe(8))
 
     if pipes:
         resolved = [p.replace("{session_id}", session_id)
@@ -63,6 +65,96 @@ def register_webclient(call: call_state.Call, user: str,
     _LOGGER.info("WebClient session %s for call %s (user=%s)",
                  session_id, call.call_id, user)
     return entry
+
+
+def create_webclient_leg(call: call_state.Call, user: str,
+                         leg_id: str,
+                         base_url: str,
+                         ready_callback: str,
+                         leg_callbacks: dict,
+                         number: str) -> dict:
+    nonce_entry = auth.create_nonce(
+        account_id=call.account_id,
+        subscriber_id=call.subscriber_id,
+        user=user)
+    nonce = nonce_entry["nonce"]
+
+    sess = register_webclient(call, user, nonce, session_id=leg_id)
+    sess["subscriber_id"] = call.subscriber_id
+    sess["leg_id"] = leg_id
+    sess["number"] = number
+    sess["ready_callback"] = ready_callback
+    sess["leg_callbacks"] = dict(leg_callbacks or {})
+
+    from urllib.parse import urlencode
+    query = urlencode({
+        "base": base_url,
+        "session": sess["session_id"],
+        "dsl": sess["dsl"],
+    })
+    iframe_url = f"{base_url}/phone/{nonce}?{query}"
+
+    _send_callback(
+        sess["subscriber_id"],
+        ready_callback,
+        {
+            "callId": call.call_id,
+            "command": "webclient",
+            "participantId": leg_id,
+            "result": "ready",
+            "iframe_url": iframe_url,
+            "nonce": nonce,
+            "user": user,
+            "session_id": sess["session_id"],
+            "leg_id": leg_id,
+        },
+    )
+    return {
+        "leg_id": leg_id,
+        "session_id": sess["session_id"],
+        "iframe_url": iframe_url,
+    }
+
+
+def emit_leg_event(session_id: str, event: str) -> None:
+    sess = _sessions.get(session_id)
+    if not sess:
+        return
+    callback = (sess.get("leg_callbacks") or {}).get(event)
+    if not callback:
+        return
+    _send_callback(
+        sess.get("subscriber_id", ""),
+        callback,
+        {
+            "leg_id": sess.get("leg_id", session_id),
+            "event": event,
+            "number": sess.get("number", ""),
+            "direction": "outbound",
+            "call_id": sess.get("call_id"),
+        },
+    )
+
+
+def _send_callback(subscriber_id: str, callback_path: str, payload: dict) -> None:
+    if not subscriber_id or not callback_path:
+        return
+    sub = subscriber.get(subscriber_id)
+    if not sub:
+        return
+    url = sub["base_url"].rstrip("/") + "/" + callback_path.lstrip("/")
+
+    def _send():
+        try:
+            resp = http_requests.post(url, json=payload, headers={
+                "Authorization": f"Bearer {sub['bearer_token']}",
+            }, timeout=10)
+            _LOGGER.info("WebClient callback %s → %d", callback_path, resp.status_code)
+        except Exception as e:
+            _LOGGER.warning("WebClient callback %s failed: %s", callback_path, e)
+
+    import threading
+    threading.Thread(target=_send, daemon=True, name="wc-callback").start()
 
 
 def get_webclient_session(session_id: str) -> Optional[dict]:
@@ -191,6 +283,19 @@ var speaker = null;
 var btn = document.getElementById('btn-rec');
 var muteBtn = document.getElementById('btn-mute');
 var statusEl = document.getElementById('status');
+var eventUrl = location.pathname + '/event';
+
+function notifyEvent(eventName) {
+  if (!sessionId) return;
+  try {
+    fetch(eventUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session: sessionId, event: eventName }),
+      keepalive: true
+    }).catch(function () {});
+  } catch (_) {}
+}
 
 function getProfile() {
   var sel = document.querySelector('input[name="profile"]:checked');
@@ -299,6 +404,7 @@ function openChannels(micStream) {
   btn.style.display = 'flex';
   muteBtn.style.display = 'inline-flex';
   syncMuteButton();
+  notifyEvent('answered');
 }
 
 // Profile switch mid-stream: close mic, reopen with new profile
@@ -315,6 +421,7 @@ document.querySelectorAll('input[name="profile"]').forEach(function(radio) {
 });
 
 function stop() {
+  var wasRecording = recording;
   recording = false;
   muted = false;
   btn.className = 'btn btn-join';
@@ -332,6 +439,7 @@ function stop() {
   muteBtn.style.display = 'none';
   syncMuteButton();
   statusEl.textContent = 'Disconnected';
+  if (wasRecording) notifyEvent('completed');
 }
 
 function syncMuteButton() {
@@ -348,6 +456,10 @@ muteBtn.addEventListener('click', function () {
   muted = !muted;
   syncMuteButton();
   statusEl.textContent = muted ? 'Connected (muted)' : 'Connected (live)';
+});
+
+window.addEventListener('beforeunload', function () {
+  if (recording) notifyEvent('completed');
 });
 </script>
 </body>
@@ -369,3 +481,22 @@ def phone_ui(nonce: str):
             resp.headers["Permissions-Policy"] = "microphone=(*)"
             return resp
     return ("Session not found\n", 404)
+
+
+@bp.route("/phone/<nonce>/event", methods=["POST"])
+def phone_event(nonce: str):
+    entry = auth.validate_nonce(nonce)
+    if not entry:
+        return ("Invalid or expired nonce\n", 403)
+
+    body = request.get_json(force=True, silent=True) or {}
+    session_id = body.get("session", "")
+    event = body.get("event", "")
+    sess = _sessions.get(session_id)
+    if not sess or sess.get("nonce") != nonce:
+        return ("Session not found\n", 404)
+    if event not in ("answered", "completed"):
+        return ("Unsupported event\n", 400)
+
+    emit_leg_event(session_id, event)
+    return jsonify({"ok": True})

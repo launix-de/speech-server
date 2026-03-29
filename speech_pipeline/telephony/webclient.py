@@ -138,7 +138,10 @@ body { font-family: system-ui, sans-serif; display: flex;
 .btn:active { transform: scale(0.9); }
 .btn-join { background: #4caf50; }
 .btn-leave { background: #f44336; }
+.btn-mute { background: #1f2937; }
+.btn-muted { background: #d97706; }
 .row { display: flex; gap: .5rem; justify-content: center; margin-bottom: 12px; font-size: 13px; color: #888; }
+.controls { display: flex; gap: 12px; justify-content: center; align-items: center; }
 </style>
 </head>
 <body>
@@ -149,20 +152,23 @@ body { font-family: system-ui, sans-serif; display: flex;
     <label><input type="radio" name="profile" value="medium" checked> mid</label>
     <label><input type="radio" name="profile" value="high"> high</label>
   </div>
-  <button class="btn btn-join" id="btn-rec" style="display:none">&#x260E;</button>
+  <div class="controls">
+    <button class="btn btn-join" id="btn-rec" style="display:none">&#x260E;</button>
+    <button class="btn btn-mute" id="btn-mute" style="display:none">&#x1F50A;</button>
+  </div>
 </div>
 <!-- codec.js loaded from tts-piper server, same way as sts.html -->
 <script>
 // Read params
 var params = new URLSearchParams(location.search);
-var baseUrl = params.get('base') || location.origin;
 var sessionId = params.get('session');
 var dsl = params.get('dsl');
-var wsBase = baseUrl.replace(/^http/, 'ws');
+var appBase = location.pathname.replace(/\/phone\/[^/?#]+$/, '');
+var wsBase = location.origin.replace(/^http/, 'ws') + appBase;
 
-// Dynamic codec.js load (same origin as tts-piper)
+// Load codec.js relative to the current /tts app prefix.
 var s = document.createElement('script');
-s.src = baseUrl + '/examples/codec.js';
+s.src = appBase + '/examples/codec.js';
 s.onload = initPhone;
 s.onerror = function() { document.getElementById('status').textContent = 'Failed to load codec.js'; };
 document.head.appendChild(s);
@@ -176,12 +182,14 @@ function initPhone() {
 <script>
 var Codec;     // set after codec.js loads
 var recording = false;
+var muted = false;
 var pipeWs = null;
 var codecWs = null;
 var mic = null;
 var speaker = null;
 
 var btn = document.getElementById('btn-rec');
+var muteBtn = document.getElementById('btn-mute');
 var statusEl = document.getElementById('status');
 
 function getProfile() {
@@ -264,7 +272,9 @@ function openChannels(micStream) {
   processor.onaudioprocess = function(e) {
     if (!recording || !codecWs || codecWs.readyState !== WebSocket.OPEN) return;
     var samples = e.inputBuffer.getChannelData(0);
-    var encoded = Codec.encodeFrame(samples, getProfile());
+    var payload = samples;
+    if (muted) payload = new Float32Array(samples.length);
+    var encoded = Codec.encodeFrame(payload, getProfile());
     codecWs.send(encoded);
   };
   source.connect(processor);
@@ -283,9 +293,12 @@ function openChannels(micStream) {
   };
 
   recording = true;
+  muted = false;
   btn.className = 'btn btn-leave';
   btn.innerHTML = '&#x2716;';
   btn.style.display = 'flex';
+  muteBtn.style.display = 'inline-flex';
+  syncMuteButton();
 }
 
 // Profile switch mid-stream: close mic, reopen with new profile
@@ -303,6 +316,7 @@ document.querySelectorAll('input[name="profile"]').forEach(function(radio) {
 
 function stop() {
   recording = false;
+  muted = false;
   btn.className = 'btn btn-join';
   btn.innerHTML = '&#x260E;';
 
@@ -315,11 +329,25 @@ function stop() {
   codecWs = null;
   // Nonce spent — hide button
   btn.style.display = 'none';
+  muteBtn.style.display = 'none';
+  syncMuteButton();
   statusEl.textContent = 'Disconnected';
+}
+
+function syncMuteButton() {
+  muteBtn.innerHTML = muted ? '&#x1F507;' : '&#x1F50A;';
+  muteBtn.className = 'btn btn-mute' + (muted ? ' btn-muted' : '');
 }
 
 btn.addEventListener('click', function () {
   if (recording) stop(); else start();
+});
+
+muteBtn.addEventListener('click', function () {
+  if (!recording) return;
+  muted = !muted;
+  syncMuteButton();
+  statusEl.textContent = muted ? 'Connected (muted)' : 'Connected (live)';
 });
 </script>
 </body>

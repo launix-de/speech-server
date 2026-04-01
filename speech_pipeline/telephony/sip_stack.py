@@ -1489,7 +1489,7 @@ def _handle_registered_client_invite(
     negotiated_codec = codec_for_pt(remote_pt) or PCMU
     to_tag = _gen_tag()
     rtp_port = _find_free_port()
-    sdp = _build_sdp(_sdp_ip_for_remote_sdp(remote_host), rtp_port)
+    sdp = _build_sdp(_sdp_ip_for_remote_sdp(remote_host), rtp_port, codec=negotiated_codec)
 
     resp = _build_response(183, "Session Progress", msg, to_tag=to_tag, body=sdp)
     _send(resp, addr)

@@ -10,6 +10,7 @@ from __future__ import annotations
 import logging
 import time
 from typing import Dict, List, Optional
+from urllib.parse import urlparse
 
 _LOGGER = logging.getLogger("telephony.subscriber")
 
@@ -21,6 +22,27 @@ _subscribers: Dict[str, dict] = {}
 
 # did -> subscriber_id  (reverse index for inbound routing)
 _did_map: Dict[str, str] = {}
+
+# sip_domain -> subscriber_id  (reverse index for SIP registration)
+_sip_domain_map: Dict[str, str] = {}
+
+
+def base_url_to_sip_domain(base_url: str) -> str:
+    """Derive SIP domain from a CRM base_url.
+
+    Path segments are reversed and prepended as subdomains:
+      https://launix.de/crm         -> crm.launix.de
+      https://launix.de/fop/crm-neu -> crm-neu.fop.launix.de
+      https://crm-neu.launix.de     -> crm-neu.launix.de
+    """
+    parsed = urlparse(base_url)
+    hostname = parsed.hostname or ""
+    path = parsed.path.strip("/")
+    if not path:
+        return hostname
+    segments = path.split("/")
+    segments.reverse()
+    return ".".join(segments) + "." + hostname
 
 
 def put(subscriber_id: str, account_id: str, data: dict) -> dict:
@@ -53,9 +75,18 @@ def put(subscriber_id: str, account_id: str, data: dict) -> dict:
                 f"DID {did} already claimed by subscriber {owner}")
         _did_map[did] = subscriber_id
 
+    # Update SIP domain reverse index
+    if old:
+        old_domain = base_url_to_sip_domain(old.get("base_url", ""))
+        if old_domain:
+            _sip_domain_map.pop(old_domain, None)
+    sip_domain = base_url_to_sip_domain(entry["base_url"])
+    if sip_domain:
+        _sip_domain_map[sip_domain] = subscriber_id
+
     _subscribers[subscriber_id] = entry
-    _LOGGER.info("Subscriber %s registered (account=%s, dids=%s)",
-                 subscriber_id, account_id, entry["inbound_dids"])
+    _LOGGER.info("Subscriber %s registered (account=%s, dids=%s, sip_domain=%s)",
+                 subscriber_id, account_id, entry["inbound_dids"], sip_domain)
     return entry
 
 
@@ -68,6 +99,9 @@ def delete(subscriber_id: str, account_id: Optional[str] = None) -> bool:
         raise PermissionError("Subscriber belongs to a different account")
     for did in entry.get("inbound_dids", []):
         _did_map.pop(did, None)
+    sip_domain = base_url_to_sip_domain(entry.get("base_url", ""))
+    if sip_domain:
+        _sip_domain_map.pop(sip_domain, None)
     del _subscribers[subscriber_id]
     _LOGGER.info("Subscriber %s removed", subscriber_id)
     return True
@@ -94,6 +128,14 @@ def list_all(account_id: Optional[str] = None) -> List[dict]:
         s_copy["status"] = "stale" if age > STALE_SECONDS else "alive"
         result.append(s_copy)
     return result
+
+
+def find_by_sip_domain(sip_domain: str) -> Optional[dict]:
+    """Look up subscriber by SIP domain (derived from base_url)."""
+    sid = _sip_domain_map.get(sip_domain)
+    if not sid:
+        return None
+    return _subscribers.get(sid)
 
 
 def find_by_did(did: str) -> Optional[dict]:

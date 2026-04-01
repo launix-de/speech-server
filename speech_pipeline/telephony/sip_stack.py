@@ -196,6 +196,25 @@ def _find_free_port() -> int:
     return port
 
 
+def _sdp_ip_for_remote_sdp(remote_sdp_ip: str) -> str:
+    """Choose our SDP IP to match the remote's network scope.
+
+    If the remote advertises a private IP, reply with our private IP
+    (direct LAN path).  If public, reply with our public IP.
+    """
+    if _is_private_ip(remote_sdp_ip):
+        return _local_ip
+    return _public_ip or _local_ip
+
+
+def _is_private_ip(ip: str) -> bool:
+    import ipaddress
+    try:
+        return ipaddress.ip_address(ip).is_private
+    except ValueError:
+        return False
+
+
 def _build_sdp(ip: str, rtp_port: int, codec=None) -> str:
     from speech_pipeline.rtp_codec import CODEC_PREFERENCE
 
@@ -283,6 +302,8 @@ def _parse_sip(data: bytes) -> dict:
         # Request: INVITE sip:user@host SIP/2.0
         msg["type"] = "request"
         tokens = first.split(None, 2)
+        if not tokens:
+            return None
         msg["method"] = tokens[0]
         msg["uri"] = tokens[1] if len(tokens) > 1 else ""
 
@@ -321,6 +342,12 @@ def _extract_uri(header_val: str) -> str:
 def _extract_user(uri: str) -> str:
     """Extract username from sip:user@host."""
     m = re.match(r"sip:([^@]+)@", uri)
+    return m.group(1) if m else ""
+
+
+def _extract_host(uri: str) -> str:
+    """Extract host from sip:user@host or sip:user@host:port."""
+    m = re.match(r"sip:[^@]+@([^:;>]+)", uri)
     return m.group(1) if m else ""
 
 
@@ -472,6 +499,7 @@ def _send(data: str, addr: Tuple[str, int]) -> None:
         return
     first_line = data.split('\r\n', 1)[0]
     _LOGGER.info("SIP TX → %s: %s", addr, first_line)
+    _LOGGER.debug("SIP TX raw to %s:\n%s", addr, data)
     try:
         _sock.sendto(data.encode("utf-8"), addr)
     except Exception as e:
@@ -631,12 +659,16 @@ def _recv_loop() -> None:
 
         first_line = data.split(b'\r\n', 1)[0].decode('utf-8', errors='replace')
         _LOGGER.info("SIP RX ← %s: %s", addr, first_line)
+        _LOGGER.debug("SIP RX raw ← %s:\n%s", addr,
+                      data.decode('utf-8', errors='replace'))
 
         try:
             msg = _parse_sip(data)
         except Exception:
             _LOGGER.debug("Failed to parse SIP message from %s", addr,
                           exc_info=True)
+            continue
+        if msg is None:
             continue
 
         try:
@@ -881,11 +913,45 @@ def _handle_request(msg: dict, addr: Tuple[str, int]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _resolve_sip_identity(to_uri: str) -> Tuple[str, str, Optional[dict]]:
+    """Resolve SIP identity from a To URI.
+
+    Supports two formats:
+      New: sip:milan.hradecky@crm.launix.de  (plain user, SIP domain)
+      Old: sip:user%40launix.de/crm@srv...   (encoded CRM info in username)
+      Old: sip:user:launix.de~crm@srv...     (: separator, ~ for /)
+
+    Returns (username, realm, subscriber) or (username, realm, None) on failure.
+    """
+    from urllib.parse import unquote
+    raw_user = _extract_user(to_uri)
+    decoded_user = unquote(raw_user)
+
+    # Old format: encoded CRM info in username (contains @ or : after decode)
+    if "@" in decoded_user or ":" in decoded_user:
+        crm_user, base_url = _split_sip_user(decoded_user)
+        realm = _realm_from_sip_user(decoded_user)
+        subscriber = _find_subscriber_by_base_url(base_url) if base_url else None
+        return (crm_user, realm, subscriber)
+
+    # New format: plain username, SIP domain identifies subscriber
+    sip_domain = _extract_host(to_uri)
+    subscriber = sub_mod.find_by_sip_domain(sip_domain)
+    # Fallback: domain is raw base_url path (e.g. launix.de/crm)
+    if not subscriber and "/" in sip_domain:
+        subscriber = _find_subscriber_by_base_url(f"https://{sip_domain}")
+    return (decoded_user, sip_domain, subscriber)
+
+
 def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
     """Process REGISTER from a SIP client device."""
     to_h = _get_header(msg, "to")
     to_uri = _extract_uri(to_h)
-    sip_user = _extract_user(to_uri)  # user@baseurl-without-https
+    username, realm, _ = _resolve_sip_identity(to_uri)
+    sip_domain = _extract_host(to_uri)
+    # Canonical SIP AOR for registration storage — always normalize
+    raw_aor = f"{username}@{sip_domain}" if sip_domain else username
+    sip_user = _normalize_sip_user(raw_aor)
     contact = _get_header(msg, "contact")
 
     # Check Authorization header
@@ -894,8 +960,6 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
         # Challenge with 401
         nonce = _rand_hex(32)
         _nonces[nonce] = time.time()
-        # Determine realm from the SIP user
-        realm = _realm_from_sip_user(sip_user)
         challenge = (
             f'Digest realm="{realm}", '
             f'nonce="{nonce}", algorithm=MD5'
@@ -917,26 +981,24 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
         _send(resp, addr)
         return
 
-    # Look up subscriber by base_url extracted from SIP user
-    username, base_url = _split_sip_user(sip_user)
-    if not username or not base_url:
-        _LOGGER.warning("REGISTER: invalid SIP user format: %s", sip_user)
+    # Resolve subscriber
+    username, realm_resolved, subscriber = _resolve_sip_identity(to_uri)
+    if not username:
+        _LOGGER.warning("REGISTER: no username in %s", to_uri)
         resp = _build_response(403, "Forbidden", msg, to_tag=_gen_tag())
         _send(resp, addr)
         return
 
-    # Find subscriber for this base_url
-    subscriber = _find_subscriber_by_base_url(base_url)
     if not subscriber:
-        _LOGGER.warning("REGISTER: no subscriber for base_url %s", base_url)
+        _LOGGER.warning("REGISTER: no subscriber for %s", to_uri)
         resp = _build_response(403, "Forbidden", msg, to_tag=_gen_tag())
         _send(resp, addr)
         return
 
     # Call CRM to get HA1
     raw_sip_user = auth_params.get("username", sip_user)
-    realm = auth_params.get("realm", "")
-    ha1_info = _crm_login(subscriber, username, realm, raw_sip_user)
+    auth_realm = auth_params.get("realm", realm_resolved)
+    ha1_info = _crm_login(subscriber, username, auth_realm, raw_sip_user)
     if not ha1_info:
         resp = _build_response(403, "Forbidden", msg, to_tag=_gen_tag())
         _send(resp, addr)
@@ -955,10 +1017,9 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
         _send(resp, addr)
         return
 
-    # Clean up nonce
-    del _nonces[nonce]
+    # Keep nonce valid until it expires (SIP clients reuse it on re-REGISTER)
 
-    # Parse expiry — cap at 120s so clients re-register quickly after restart
+    # Parse expiry
     exp_header = _get_header(msg, "expires")
     expires = int(exp_header or "3600")
     if expires < 30:
@@ -993,28 +1054,46 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
     _send(resp, addr)
 
 
+def _split_sip_user_sep(sip_user: str) -> Tuple[str, str, str]:
+    """Split SIP username at the CRM separator (@ or :).
+
+    Supports two formats:
+      user@example.com/app   (percent-encoded %40 is decoded first)
+      user:example.com/app   (for SIP clients that reject @ in usernames)
+      user:example.com~app   (~ as / alternative for clients that reject /)
+
+    @ takes precedence so that %40-encoded users keep working.
+    Returns (username, rest, separator) or ("", "", "") if no separator found.
+    """
+    from urllib.parse import unquote
+    sip_user = unquote(sip_user)
+    for sep in ("@", ":"):
+        if sep in sip_user:
+            username, rest = sip_user.split(sep, 1)
+            rest = rest.replace("~", "/")
+            return (username, rest, sep)
+    return ("", "", "")
+
+
 def _realm_from_sip_user(sip_user: str) -> str:
     """Extract realm from SIP username.
 
-    SIP user format: username@baseurl-without-https
-    Realm = the baseurl-without-https part.
+    SIP user format: username@baseurl  or  username:baseurl
+    Realm = the baseurl part.
     """
-    if "@" in sip_user:
-        return sip_user.split("@", 1)[1]
-    return sip_user
+    _, rest, _ = _split_sip_user_sep(sip_user)
+    return rest if rest else sip_user
 
 
 def _split_sip_user(sip_user: str) -> Tuple[str, str]:
     """Split SIP username into (crm_username, base_url).
 
-    Input:  user@example.com/app  (or user%40example.com/app)
+    Input:  user@example.com/app  (or user%40example.com/app or user:example.com~app)
     Output: ("user", "https://example.com/app")
     """
-    from urllib.parse import unquote
-    sip_user = unquote(sip_user)
-    if "@" not in sip_user:
+    username, rest, _ = _split_sip_user_sep(sip_user)
+    if not username or not rest:
         return ("", "")
-    username, rest = sip_user.split("@", 1)
     base_url = f"https://{rest}"
     return (username, base_url)
 
@@ -1288,7 +1367,8 @@ def hangup_trunk_leg(sip_call_id: str) -> bool:
 
 def _get_registrations(sip_user: str) -> List[_Registration]:
     with _registrations_lock:
-        regs = _registrations.get(sip_user, {})
+        normalized = _normalize_sip_user(sip_user)
+        regs = _registrations.get(sip_user, {}) or _registrations.get(normalized, {})
         if not regs:
             return []
         now = time.time()
@@ -1378,6 +1458,9 @@ def _handle_registered_client_invite(
         _, base_url = _split_sip_user(source_user)
         if base_url:
             subscriber = _find_subscriber_by_base_url(base_url)
+    if not subscriber and "@" in source_user:
+        domain = source_user.split("@", 1)[1]
+        subscriber = sub_mod.find_by_sip_domain(domain)
     if not subscriber:
         _LOGGER.warning("Registered INVITE from %s: no subscriber found", source_user)
         resp = _build_response(403, "Forbidden", msg, to_tag=_gen_tag())
@@ -1406,7 +1489,7 @@ def _handle_registered_client_invite(
     negotiated_codec = codec_for_pt(remote_pt) or PCMU
     to_tag = _gen_tag()
     rtp_port = _find_free_port()
-    sdp = _build_sdp(_local_ip, rtp_port, codec=negotiated_codec)
+    sdp = _build_sdp(_sdp_ip_for_remote_sdp(remote_host), rtp_port)
 
     resp = _build_response(183, "Session Progress", msg, to_tag=to_tag, body=sdp)
     _send(resp, addr)
@@ -1817,7 +1900,7 @@ def _call_device_to_registration(sip_user: str, reg: dict) -> SIPCall:
         _calls[call_id] = call_obj
 
     # Build and send INVITE directly to device
-    sdp = _build_sdp(_local_ip, rtp_port)
+    sdp = _build_sdp(_sdp_ip_for_remote_sdp(device_host), rtp_port)
     branch = _gen_branch()
     call_obj._cseq = 1
     call_obj._via_branch = branch  # needed for CANCEL (must match INVITE branch)
@@ -1937,14 +2020,29 @@ def call_registered_user(sip_user: str) -> SIPCall:
     return master
 
 
+def _normalize_sip_user(sip_user: str) -> str:
+    """Normalize old-format SIP user to new user@sip_domain format.
+
+    milan.hradecky@launix.de/crm -> milan.hradecky@crm.launix.de
+    milan.hradecky@crm.launix.de -> milan.hradecky@crm.launix.de (unchanged)
+    """
+    from urllib.parse import unquote
+    decoded = unquote(sip_user)
+    username, base_url = _split_sip_user(decoded)
+    if username and base_url:
+        sip_domain = sub_mod.base_url_to_sip_domain(base_url)
+        return f"{username}@{sip_domain}"
+    return decoded
+
+
 def get_registrations(sip_user: str) -> List[dict]:
     """Look up all active registrations for a SIP username."""
     with _registrations_lock:
         from urllib.parse import unquote
-        needle = unquote(sip_user)
+        needle = _normalize_sip_user(sip_user)
         result: List[dict] = []
         for key, reg_map in list(_registrations.items()):
-            if unquote(key) != needle:
+            if _normalize_sip_user(key) != needle:
                 continue
             expired = [reg_key for reg_key, reg in reg_map.items() if reg.expires < time.time()]
             for reg_key in expired:
@@ -1975,10 +2073,16 @@ def is_local_sip_user(sip_user: str) -> bool:
     """Return True if the SIP identity belongs to a known CRM subscriber."""
     if _get_registrations(sip_user):
         return True
+    # Old format: encoded base_url in username
     _, base_url = _split_sip_user(sip_user)
-    if not base_url:
-        return False
-    return _find_subscriber_by_base_url(base_url) is not None
+    if base_url and _find_subscriber_by_base_url(base_url):
+        return True
+    # New format: user@sip_domain
+    if "@" in sip_user:
+        domain = sip_user.split("@", 1)[1]
+        if sub_mod.find_by_sip_domain(domain):
+            return True
+    return False
 
 
 def hangup(call_obj: SIPCall) -> None:

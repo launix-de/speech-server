@@ -136,22 +136,23 @@ class ConferenceMixer(Stage):
                 src = self._sources.pop(sid)
                 src.buffer.clear()
 
-    def add_participant(self, in_q: queue.Queue) -> tuple:
+    def add_participant(self, stage: Stage) -> tuple:
         """Add a full participant (input + auto-muted output).
+
+        *stage* is the upstream audio source (e.g. a ConferenceLeg that
+        wraps SIPSource).  The mixer's own pump thread drives the
+        generator — no external pump needed.
 
         Returns ``(src_id, sink_id, out_queue)``.  The output automatically
         subtracts this participant's own input (mix-minus).
         """
-        src_id = _next_id("src")
-        entry = _Source(id=src_id, queue=in_q, sink=None)
+        src_id = self.add_source(stage)
         sink_id = _next_id("out")
         out_q: queue.Queue = queue.Queue(maxsize=200)
         sink_entry = _Sink(id=sink_id, stage=None, queue=out_q,
                            source=None, mute_source=src_id, thread=None)
         with self._lock:
-            self._sources[src_id] = entry
             self._sinks.append(sink_entry)
-        self._has_sources.set()
         _LOGGER.info("ConferenceMixer '%s': +participant %s", self.name, src_id)
         return src_id, sink_id, out_q
 

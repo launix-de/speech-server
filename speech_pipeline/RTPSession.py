@@ -38,11 +38,14 @@ class RTPSession:
     """
 
     def __init__(self, local_port: int, remote_host: str, remote_port: int,
-                 codec: Optional[RTPCodec] = None) -> None:
+                 codec: Optional[RTPCodec] = None,
+                 dtls_role: Optional[str] = None) -> None:
         self.local_port = local_port
         self.remote_host = remote_host
         self.remote_port = remote_port
         self.codec = codec or PCMU
+        self._dtls_role = dtls_role  # None=plain RTP, "server"/"client"=DTLS-SRTP
+        self._dtls = None  # DtlsSrtpSession, set in start() if dtls_role
 
         self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -71,8 +74,29 @@ class RTPSession:
                       self.codec, "0.0.0.0", local_port, remote_host, remote_port)
 
     def start(self) -> None:
-        """Start RTP receive and transmit threads."""
+        """Start RTP receive and transmit threads.
+
+        If dtls_role is set, performs DTLS handshake first (blocking).
+        Falls back to plain RTP if handshake fails.
+        """
         self._running = True
+
+        # Optional DTLS-SRTP handshake
+        if self._dtls_role:
+            try:
+                from .dtls_srtp import DtlsSrtpSession
+                self._dtls = DtlsSrtpSession(
+                    self._sock,
+                    role=self._dtls_role,
+                    remote_addr=(self.remote_host, self.remote_port),
+                )
+                if not self._dtls.do_handshake(timeout=5.0):
+                    _LOGGER.warning("DTLS handshake failed, falling back to plain RTP")
+                    self._dtls = None
+            except Exception as exc:
+                _LOGGER.warning("DTLS init failed (%s), falling back to plain RTP", exc)
+                self._dtls = None
+
         self._rx_thread = threading.Thread(
             target=self._recv_loop, daemon=True, name="rtp-rx")
         self._rx_thread.start()
@@ -106,18 +130,11 @@ class RTPSession:
         return self.codec.decode(wire_data)
 
     def write_s16le(self, data: bytes) -> None:
-        """Encode s16le PCM to wire format and queue for TX."""
-        try:
-            self._tx_queue.put_nowait(self.codec.encode(data))
-        except queue.Full:
-            pass  # drop — real-time audio, don't build up delay
-
-    def write_wire(self, data: bytes) -> None:
-        """Queue pre-encoded wire bytes for TX (no encoding)."""
+        """Queue s16le PCM for encoding and TX."""
         try:
             self._tx_queue.put_nowait(data)
         except queue.Full:
-            pass  # drop — real-time audio
+            pass  # drop — real-time audio, don't build up delay
 
     # ----- Legacy pyVoIP-compat API (u8) -----
 
@@ -134,11 +151,10 @@ class RTPSession:
     def _tx_loop(self) -> None:
         """Send RTP packets with codec pacing.
 
-        Feeding bursts into the remote jitter buffer causes audible
-        lag and choppiness on SIP legs, so we transmit one codec frame
-        per frame duration.
+        Receives s16le PCM via _tx_queue, segments into codec frames,
+        encodes, and sends at real-time cadence.
         """
-        frame_bytes = self.codec.frame_bytes
+        pcm_frame_bytes = self.codec.frame_samples * 2  # s16le = 2 bytes/sample
         frame_duration = self.codec.frame_samples / float(self.codec.sample_rate)
         buf = b""
         next_send = time.monotonic()
@@ -158,21 +174,24 @@ class RTPSession:
             except queue.Empty:
                 pass
 
-            # Send complete frames at real-time cadence.
-            while len(buf) >= frame_bytes:
+            # Segment PCM into codec frames, encode, and send.
+            while len(buf) >= pcm_frame_bytes:
                 now = time.monotonic()
                 if next_send > now:
                     time.sleep(next_send - now)
                 elif now - next_send > frame_duration * 4:
-                    # After underruns, resume pacing from "now" instead
-                    # of trying to catch up with a burst.
                     next_send = now
-                packet = self._build_rtp_packet(buf[:frame_bytes])
-                buf = buf[frame_bytes:]
-                try:
-                    self._sock.sendto(packet, (self.remote_host, self.remote_port))
-                except Exception:
-                    pass
+                wire = self.codec.encode(buf[:pcm_frame_bytes])
+                buf = buf[pcm_frame_bytes:]
+                if wire:
+                    packet = self._build_rtp_packet(wire)
+                    # SRTP encrypt (if DTLS-SRTP is active)
+                    if self._dtls and self._dtls.encrypted:
+                        packet = self._dtls.protect(packet)
+                    try:
+                        self._sock.sendto(packet, (self.remote_host, self.remote_port))
+                    except Exception:
+                        pass
                 self._tx_seq = (self._tx_seq + 1) & 0xFFFF
                 self._tx_ts += self.codec.timestamp_step
                 next_send += frame_duration
@@ -195,6 +214,20 @@ class RTPSession:
                 continue
             except OSError:
                 break
+
+            if not data:
+                continue
+
+            # DTLS packets (content type 20-63) go to the handshake handler
+            if self._dtls and len(data) > 0 and 20 <= data[0] <= 63:
+                self._dtls.feed_dtls(data)
+                continue
+
+            # SRTP decrypt (if DTLS-SRTP is active)
+            if self._dtls and self._dtls.encrypted:
+                data = self._dtls.unprotect(data)
+                if data is None:
+                    continue  # decryption failed, drop
 
             if len(data) < RTP_HEADER_SIZE:
                 continue

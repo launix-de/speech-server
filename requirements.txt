@@ -16,6 +16,10 @@ faster-whisper>=1.0
 TTS>=0.22; python_version < "3.12"
 torch>=2.1; python_version < "3.12"
 
+# DTLS-SRTP media encryption
+pylibsrtp>=0.10
+pyOpenSSL>=23.0
+
 # Note:
 # - Install Piper (Python bindings) from your local sources (not from PyPI):
 #     pip install -e /home/carli/sources/piper

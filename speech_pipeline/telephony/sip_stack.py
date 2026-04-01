@@ -215,13 +215,24 @@ def _is_private_ip(ip: str) -> bool:
         return False
 
 
-def _build_sdp(ip: str, rtp_port: int, codec=None) -> str:
+def _build_sdp(ip: str, rtp_port: int, codec=None,
+               include_dtls: bool = True) -> str:
     from speech_pipeline.rtp_codec import CODEC_PREFERENCE
 
     session_id = str(random.randint(100000, 999999))
     codecs = [codec] if codec is not None else CODEC_PREFERENCE
     payloads = " ".join(str(c.payload_type) for c in codecs)
     rtpmap = "".join(c.sdp_rtpmap for c in codecs)
+
+    # DTLS-SRTP fingerprint (optional, always offered so clients can use it)
+    dtls_attrs = ""
+    if include_dtls:
+        try:
+            from speech_pipeline.dtls_srtp import sdp_attributes
+            dtls_attrs = sdp_attributes()
+        except Exception:
+            pass
+
     return (
         "v=0\r\n"
         f"o=tts-piper {session_id} {session_id} IN IP4 {ip}\r\n"
@@ -232,6 +243,7 @@ def _build_sdp(ip: str, rtp_port: int, codec=None) -> str:
         f"{rtpmap}"
         "a=rtpmap:101 telephone-event/8000\r\n"
         "a=fmtp:101 0-16\r\n"
+        f"{dtls_attrs}"
         "a=sendrecv\r\n"
     )
 
@@ -259,6 +271,22 @@ def _parse_sdp(sdp: str) -> Tuple[str, int, int]:
     host, port, remote_pts = _parse_sdp_offer(sdp)
     payload_type = negotiate_payload_type(remote_pts)
     return host, port, payload_type
+
+
+def _parse_sdp_dtls(sdp: str) -> Tuple[str, str]:
+    """Extract DTLS fingerprint and setup role from SDP.
+
+    Returns (fingerprint, setup) or ("", "") if not present.
+    """
+    fingerprint = ""
+    setup = ""
+    for line in sdp.splitlines():
+        line = line.strip()
+        if line.startswith("a=fingerprint:sha-256 "):
+            fingerprint = line[len("a=fingerprint:sha-256 "):]
+        elif line.startswith("a=setup:"):
+            setup = line[len("a=setup:"):]
+    return fingerprint, setup
 
 
 # ---------------------------------------------------------------------------
@@ -1506,7 +1534,11 @@ def _handle_registered_client_invite(
         "source_user": source_user,
     }
 
-    rtp = RTPSession(rtp_port, remote_host, remote_port, codec=negotiated_codec)
+    # Check if remote device offers DTLS-SRTP
+    remote_fp, _ = _parse_sdp_dtls(msg.get("body", ""))
+    dtls_role = "server" if remote_fp else None
+    rtp = RTPSession(rtp_port, remote_host, remote_port, codec=negotiated_codec,
+                     dtls_role=dtls_role)
     rtp.start()
     session = RTPCallSession(rtp)
 

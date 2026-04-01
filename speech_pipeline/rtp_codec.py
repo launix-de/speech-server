@@ -1,6 +1,6 @@
 """RTP codec abstraction — encode/decode between s16le PCM and wire format.
 
-Supported codecs: G.722, PCMU (G.711 µ-law), PCMA (G.711 A-law).
+Supported codecs: Opus, G.722, PCMU (G.711 µ-law), PCMA (G.711 A-law).
 
 Usage::
 
@@ -235,16 +235,93 @@ class _G722(RTPCodec):
             self._decoder_thread.join(timeout=1.0)
 
 
+class _Opus(RTPCodec):
+    """Opus wideband codec (48 kHz, RFC 7587).
+
+    At 48 kHz Opus matches the ConferenceMixer's native sample rate,
+    eliminating resampling entirely.  Variable bitrate encoding via PyAV.
+    """
+    __slots__ = RTPCodec.__slots__ + (
+        "_encoder",
+        "_decoder",
+        "_encode_lock",
+        "_decode_lock",
+    )
+
+    def __init__(self, runtime: bool = False) -> None:
+        # PT 111 is conventional for Opus in SIP (dynamic range).
+        # RTP clock is always 48000 (RFC 7587), mono but SDP says /2.
+        super().__init__("opus", 111, 48000, 48000, 960, 0, 0x00)
+        self._encoder = None
+        self._decoder = None
+        self._encode_lock = threading.Lock()
+        self._decode_lock = threading.Lock()
+        if runtime:
+            self._init_runtime()
+
+    @property
+    def sdp_rtpmap(self) -> str:
+        # RFC 7587: Opus MUST use "/2" channel count even for mono
+        return (f"a=rtpmap:{self.payload_type} opus/48000/2\r\n"
+                f"a=fmtp:{self.payload_type} useinbandfec=1;stereo=0;sprop-stereo=0\r\n")
+
+    def new_session_codec(self) -> RTPCodec:
+        return _Opus(runtime=True)
+
+    def _init_runtime(self) -> None:
+        if self._encoder is not None:
+            return
+        self._encoder = av.codec.CodecContext.create("libopus", "w")
+        self._encoder.sample_rate = 48000
+        self._encoder.layout = "mono"
+        self._encoder.format = "s16"
+        self._encoder.bit_rate = 32000
+
+        self._decoder = av.codec.CodecContext.create("libopus", "r")
+        self._decoder.sample_rate = 48000
+        self._decoder.layout = "mono"
+        self._decoder.format = "s16"
+
+    def encode(self, s16le: bytes) -> bytes:
+        self._init_runtime()
+        if not s16le:
+            return b""
+        frame = av.AudioFrame(format="s16", layout="mono",
+                              samples=len(s16le) // 2)
+        frame.sample_rate = 48000
+        frame.planes[0].update(s16le)
+        with self._encode_lock:
+            packets = self._encoder.encode(frame)
+        return b"".join(bytes(p) for p in packets)
+
+    def decode(self, wire: bytes) -> bytes:
+        self._init_runtime()
+        if not wire:
+            return b""
+        packet = av.Packet(wire)
+        with self._decode_lock:
+            frames = self._decoder.decode(packet)
+        if frames:
+            # Use to_ndarray() — planes[0] may contain stride padding
+            return b"".join(f.to_ndarray().tobytes() for f in frames)
+        return b"\x00" * (self.frame_samples * 2)
+
+    def close(self) -> None:
+        self._encoder = None
+        self._decoder = None
+
+
 # Module-level singletons
+Opus = _Opus()
 G722 = _G722()
 PCMU = _PCMU()
 PCMA = _PCMA()
 
-CODECS_BY_PT = {9: G722, 0: PCMU, 8: PCMA}
-CODECS_BY_NAME = {"G722": G722, "PCMU": PCMU, "PCMA": PCMA}
+CODECS_BY_PT = {111: Opus, 9: G722, 0: PCMU, 8: PCMA}
+CODECS_BY_NAME = {"opus": Opus, "G722": G722, "PCMU": PCMU, "PCMA": PCMA}
 
 # SDP offer preference order
-CODEC_PREFERENCE = [G722, PCMU, PCMA]
+CODEC_PREFERENCE = [Opus, G722, PCMU, PCMA]
 
 
 def codec_for_pt(pt: int) -> RTPCodec | None:

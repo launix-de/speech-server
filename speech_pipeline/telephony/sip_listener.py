@@ -303,7 +303,11 @@ def _handle_trunk_call(pbx_id: str, caller: str, callee: str,
 
     remote_host, remote_port, remote_pt = sip_stack._parse_sdp(sip_msg.get("body", ""))
     codec = codec_for_pt(remote_pt)
-    rtp = RTPSession(rtp_port, remote_host, remote_port, codec=codec)
+    # Check if remote offers DTLS-SRTP
+    remote_fp, remote_setup = sip_stack._parse_sdp_dtls(sip_msg.get("body", ""))
+    dtls_role = "server" if remote_fp else None  # we are answerer → server
+    rtp = RTPSession(rtp_port, remote_host, remote_port, codec=codec,
+                     dtls_role=dtls_role)
     rtp.start()
     session = RTPCallSession(rtp)
 

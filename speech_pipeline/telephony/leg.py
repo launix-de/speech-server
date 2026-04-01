@@ -1,10 +1,24 @@
 """SIP leg management using ConferenceMixer.
 
 A leg is a SIP channel. When bridged to a conference:
-- SIPSource → conf.add_source() (auto-resamples 8kHz u8 → 48kHz s16le)
-- conf.add_sink(SIPSink, mute_source=src_id) (auto-resamples 48kHz → 8kHz)
+- SIPSource → pipe() → ConferenceLeg → pipe() → SIPSink
+- All format conversion via pipe(). No manual AudioTee/MixMinus.
 
-All format conversion via pipe(). No manual AudioTee/MixMinus.
+WEBHOOK CONTRACT
+================
+The "completed" callback MUST fire exactly once for every leg that
+reaches "answered" or "in-progress" status, regardless of how the
+leg ends (remote BYE, API delete, call teardown).
+
+Rules:
+1. Every monitor thread fires the "completed" callback unconditionally
+   when the leg ends — even if ``delete_call`` already set status.
+2. The ``_callback_fired`` flag prevents duplicate delivery.
+3. ``hangup()`` NEVER fires callbacks — only monitors do.
+4. ``delete_leg()`` NEVER fires callbacks — only monitors do.
+5. If a leg is deleted before a monitor is started (e.g. ringing leg
+   that gets cancelled), the caller (API/originate) is responsible
+   for firing the appropriate callback (e.g. "failed").
 """
 from __future__ import annotations
 
@@ -35,6 +49,7 @@ class Leg:
         self.status = "ringing"
         self.voip_call = voip_call
         self.call_id: Optional[str] = None
+        self.caller_id: Optional[str] = None  # display name for remote party
         self.callbacks: Dict[str, str] = {}
         self.created_at = time.time()
         self.answered_at: Optional[float] = None
@@ -43,6 +58,7 @@ class Leg:
         self._sink_id: Optional[str] = None
         self._sip_session = None
         self._completion_monitor_started = False
+        self._callback_fired: Dict[str, bool] = {}  # event -> fired
 
     def to_dict(self) -> dict:
         return {
@@ -53,10 +69,12 @@ class Leg:
             "subscriber_id": self.subscriber_id,
             "status": self.status,
             "call_id": self.call_id,
+            "caller_id": self.caller_id,
             "created_at": self.created_at,
         }
 
     def hangup(self) -> None:
+        """Hang up the SIP leg. Does NOT fire any callbacks (see contract)."""
         # 1. Send SIP BYE FIRST (before closing sockets)
         sent_signaling = False
         if hasattr(self, '_sip_call') and self._sip_call:
@@ -120,6 +138,7 @@ def get_leg(leg_id: str) -> Optional[Leg]:
 
 
 def delete_leg(leg_id: str) -> bool:
+    """Remove leg from registry and hang up. Does NOT fire callbacks."""
     leg = _legs.pop(leg_id, None)
     if leg:
         leg.hangup()
@@ -158,7 +177,9 @@ def originate_only(leg: Leg, pbx_entry: dict) -> None:
     leg.answered_at = time.time()
     _fire_callback(leg, "answered")
 
-    # Monitor for remote hangup — fire completed callback + cleanup
+    # Monitor for end-of-call — fire "completed" callback when done.
+    # This monitor runs for legs that are NOT wired via pipe_executor
+    # (pipe_executor has its own monitor in _start_sip_monitors).
     def _monitor():
         while leg.status == "answered" or leg.status == "in-progress":
             ended = False
@@ -178,25 +199,29 @@ def originate_only(leg: Leg, pbx_entry: dict) -> None:
                 break
             time.sleep(0.5)
 
-        if leg.status != "completed":
-            leg.status = "completed"
-            duration = time.time() - leg.answered_at if leg.answered_at else 0
-            _fire_callback(leg, "completed", duration=duration)
-            _LOGGER.info("Leg %s ended (duration=%.1fs)", leg.leg_id, duration)
-            # Cleanup mixer sources/sinks
-            if leg._src_id and leg.call_id:
-                from . import call_state
-                call = call_state.get_call(leg.call_id)
-                if call:
-                    call.mixer.kill_source(leg._src_id)
-                    if leg._sink_id:
-                        call.mixer.remove_sink(leg._sink_id)
-            delete_leg(leg.leg_id)
+        # CONTRACT: always fire "completed" — _fire_callback deduplicates
+        leg.status = "completed"
+        duration = time.time() - leg.answered_at if leg.answered_at else 0
+        _fire_callback(leg, "completed", duration=duration)
+        _LOGGER.info("Leg %s ended (duration=%.1fs)", leg.leg_id, duration)
+        # Cleanup mixer sources/sinks
+        if leg._src_id and leg.call_id:
+            from . import call_state
+            call = call_state.get_call(leg.call_id)
+            if call:
+                call.mixer.kill_source(leg._src_id)
+                if leg._sink_id:
+                    call.mixer.remove_sink(leg._sink_id)
+        delete_leg(leg.leg_id)
 
     leg._completion_monitor_started = True
     threading.Thread(target=_monitor, daemon=True,
                      name=f"mon-{leg.leg_id}").start()
 
+
+# ---------------------------------------------------------------------------
+# SIP session helpers
+# ---------------------------------------------------------------------------
 
 def _create_sip_session(leg: Leg, pbx_entry: dict):
     """Create a SIP session — returns a session object with .call, .connected, .hungup.
@@ -210,7 +235,6 @@ def _create_sip_session(leg: Leg, pbx_entry: dict):
         raise RuntimeError("SIP stack not running")
 
     # CRM-local SIP identities route to registered devices.
-    # Generic user@host targets remain real external SIP calls via trunk.
     if "@" in leg.number:
         from urllib.parse import unquote
         sip_user = unquote(leg.number)
@@ -238,8 +262,9 @@ def _create_trunk_call_session(leg: Leg):
     """Originate via sip_stack trunk to PSTN."""
     from . import sip_stack
 
-    caller_id = leg.callbacks.get("caller_id", "")
-    _LOGGER.info("Originate %s via trunk on PBX %s (caller_id=%s)", leg.number, leg.pbx_id, caller_id or "default")
+    caller_id = leg.caller_id or leg.callbacks.get("caller_id", "")
+    _LOGGER.info("Originate %s via trunk on PBX %s (caller_id=%s)",
+                 leg.number, leg.pbx_id, caller_id or "default")
     sip_call = sip_stack.call(leg.pbx_id, leg.number, caller_id=caller_id)
     return _wait_and_setup_rtp(leg, sip_call)
 
@@ -270,7 +295,6 @@ def _wait_and_setup_rtp(leg: Leg, sip_call):
                  leg.number, sip_call.remote_rtp_host,
                  sip_call.remote_rtp_port, sip_call.local_rtp_port, codec)
 
-    # Create RTP media session + wrap as SIPSource/SIPSink-compatible session
     rtp = RTPSession(sip_call.local_rtp_port,
                      sip_call.remote_rtp_host, sip_call.remote_rtp_port,
                      codec=codec)
@@ -292,51 +316,34 @@ def _wait_and_setup_rtp(leg: Leg, sip_call):
     return session
 
 
-def _create_pyvoip_session(leg: Leg, pbx_entry: dict):
-    """Originate via pyVoIP (full SIP+RTP stack)."""
-    from speech_pipeline.SIPSession import SIPSession
-
-    _LOGGER.info("Originate %s via pyVoIP on PBX %s", leg.number, leg.pbx_id)
-    session = SIPSession(
-        target=leg.number,
-        server=pbx_entry.get("sip_proxy", "127.0.0.1"),
-        port=int(pbx_entry.get("sip_port", 5060)),
-        username=pbx_entry.get("sip_user", "piper"),
-        password=pbx_entry.get("sip_password", ""),
-    )
-    session.start()  # Blocks until registered + answered
-    return session
-
-
 # ---------------------------------------------------------------------------
-# Helpers
+# pyVoIP compat
 # ---------------------------------------------------------------------------
 
-class _CallSession:
-    """Adapter so SIPSource/SIPSink can use a raw pyVoIP call.
+class _PyVoIPCallSession:
+    """Wrap a pyVoIP Call so that SIPSource/SIPSink can treat it
+    identically to an RTPCallSession."""
 
-    Provides rx_queue (same as AudioSocketSession / RTPCallSession).
-    A pump thread reads from pyVoIP read_audio → rx_queue.
-    """
-
-    def __init__(self, voip_call):
-        import queue as _queue
-        self._call = voip_call
-        self.connected = threading.Event()
+    def __init__(self, call):
+        self._call = call
         self.hungup = threading.Event()
-        self.connected.set()
-        self.rx_queue: _queue.Queue = _queue.Queue(maxsize=10)
 
-        # Pump: pyVoIP read_audio (blocking) → rx_queue
+        import queue
+        self.rx_queue: queue.Queue = queue.Queue(maxsize=10)
+
+        self._rx_pump_running = True
+        import audioop
+
         def _rx_pump():
-            while not self.hungup.is_set():
+            while self._rx_pump_running:
                 try:
-                    frame = voip_call.read_audio(length=160, blocking=True)
-                    if frame:
+                    data = self._call.read_audio(160, blocking=True)
+                    if data and len(data) == 160:
+                        pcm = audioop.ulaw2lin(data, 2)
                         try:
-                            self.rx_queue.put_nowait(frame)
-                        except _queue.Full:
-                            pass  # drop — bounded delay
+                            self.rx_queue.put_nowait(pcm)
+                        except queue.Full:
+                            pass
                 except Exception as e:
                     if not self.hungup.is_set():
                         _LOGGER.warning("rx_pump error: %s", e)
@@ -351,6 +358,14 @@ class _CallSession:
 
 
 def _fire_callback(leg: Leg, event: str, **extra) -> list:
+    """Fire a webhook callback for a leg event. Deduplicates per event."""
+    # Exactly-once: skip if this event was already fired for this leg
+    if leg._callback_fired.get(event):
+        _LOGGER.debug("_fire_callback: %s already fired for leg %s, skipping",
+                      event, leg.leg_id)
+        return []
+    leg._callback_fired[event] = True
+
     from . import subscriber as sub_mod
 
     cb_path = leg.callbacks.get(event)
@@ -372,6 +387,7 @@ def _fire_callback(leg: Leg, event: str, **extra) -> list:
         "number": leg.number,
         "direction": leg.direction,
         "call_id": leg.call_id,
+        "caller_id": leg.caller_id,
         **extra,
     }
 

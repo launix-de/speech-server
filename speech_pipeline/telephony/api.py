@@ -546,6 +546,7 @@ def originate_leg():
                               call.subscriber_id)
     leg.callbacks = callbacks
     leg.call_id = call_id  # set early so delete_call can find ringing legs
+    leg.caller_id = body.get("caller_id")  # display name for remote party
 
     # Originate in background — fires ringing/answered/failed callbacks.
     # CRM bridges the leg via POST /pipes after receiving answered callback.

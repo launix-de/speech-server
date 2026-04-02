@@ -635,7 +635,8 @@ class CallPipeExecutor:
 
         def _monitor():
             self.call.mixer.wait_source(src_id)
-            url = sub["base_url"].rstrip("/") + "/" + callback_path.lstrip("/")
+            from . import _shared as _sh
+            url = _sh.subscriber_url(sub, callback_path)
             try:
                 import requests
                 requests.post(url, json={"call_id": self.call.call_id, "source": src_id},

@@ -311,14 +311,8 @@ def post_pipes(call_id: str):
     if not isinstance(pipes, list):
         return ("'pipes' must be a list\n", 400)
 
-    from .pipe_executor import CallPipeExecutor
-    if not hasattr(call, 'pipe_executor') or call.pipe_executor is None:
-        sub = subscriber.get(call.subscriber_id) if hasattr(call, 'subscriber_id') else None
-        from . import _shared
-        call.pipe_executor = CallPipeExecutor(
-            call, tts_registry=_shared.tts_registry, subscriber=sub)
-
-    results = call.pipe_executor.add_pipes(pipes)
+    from . import _shared
+    results = _shared.ensure_pipe_executor(call).add_pipes(pipes)
     return jsonify({"call_id": call_id, "results": results}), 202
 
 
@@ -471,13 +465,8 @@ def bridge_leg(leg_id: str):
         )
 
     # Bridge via pipe_executor (DSL: sip:LEG -> call:CALL -> sip:LEG)
-    from .pipe_executor import CallPipeExecutor
-    if not hasattr(call, 'pipe_executor') or call.pipe_executor is None:
-        sub = subscriber.get(call.subscriber_id) if hasattr(call, 'subscriber_id') else None
-        from . import _shared
-        call.pipe_executor = CallPipeExecutor(
-            call, tts_registry=_shared.tts_registry, subscriber=sub)
-    call.pipe_executor.add_pipes([
+    from . import _shared
+    _shared.ensure_pipe_executor(call).add_pipes([
         f"sip:{leg_id} -> call:{call.call_id} -> sip:{leg_id}"
     ])
     return jsonify({"call_id": call.call_id, "leg_id": leg_id}), 200

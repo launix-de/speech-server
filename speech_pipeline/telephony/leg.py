@@ -380,7 +380,8 @@ def fire_callback(leg: Leg, event: str, **extra) -> list:
                         leg.subscriber_id, event)
         return []
 
-    url = sub["base_url"].rstrip("/") + "/" + cb_path.lstrip("/")
+    from . import _shared
+    url = _shared.subscriber_url(sub, cb_path)
     payload = {
         "leg_id": leg.leg_id,
         "event": event,
@@ -391,15 +392,6 @@ def fire_callback(leg: Leg, event: str, **extra) -> list:
         **extra,
     }
 
-    def _send():
-        try:
-            resp = http_requests.post(url, json=payload, headers={
-                "Authorization": f"Bearer {sub['bearer_token']}",
-            }, timeout=10)
-            _LOGGER.info("Leg callback %s → %d", event, resp.status_code)
-        except Exception as e:
-            _LOGGER.warning("Leg callback %s → %s failed: %s", event, url, e)
-
     _LOGGER.info("Leg callback %s → %s", event, url)
-    threading.Thread(target=_send, daemon=True).start()
+    _shared.post_webhook(url, payload, sub["bearer_token"])
     return []

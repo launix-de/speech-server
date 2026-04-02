@@ -241,13 +241,7 @@ def _cmd_transfer(call: call_state.Call, cmd: dict) -> None:
             except: pass
         call.unregister_participant(pid)
         # Re-bridge to target call via pipe_executor
-        from .pipe_executor import CallPipeExecutor
-        if not hasattr(target_call, 'pipe_executor') or not target_call.pipe_executor:
-            from . import _shared, subscriber
-            sub = subscriber.get(target_call.subscriber_id) if hasattr(target_call, 'subscriber_id') else None
-            target_call.pipe_executor = CallPipeExecutor(
-                target_call, tts_registry=_shared.tts_registry, subscriber=sub)
-        target_call.pipe_executor.add_pipes([
+        _shared.ensure_pipe_executor(target_call).add_pipes([
             f"sip:{pid} -> call:{target_call_id} -> sip:{pid}"
         ])
         _LOGGER.info("Transferred leg %s from %s to %s",
@@ -337,8 +331,8 @@ def _cmd_stt_start(call: call_state.Call, cmd: dict) -> None:
 
     sub = subscriber.get(call.subscriber_id)
     bearer = sub["bearer_token"] if sub else ""
-    webhook_url = (sub["base_url"].rstrip("/") + "/" + callback.lstrip("/")
-                   if sub else callback)
+    from . import _shared
+    webhook_url = (_shared.subscriber_url(sub, callback) if sub else callback)
 
     pid = "stt-" + secrets.token_urlsafe(8)
     call.stt_pipeline_id = pid
@@ -423,7 +417,7 @@ def _send_callback(call: call_state.Call, callback_path: Optional[str],
     if not sub:
         return []
 
-    url = sub["base_url"].rstrip("/") + "/" + callback_path.lstrip("/")
+    url = _shared.subscriber_url(sub, callback_path)
     payload = {
         "callId": call.call_id,
         "command": command,

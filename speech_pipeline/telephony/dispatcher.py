@@ -41,7 +41,8 @@ def fire_subscriber_event(sub: dict, event_key: str, payload: dict) -> list:
         return []
     method, path = resolved
 
-    url = sub["base_url"].rstrip("/") + "/" + path.lstrip("/")
+    from . import _shared
+    url = _shared.subscriber_url(sub, path)
     event_payload = {"event": event_key, **payload}
 
     def _send() -> None:

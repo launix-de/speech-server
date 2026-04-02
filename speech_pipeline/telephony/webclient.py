@@ -142,19 +142,10 @@ def _send_callback(subscriber_id: str, callback_path: str, payload: dict) -> Non
     sub = subscriber.get(subscriber_id)
     if not sub:
         return
-    url = sub["base_url"].rstrip("/") + "/" + callback_path.lstrip("/")
+    from . import _shared
+    url = _shared.subscriber_url(sub, callback_path)
 
-    def _send():
-        try:
-            resp = http_requests.post(url, json=payload, headers={
-                "Authorization": f"Bearer {sub['bearer_token']}",
-            }, timeout=10)
-            _LOGGER.info("WebClient callback %s → %d", callback_path, resp.status_code)
-        except Exception as e:
-            _LOGGER.warning("WebClient callback %s failed: %s", callback_path, e)
-
-    import threading
-    threading.Thread(target=_send, daemon=True, name="wc-callback").start()
+    _shared.post_webhook(url, payload, sub["bearer_token"])
 
 
 def get_webclient_session(session_id: str) -> Optional[dict]:

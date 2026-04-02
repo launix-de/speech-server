@@ -56,8 +56,8 @@ class Leg:
 
         self._src_id: Optional[str] = None
         self._sink_id: Optional[str] = None
-        self._sip_session = None
-        self._completion_monitor_started = False
+        self.sip_session = None
+        self.completion_monitor_started = False
         self._callback_fired: Dict[str, bool] = {}  # event -> fired
 
     def to_dict(self) -> dict:
@@ -77,17 +77,17 @@ class Leg:
         """Hang up the SIP leg. Does NOT fire any callbacks (see contract)."""
         # 1. Send SIP BYE FIRST (before closing sockets)
         sent_signaling = False
-        if hasattr(self, '_sip_call') and self._sip_call:
+        if hasattr(self, 'sip_call') and self.sip_call:
             try:
                 from . import sip_stack
-                sip_stack.hangup(self._sip_call)
+                sip_stack.hangup(self.sip_call)
                 sent_signaling = True
             except Exception:
                 pass
-        elif hasattr(self, '_sip_call_id') and self._sip_call_id:
+        elif hasattr(self, '_sip_call_id') and self.sip_call_id:
             try:
                 from . import sip_stack
-                sent_signaling = sip_stack.hangup_trunk_leg(self._sip_call_id)
+                sent_signaling = sip_stack.hangup_trunk_leg(self.sip_call_id)
             except Exception:
                 pass
         if self.voip_call:
@@ -96,15 +96,15 @@ class Leg:
                     self.voip_call.hangup()
             except Exception:
                 pass
-        if self._sip_session:
+        if self.sip_session:
             try:
-                self._sip_session.hangup()
+                self.sip_session.hangup()
             except Exception:
                 pass
         # 2. Stop RTP
-        if hasattr(self, '_rtp_session') and self._rtp_session:
+        if hasattr(self, 'rtp_session') and self.rtp_session:
             try:
-                self._rtp_session.stop()
+                self.rtp_session.stop()
             except Exception:
                 pass
         # 3. Remove from mixer
@@ -172,7 +172,7 @@ def originate_only(leg: Leg, pbx_entry: dict) -> None:
 
     # Store session on leg so pipe_executor can use it later
     leg.voip_call = session.call
-    leg._sip_session = session
+    leg.sip_session = session
     leg.status = "answered"
     leg.answered_at = time.time()
     _fire_callback(leg, "answered")
@@ -190,8 +190,8 @@ def originate_only(leg: Leg, pbx_entry: dict) -> None:
                         ended = True
                 except Exception:
                     pass
-            if hasattr(leg, '_sip_call') and leg._sip_call:
-                if leg._sip_call.state == "ended":
+            if hasattr(leg, 'sip_call') and leg.sip_call:
+                if leg.sip_call.state == "ended":
                     ended = True
             if session.hungup.is_set():
                 ended = True
@@ -214,7 +214,7 @@ def originate_only(leg: Leg, pbx_entry: dict) -> None:
                     call.mixer.remove_sink(leg._sink_id)
         delete_leg(leg.leg_id)
 
-    leg._completion_monitor_started = True
+    leg.completion_monitor_started = True
     threading.Thread(target=_monitor, daemon=True,
                      name=f"mon-{leg.leg_id}").start()
 
@@ -231,7 +231,7 @@ def _create_sip_session(leg: Leg, pbx_entry: dict):
     """
     from . import sip_stack
 
-    if not sip_stack._running:
+    if not sip_stack.is_running():
         raise RuntimeError("SIP stack not running")
 
     # CRM-local SIP identities route to registered devices.
@@ -275,7 +275,7 @@ def _wait_and_setup_rtp(leg: Leg, sip_call):
     from speech_pipeline.RTPSession import RTPSession, RTPCallSession
     from speech_pipeline.rtp_codec import codec_for_pt, PCMU
 
-    leg._sip_call = sip_call  # set IMMEDIATELY so hangup() can CANCEL during ringing
+    leg.sip_call = sip_call  # set IMMEDIATELY so hangup() can CANCEL during ringing
 
     # Wait for answer (up to 30s)
     deadline = time.time() + 30
@@ -300,8 +300,8 @@ def _wait_and_setup_rtp(leg: Leg, sip_call):
                      codec=codec)
     rtp.start()
     session = RTPCallSession(rtp)
-    leg._sip_call = sip_call
-    leg._rtp_session = rtp
+    leg.sip_call = sip_call
+    leg.rtp_session = rtp
 
     # Monitor sip_stack call state → set hungup when ended
     def _monitor():
@@ -320,7 +320,7 @@ def _wait_and_setup_rtp(leg: Leg, sip_call):
 # pyVoIP compat
 # ---------------------------------------------------------------------------
 
-class _PyVoIPCallSession:
+class PyVoIPCallSession:
     """Wrap a pyVoIP Call so that SIPSource/SIPSink can treat it
     identically to an RTPCallSession."""
 
@@ -357,7 +357,7 @@ class _PyVoIPCallSession:
         return self._call
 
 
-def _fire_callback(leg: Leg, event: str, **extra) -> list:
+def fire_callback(leg: Leg, event: str, **extra) -> list:
     """Fire a webhook callback for a leg event. Deduplicates per event."""
     # Exactly-once: skip if this event was already fired for this leg
     if leg._callback_fired.get(event):

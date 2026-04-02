@@ -179,10 +179,8 @@ def _cmd_stop_play(call: call_state.Call, cmd: dict) -> None:
 def _cmd_stop_play_all(call: call_state.Call, cmd: dict) -> None:
     """Stop ALL playing sources — both commands-based and pipe-executor-based."""
     # Stop commands-based plays (registered as participants with _stop event)
-    with call._lock:
-        plays = [(pid, p) for pid, p in call._participants.items()
-                 if p.get("type") == "play"]
-    for pid, p in plays:
+    plays = call.list_participants(type_filter="play")
+    for p in plays:
         if p.get("_stop"):
             p["_stop"].set()
         if p.get("_current_src"):
@@ -238,8 +236,8 @@ def _cmd_transfer(call: call_state.Call, cmd: dict) -> None:
     # For SIP legs: cancel current pipeline, re-bridge to target via pipes
     leg = leg_mod.get_leg(pid)
     if leg:
-        if hasattr(leg, '_conf_leg') and leg._conf_leg:
-            try: leg._conf_leg.cancel()
+        if hasattr(leg, 'conf_leg') and leg.conf_leg:
+            try: leg.conf_leg.cancel()
             except: pass
         call.unregister_participant(pid)
         # Re-bridge to target call via pipe_executor

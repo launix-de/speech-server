@@ -35,7 +35,7 @@ def put(pbx_id: str, data: dict) -> dict:
     if entry["sip_proxy"] and entry["sip_user"]:
         try:
             from . import sip_stack
-            if sip_stack._running:
+            if sip_stack.is_running():
                 sip_stack.register_trunk(
                     pbx_id,
                     server=entry["sip_proxy"],

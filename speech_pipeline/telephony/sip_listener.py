@@ -258,7 +258,7 @@ def _monitor_hangup(leg, voip_call) -> None:
     cb_path = leg.callbacks.get("completed")
     if cb_path:
         from . import leg as leg_mod
-        leg_mod._fire_callback(leg, "completed")
+        leg_mod.fire_callback(leg, "completed")
 
     # Fire call_ended event to subscriber
     if leg.call_id:
@@ -276,7 +276,7 @@ def _handle_trunk_call(pbx_id: str, caller: str, callee: str,
     """Handle incoming call from trunk via built-in SIP stack (no pyVoIP)."""
     from . import sip_stack
 
-    sip_call_id = sip_stack._get_header(sip_msg, "call-id")
+    sip_call_id = sip_stack.get_header(sip_msg, "call-id")
     if sip_call_id and not _claim_inbound_dialog(pbx_id, sip_call_id):
         _LOGGER.info("Ignoring duplicate inbound trunk callback on %s (call-id=%s)",
                      pbx_id, sip_call_id)
@@ -301,10 +301,10 @@ def _handle_trunk_call(pbx_id: str, caller: str, callee: str,
     from speech_pipeline.RTPSession import RTPSession, RTPCallSession
     from speech_pipeline.rtp_codec import codec_for_pt
 
-    remote_host, remote_port, remote_pt = sip_stack._parse_sdp(sip_msg.get("body", ""))
+    remote_host, remote_port, remote_pt = sip_stack.parse_sdp(sip_msg.get("body", ""))
     codec = codec_for_pt(remote_pt)
     # Check if remote offers DTLS-SRTP
-    remote_fp, remote_setup = sip_stack._parse_sdp_dtls(sip_msg.get("body", ""))
+    remote_fp, remote_setup = sip_stack.parse_sdp_dtls(sip_msg.get("body", ""))
     dtls_role = "server" if remote_fp else None  # we are answerer → server
     rtp = RTPSession(rtp_port, remote_host, remote_port, codec=codec,
                      dtls_role=dtls_role)
@@ -320,17 +320,17 @@ def _handle_trunk_call(pbx_id: str, caller: str, callee: str,
         voip_call=rtp,  # RTPSession mimics pyVoIP call interface
     )
     leg.status = "ringing"
-    leg._sip_msg = sip_msg
-    leg._sip_addr = addr
-    leg._rtp_port = rtp_port
-    leg._rtp_session = rtp
-    leg._sip_session = session  # so pipe_executor uses RTPCallSession directly
+    leg.sip_msg = sip_msg
+    leg.sip_addr = addr
+    leg.rtp_port = rtp_port
+    leg.rtp_session = rtp
+    leg.sip_session = session  # so pipe_executor uses RTPCallSession directly
     # Store SIP Call-ID for deferred answer (Early Media → 200 OK)
-    leg._sip_call_id = sip_stack._get_header(sip_msg, "call-id")
-    if leg._sip_call_id in sip_stack._trunk_dialogs:
-        sip_stack._trunk_dialogs[leg._sip_call_id]["session"] = session
-        sip_stack._trunk_dialogs[leg._sip_call_id]["rtp_session"] = rtp
-        sip_stack._trunk_dialogs[leg._sip_call_id]["leg_id"] = leg.leg_id
+    leg.sip_call_id = sip_stack.get_header(sip_msg, "call-id")
+    if leg.sip_call_id in sip_stack.trunk_dialogs:
+        sip_stack.trunk_dialogs[leg.sip_call_id]["session"] = session
+        sip_stack.trunk_dialogs[leg.sip_call_id]["rtp_session"] = rtp
+        sip_stack.trunk_dialogs[leg.sip_call_id]["leg_id"] = leg.leg_id
 
     # Fire incoming event asynchronously
     threading.Thread(

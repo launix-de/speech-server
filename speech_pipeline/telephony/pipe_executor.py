@@ -412,7 +412,7 @@ class CallPipeExecutor:
             self._sessions[f"_leg:{leg_id}"] = leg
             return self._sessions[session_key]
 
-        session = getattr(leg, '_sip_session', None) or leg_mod._CallSession(leg.voip_call)
+        session = getattr(leg, 'sip_session', None) or leg_mod.PyVoIPCallSession(leg.voip_call)
         self._sessions[session_key] = session
         self._sessions[f"_leg:{leg_id}"] = leg
         return session
@@ -527,12 +527,12 @@ class CallPipeExecutor:
             return
 
         def _on_attached(conf):
-            leg._conf_leg = conf
+            leg.conf_leg = conf
             leg._src_id = getattr(conf, "_src_id", None)
 
         def _on_detached(conf):
             if getattr(leg, "_conf_leg", None) is conf:
-                leg._conf_leg = None
+                leg.conf_leg = None
                 leg._src_id = None
 
         conf_leg.on_attached = _on_attached
@@ -659,7 +659,7 @@ class CallPipeExecutor:
                 try:
                     d = leg.voip_call.get_dtmf(length=1)
                     if d:
-                        leg_mod._fire_callback(leg, "dtmf", digit=d,
+                        leg_mod.fire_callback(leg, "dtmf", digit=d,
                                                call_id=self.call.call_id)
                 except Exception:
                     time.sleep(0.1)
@@ -679,8 +679,8 @@ class CallPipeExecutor:
                             ended = True
                     except Exception:
                         pass
-                if hasattr(leg, '_sip_call') and leg._sip_call:
-                    if leg._sip_call.state == "ended":
+                if hasattr(leg, 'sip_call') and leg.sip_call:
+                    if leg.sip_call.state == "ended":
                         ended = True
                 if session.hungup.is_set():
                     ended = True
@@ -689,14 +689,14 @@ class CallPipeExecutor:
                 time.sleep(0.5)
             leg.status = "completed"
             dur = time.time() - leg.answered_at if leg.answered_at else 0
-            if hasattr(leg, '_conf_leg') and leg._conf_leg:
-                try: leg._conf_leg.cancel()
+            if hasattr(leg, 'conf_leg') and leg.conf_leg:
+                try: leg.conf_leg.cancel()
                 except: pass
             self.call.unregister_participant(leg.leg_id)
-            leg_mod._fire_callback(leg, "completed", duration=dur)
+            leg_mod.fire_callback(leg, "completed", duration=dur)
             _LOGGER.info("Leg %s ended (%.1fs)", leg_id, dur)
             leg_mod.delete_leg(leg_id)
-        leg._completion_monitor_started = True
+        leg.completion_monitor_started = True
         threading.Thread(target=_monitor, daemon=True, name=f"mon-{leg_id}").start()
 
         _LOGGER.info("SIP leg %s wired", leg_id)

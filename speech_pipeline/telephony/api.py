@@ -357,7 +357,7 @@ def delete_call(call_id: str):
     for leg in all_legs:
         _LOGGER.info("  leg %s: call_id=%s status=%s has_sip_call=%s",
                      leg.leg_id, leg.call_id, leg.status,
-                     hasattr(leg, '_sip_call') and leg._sip_call is not None)
+                     hasattr(leg, 'sip_call') and leg.sip_call is not None)
         if leg.call_id == call_id and leg.status != "completed":
             _LOGGER.info("  -> deleting leg %s", leg.leg_id)
             leg.status = "completed"

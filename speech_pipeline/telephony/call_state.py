@@ -81,10 +81,14 @@ class Call:
         with self._lock:
             return self._participants.get(pid)
 
-    def list_participants(self) -> List[dict]:
+    def list_participants(self, type_filter: str = None) -> List[dict]:
         with self._lock:
-            return [{"id": k, **{kk: vv for kk, vv in v.items() if not kk.startswith("_")}}
-                    for k, v in self._participants.items()]
+            result = []
+            for k, v in self._participants.items():
+                if type_filter and v.get("type") != type_filter:
+                    continue
+                result.append({"id": k, **v})
+            return result
 
     def end(self) -> None:
         self.mixer.cancel()

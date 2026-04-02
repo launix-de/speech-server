@@ -1552,12 +1552,12 @@ def _handle_registered_client_invite(
         voip_call=rtp,
     )
     leg.status = "ringing"
-    leg._sip_msg = msg
-    leg._sip_addr = addr
-    leg._rtp_port = rtp_port
-    leg._rtp_session = rtp
-    leg._sip_session = session
-    leg._sip_call_id = call_id
+    leg.sip_msg = msg
+    leg.sip_addr = addr
+    leg.rtp_port = rtp_port
+    leg.rtp_session = rtp
+    leg.sip_session = session
+    leg.sip_call_id = call_id
 
     _trunk_dialogs[call_id]["session"] = session
     _trunk_dialogs[call_id]["rtp_session"] = rtp
@@ -1748,6 +1748,19 @@ def _cleanup_loop() -> None:
 # ===========================================================================
 # Public API
 # ===========================================================================
+
+# Public aliases for functions used by other telephony modules.
+# The underscore-prefixed originals remain for internal use within this file.
+get_header = _get_header
+parse_sdp = _parse_sdp
+parse_sdp_offer = _parse_sdp_offer
+parse_sdp_dtls = _parse_sdp_dtls
+trunk_dialogs = _trunk_dialogs
+
+
+def is_running() -> bool:
+    """Check if the SIP stack is started."""
+    return _running
 
 
 def init(sip_port: int) -> None:

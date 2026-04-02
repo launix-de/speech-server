@@ -20,5 +20,11 @@ all = ["speech-pipeline[tts,stt,vc,sip,server]"]
 [tool.setuptools.packages.find]
 include = ["speech_pipeline*"]
 
+[project.optional-dependencies.test]
+pytest = ["pytest>=7.0"]
+
 [project.scripts]
 speech-pipeline = "speech_pipeline.cli:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

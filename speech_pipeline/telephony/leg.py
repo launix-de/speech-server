@@ -159,14 +159,14 @@ def originate_only(leg: Leg, pbx_entry: dict) -> None:
     after receiving the 'answered' callback. This keeps originate
     non-blocking and DSL-compatible.
     """
-    _fire_callback(leg, "ringing")
+    fire_callback(leg, "ringing")
 
     try:
         session = _create_sip_session(leg, pbx_entry)
     except Exception as e:
         _LOGGER.warning("Originate %s failed: %s", leg.number, e)
         leg.status = "failed"
-        _fire_callback(leg, "failed", error=str(e))
+        fire_callback(leg, "failed", error=str(e))
         delete_leg(leg.leg_id)
         return
 
@@ -175,7 +175,7 @@ def originate_only(leg: Leg, pbx_entry: dict) -> None:
     leg.sip_session = session
     leg.status = "answered"
     leg.answered_at = time.time()
-    _fire_callback(leg, "answered")
+    fire_callback(leg, "answered")
 
     # Monitor for end-of-call — fire "completed" callback when done.
     # This monitor runs for legs that are NOT wired via pipe_executor
@@ -202,7 +202,7 @@ def originate_only(leg: Leg, pbx_entry: dict) -> None:
         # CONTRACT: always fire "completed" — _fire_callback deduplicates
         leg.status = "completed"
         duration = time.time() - leg.answered_at if leg.answered_at else 0
-        _fire_callback(leg, "completed", duration=duration)
+        fire_callback(leg, "completed", duration=duration)
         _LOGGER.info("Leg %s ended (duration=%.1fs)", leg.leg_id, duration)
         # Cleanup mixer sources/sinks
         if leg._src_id and leg.call_id:

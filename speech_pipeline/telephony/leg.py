@@ -84,7 +84,7 @@ class Leg:
                 sent_signaling = True
             except Exception:
                 pass
-        elif hasattr(self, '_sip_call_id') and self.sip_call_id:
+        elif hasattr(self, 'sip_call_id') and self.sip_call_id:
             try:
                 from . import sip_stack
                 sent_signaling = sip_stack.hangup_trunk_leg(self.sip_call_id)
@@ -353,6 +353,15 @@ class PyVoIPCallSession:
 
         threading.Thread(target=_rx_pump, daemon=True,
                          name="pyvoip-rx").start()
+
+    def hangup(self):
+        """Stop the rx pump and signal hangup."""
+        self._rx_pump_running = False
+        self.hungup.set()
+        try:
+            self._call.hangup()
+        except Exception:
+            pass
 
     @property
     def call(self):

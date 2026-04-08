@@ -70,7 +70,7 @@ class VCConverter(Stage):
             return self.target_ref
         if isinstance(self.target_ref, str):
             # Accept direct URL or file path string
-            kind, value = FileFetcher.classify(self.target_ref)
+            kind, value = FileFetcher._classify(self.target_ref)
             if kind == 'http':
                 tmp = FileFetcher(value, bearer=self._bearer).to_local_tmp()
                 if tmp:

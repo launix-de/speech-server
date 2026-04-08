@@ -666,7 +666,7 @@ class CallPipeExecutor:
                     time.sleep(0.1)
         threading.Thread(target=_dtmf, daemon=True, name=f"dtmf-{leg_id}").start()
 
-        if getattr(leg, "_completion_monitor_started", False):
+        if getattr(leg, "completion_monitor_started", False):
             _LOGGER.info("SIP leg %s wired", leg_id)
             return
 

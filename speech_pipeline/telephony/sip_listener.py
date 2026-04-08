@@ -212,7 +212,7 @@ def _wait_for_bridge(leg, voip_call) -> None:
     while time.time() < deadline:
         if leg.call_id:
             return  # bridged via API
-        session = getattr(leg, "_sip_session", None)
+        session = getattr(leg, "sip_session", None)
         if session is not None and hasattr(session, "hungup") and session.hungup.is_set():
             leg.status = "completed"
             leg_mod.delete_leg(leg.leg_id)

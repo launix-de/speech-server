@@ -326,6 +326,8 @@ class PyVoIPCallSession:
 
     def __init__(self, call):
         self._call = call
+        self.connected = threading.Event()
+        self.connected.set()  # pyVoIP calls are already connected
         self.hungup = threading.Event()
 
         import queue

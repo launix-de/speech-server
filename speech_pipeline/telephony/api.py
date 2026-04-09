@@ -23,6 +23,7 @@ Account-scoped (account token **or** admin):
 - ``GET    /api/calls``               – list own calls
 - ``GET    /api/calls/<call_id>``     – get call details
 - ``POST   /api/calls/<call_id>/commands`` – send commands to a call
+- ``DELETE /api/calls/<call_id>/stages/<stage_id>`` – kill a named stage
 - ``DELETE /api/calls/<call_id>``     – end a call
 - ``POST   /api/nonce``               – create webclient nonce
 - ``GET    /api/nonces``              – list own nonces
@@ -290,30 +291,6 @@ def post_commands(call_id: str):
     _LOGGER.info("Executing %d commands for call %s (background)", len(commands), call_id)
 
     return jsonify({"queued": len(commands), "call_id": call_id}), 202
-
-
-@api.route("/calls/<call_id>/pipes", methods=["POST"])
-@auth.require_account
-def post_pipes(call_id: str):
-    """Execute DSL pipes on a call.
-
-    Body: {"pipes": ["sip:leg-abc -> call:xyz -> sip:leg-abc", ...]}
-    """
-    call = call_state.get_call(call_id)
-    if not call:
-        return ("Call not found\n", 404)
-    aid = _account_id()
-    if aid and call.account_id != aid:
-        return ("Forbidden\n", 403)
-
-    body = _body()
-    pipes = body.get("pipes", [])
-    if not isinstance(pipes, list):
-        return ("'pipes' must be a list\n", 400)
-
-    from . import _shared
-    results = _shared.ensure_pipe_executor(call).add_pipes(pipes)
-    return jsonify({"call_id": call_id, "results": results}), 202
 
 
 @api.route("/calls/<call_id>/stages/<stage_id>", methods=["DELETE"])

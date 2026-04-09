@@ -87,6 +87,9 @@ def app():
     from speech_pipeline.telephony.api import api as telephony_bp
     app.register_blueprint(telephony_bp)
 
+    from speech_pipeline.pipeline_api import api as pipeline_bp
+    app.register_blueprint(pipeline_bp)
+
     import speech_pipeline.telephony._shared as _shared
     _shared.flask_app = app
 
@@ -111,6 +114,13 @@ def app():
     subscriber._did_map.clear()
     subscriber._sip_domain_map.clear()
     pbx._pbx_list.clear()
+    from speech_pipeline import live_pipeline
+    for pid in list(live_pipeline._pipelines.keys()):
+        try:
+            live_pipeline._pipelines[pid].cancel()
+        except Exception:
+            pass
+    live_pipeline._pipelines.clear()
 
 
 @pytest.fixture

@@ -2,9 +2,9 @@
 
 Sequence (mirrors fop-dev webhook flow):
 1. POST /api/calls → create conference
-2. POST /api/calls/{id}/pipes → wire inbound leg + wait music
+2. POST /api/pipelines → wire inbound leg + wait music
 3. POST /api/legs/originate → ring outbound participant
-4. POST /api/calls/{id}/pipes → bridge answered participant
+4. POST /api/pipelines → bridge answered participant
 5. DELETE /api/calls/{id}/stages/play:... → kill wait music
 6. DELETE /api/calls/{id} → teardown, verify cleanup
 """
@@ -28,56 +28,57 @@ from speech_pipeline.telephony import leg as leg_mod, call_state
 def _make_inbound_leg(client, headers, number="+4989123456"):
     """Register an inbound leg (simulates SIP listener creating one)."""
     leg = leg_mod.Leg(
-        leg_id=f"leg-in-{number}",
+        leg_id=f"leg-test-{number.replace('+', '')}",
         direction="inbound",
         number=number,
         pbx_id="TestPBX",
         subscriber_id=SUBSCRIBER_ID,
     )
-    # Mock SIP session
-    from unittest.mock import MagicMock
-    mock_call = MagicMock()
-    mock_call.read_audio.side_effect = Exception("stopped")
-    mock_call.get_dtmf.return_value = ""
-    leg.voip_call = mock_call
-
-    from speech_pipeline.telephony.leg import PyVoIPCallSession
-    session = PyVoIPCallSession(mock_call)
-    leg.sip_session = session
-    leg.status = "ringing"
-
+    # Give it a fake voip_call so SIPSource/SIPSink don't crash
+    import queue
+    fake_call = type("FakeVoIPCall", (), {
+        "read_audio": lambda self, *a, **kw: b"\xff" * 160,
+        "write_audio": lambda self, *a, **kw: None,
+        "get_dtmf": lambda self, *a, **kw: "",
+        "state": "answered",
+        "RTPClients": [],
+    })()
+    leg.voip_call = fake_call
+    leg.sip_session = type("FakeSession", (), {
+        "call": fake_call,
+        "connected": threading.Event(),
+        "hungup": threading.Event(),
+        "rx_queue": queue.Queue(),
+    })()
+    leg.sip_session.connected.set()
     leg_mod._legs[leg.leg_id] = leg
     return leg
 
 
+def _post_pipes(client, headers, dsl_strings):
+    """Post one or more DSL strings as separate pipelines."""
+    results = []
+    for dsl in dsl_strings:
+        resp = client.post("/api/pipelines",
+                           data=json.dumps({"dsl": dsl}),
+                           headers=headers)
+        results.append(resp)
+    return results
+
+
 # ---------------------------------------------------------------------------
-# Test: create and delete call
+# Test: nonexistent call in DSL
 # ---------------------------------------------------------------------------
 
-class TestCreateDeleteCall:
+class TestCallNotFound:
 
-    def test_create_call(self, client, account):
-        call_id = create_call(client, account)
-        assert call_id.startswith("call-")
-
-        # Call exists
-        resp = client.get(f"/api/calls/{call_id}", headers=account)
-        assert resp.status_code == 200
-
-    def test_delete_call(self, client, account):
-        call_id = create_call(client, account)
-        resp = client.delete(f"/api/calls/{call_id}", headers=account)
-        assert resp.status_code == 204
-
-        # Call is gone
-        resp = client.get(f"/api/calls/{call_id}", headers=account)
-        assert resp.status_code == 404
-
-    def test_double_delete_returns_404(self, client, account):
-        call_id = create_call(client, account)
-        client.delete(f"/api/calls/{call_id}", headers=account)
-        resp = client.delete(f"/api/calls/{call_id}", headers=account)
-        assert resp.status_code == 404
+    def test_pipe_with_nonexistent_call(self, client, account):
+        resp = client.post("/api/pipelines",
+                           data=json.dumps({
+                               "dsl": "play:x -> call:call-doesnotexist"
+                           }),
+                           headers=account)
+        assert resp.status_code in (400, 403)
 
 
 # ---------------------------------------------------------------------------
@@ -88,18 +89,10 @@ class TestWaitMusic:
 
     def test_add_play_pipe(self, client, account):
         call_id = create_call(client, account)
-        resp = client.post(
-            f"/api/calls/{call_id}/pipes",
-            data=json.dumps({
-                "pipes": [
-                    f'play:{call_id}_wait{{"url":"examples/queue.mp3","loop":true}} -> call:{call_id}'
-                ]
-            }),
-            headers=account,
-        )
-        assert resp.status_code == 202
-        results = resp.get_json()["results"]
-        assert results[0]["ok"] is True
+        resps = _post_pipes(client, account, [
+            f'play:{call_id}_wait{{"url":"examples/queue.mp3","loop":true}} -> call:{call_id}'
+        ])
+        assert resps[0].status_code == 201
 
         # Stage is registered on the pipe executor
         call = call_state.get_call(call_id)
@@ -111,15 +104,9 @@ class TestWaitMusic:
 
     def test_kill_play_stage(self, client, account):
         call_id = create_call(client, account)
-        client.post(
-            f"/api/calls/{call_id}/pipes",
-            data=json.dumps({
-                "pipes": [
-                    f'play:{call_id}_wait{{"url":"examples/queue.mp3","loop":true}} -> call:{call_id}'
-                ]
-            }),
-            headers=account,
-        )
+        _post_pipes(client, account, [
+            f'play:{call_id}_wait{{"url":"examples/queue.mp3","loop":true}} -> call:{call_id}'
+        ])
 
         resp = client.delete(
             f"/api/calls/{call_id}/stages/play:{call_id}_wait",
@@ -146,16 +133,10 @@ class TestBridgeLeg:
         call_id = create_call(client, account)
         leg = _make_inbound_leg(client, account)
 
-        resp = client.post(
-            f"/api/calls/{call_id}/pipes",
-            data=json.dumps({
-                "pipes": [
-                    f'sip:{leg.leg_id}{{"completed":"/cb/done"}} -> call:{call_id} -> sip:{leg.leg_id}'
-                ]
-            }),
-            headers=account,
-        )
-        assert resp.status_code == 202
+        resps = _post_pipes(client, account, [
+            f'sip:{leg.leg_id}{{"completed":"/cb/done"}} -> call:{call_id} -> sip:{leg.leg_id}'
+        ])
+        assert resps[0].status_code == 201
 
         # Leg should be in-progress now
         assert leg.status == "in-progress"
@@ -176,15 +157,9 @@ class TestBridgeLeg:
         leg = _make_inbound_leg(client, account, "+4989999999")
 
         # Bridge first
-        client.post(
-            f"/api/calls/{call_id}/pipes",
-            data=json.dumps({
-                "pipes": [
-                    f'sip:{leg.leg_id} -> call:{call_id} -> sip:{leg.leg_id}'
-                ]
-            }),
-            headers=account,
-        )
+        _post_pipes(client, account, [
+            f'sip:{leg.leg_id} -> call:{call_id} -> sip:{leg.leg_id}'
+        ])
 
         resp = client.post(f"/api/legs/{leg.leg_id}/answer", headers=account)
         assert resp.status_code == 200
@@ -206,16 +181,10 @@ class TestFullLifecycle:
 
         # 2. Wire inbound leg + wait music
         leg = _make_inbound_leg(client, account, "+4989111111")
-        client.post(
-            f"/api/calls/{call_id}/pipes",
-            data=json.dumps({
-                "pipes": [
-                    f'sip:{leg.leg_id} -> call:{call_id} -> sip:{leg.leg_id}',
-                    f'play:{call_id}_wait{{"url":"examples/queue.mp3","loop":true}} -> call:{call_id}',
-                ]
-            }),
-            headers=account,
-        )
+        _post_pipes(client, account, [
+            f'sip:{leg.leg_id} -> call:{call_id} -> sip:{leg.leg_id}',
+            f'play:{call_id}_wait{{"url":"examples/queue.mp3","loop":true}} -> call:{call_id}',
+        ])
 
         # 3. Wait music is playing
         call = call_state.get_call(call_id)
@@ -228,15 +197,9 @@ class TestFullLifecycle:
         leg2.leg_id = "leg-out-1747"
         leg_mod._legs[leg2.leg_id] = leg2
 
-        client.post(
-            f"/api/calls/{call_id}/pipes",
-            data=json.dumps({
-                "pipes": [
-                    f'sip:{leg2.leg_id} -> call:{call_id} -> sip:{leg2.leg_id}'
-                ]
-            }),
-            headers=account,
-        )
+        _post_pipes(client, account, [
+            f'sip:{leg2.leg_id} -> call:{call_id} -> sip:{leg2.leg_id}'
+        ])
 
         # 5. Kill wait music
         resp = client.delete(

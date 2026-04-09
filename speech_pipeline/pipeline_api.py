@@ -108,15 +108,13 @@ def create_pipeline():
             call = call_state.get_call(elem_id)
             break
 
-    # Build executor — call is optional for standalone pipelines
+    # Reuse existing executor for the call (preserves tees/stages),
+    # or create a new one for standalone pipelines.
     tts_registry = _shared.tts_registry
-    subscriber = None
     if call:
-        from .telephony import subscriber as sub_mod
-        subscriber = sub_mod.get(call.subscriber_id) if call.subscriber_id else None
-
-    executor = CallPipeExecutor(call=call, tts_registry=tts_registry,
-                                 subscriber=subscriber)
+        executor = _shared.ensure_pipe_executor(call)
+    else:
+        executor = CallPipeExecutor(call=None, tts_registry=tts_registry)
 
     pipeline = registry.LivePipeline(dsl=dsl)
 

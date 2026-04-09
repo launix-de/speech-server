@@ -66,10 +66,12 @@ class TestCrossAccountCalls:
 
 
 class TestCrossAccountPipes:
-    def test_cannot_post_pipes_on_other_call(self, client, account, account2):
+    def test_cannot_create_pipeline_for_other_call(self, client, account, account2):
         call_id = create_call(client, account2, SUBSCRIBER2_ID)
-        resp = client.post(f"/api/calls/{call_id}/pipes",
-                           data=json.dumps({"pipes": []}),
+        resp = client.post("/api/pipelines",
+                           data=json.dumps({
+                               "dsl": f"play:x -> call:{call_id}"
+                           }),
                            headers=account)
         assert resp.status_code == 403
 

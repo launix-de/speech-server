@@ -19,10 +19,10 @@ class TestStages:
 
     def test_delete_stage_not_found(self, client, account):
         call_id = create_call(client, account)
-        # Create pipe executor by sending empty pipes
-        client.post(f"/api/calls/{call_id}/pipes",
-                    data=json.dumps({"pipes": []}),
-                    headers=account)
+        # Create pipe executor by posting a pipeline that references this call
+        from speech_pipeline.telephony import _shared, call_state
+        call = call_state.get_call(call_id)
+        _shared.ensure_pipe_executor(call)
         resp = client.delete(f"/api/calls/{call_id}/stages/play:nonexistent",
                              headers=account)
         assert resp.status_code == 404

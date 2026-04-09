@@ -88,51 +88,16 @@ class _PCMA(RTPCodec):
         return audioop.alaw2lin(wire, 2)
 
 
-class _QueueReader(io.RawIOBase):
-    """Blocking byte stream for PyAV raw demuxers."""
-
-    def __init__(self) -> None:
-        super().__init__()
-        self._queue: queue.Queue[bytes | None] = queue.Queue()
-        self._buf = bytearray()
-        self._closed = False
-
-    def readable(self) -> bool:
-        return True
-
-    def feed(self, chunk: bytes) -> None:
-        if chunk:
-            self._queue.put(chunk)
-
-    def close_input(self) -> None:
-        if not self._closed:
-            self._closed = True
-            self._queue.put(None)
-
-    def read(self, size: int = -1) -> bytes:
-        while not self._buf and not self._closed:
-            item = self._queue.get()
-            if item is None:
-                self._closed = True
-                break
-            self._buf.extend(item)
-
-        if size is None or size < 0:
-            size = len(self._buf)
-        out = bytes(self._buf[:size])
-        del self._buf[:size]
-        return out
-
-
 class _G722(RTPCodec):
+    """G.722 wideband codec (16 kHz PCM, 8 kHz RTP clock).
+
+    Synchronous encode/decode via PyAV CodecContext — same pattern as Opus.
+    """
     __slots__ = RTPCodec.__slots__ + (
         "_encoder",
-        "_decoder_in",
-        "_decoder_out",
-        "_decoder_thread",
-        "_decoder_error",
-        "_decoder_ready",
+        "_decoder",
         "_encode_lock",
+        "_decode_lock",
     )
 
     def __init__(self, runtime: bool = False) -> None:
@@ -140,12 +105,9 @@ class _G722(RTPCodec):
         # PCM is 16kHz wideband audio (RFC 3551 compatibility quirk).
         super().__init__("G722", 9, 8000, 16000, 320, 160, 0x00)
         self._encoder = None
-        self._decoder_in = None
-        self._decoder_out = None
-        self._decoder_thread = None
-        self._decoder_error = None
-        self._decoder_ready = threading.Event()
+        self._decoder = None
         self._encode_lock = threading.Lock()
+        self._decode_lock = threading.Lock()
         if runtime:
             self._init_runtime()
 
@@ -161,40 +123,10 @@ class _G722(RTPCodec):
         self._encoder.layout = "mono"
         self._encoder.format = "s16"
 
-        self._decoder_in = _QueueReader()
-        self._decoder_out = queue.Queue()
-        self._decoder_thread = threading.Thread(
-            target=self._run_decoder,
-            daemon=True,
-            name="g722-decoder",
-        )
-        self._decoder_thread.start()
-        self._decoder_ready.wait(timeout=1.0)
-        if self._decoder_error is not None:
-            raise RuntimeError(f"G.722 decoder init failed: {self._decoder_error}")
-
-    def _run_decoder(self) -> None:
-        try:
-            container = av.open(
-                self._decoder_in,
-                mode="r",
-                format="g722",
-                options={
-                    "probesize": "32",
-                    "analyzeduration": "0",
-                    "fflags": "nobuffer",
-                },
-            )
-            self._decoder_ready.set()
-            for packet in container.demux():
-                for frame in packet.decode():
-                    self._decoder_out.put(bytes(frame.planes[0]))
-        except Exception as exc:
-            self._decoder_error = exc
-            self._decoder_ready.set()
-        finally:
-            if self._decoder_out is not None:
-                self._decoder_out.put(None)
+        self._decoder = av.codec.CodecContext.create("g722", "r")
+        self._decoder.sample_rate = self.sample_rate
+        self._decoder.layout = "mono"
+        self._decoder.format = "s16"
 
     def encode(self, s16le: bytes) -> bytes:
         self._init_runtime()
@@ -215,24 +147,16 @@ class _G722(RTPCodec):
         self._init_runtime()
         if not wire:
             return b""
-        self._decoder_in.feed(wire)
-        try:
-            out = self._decoder_out.get(timeout=0.05)
-        except queue.Empty as exc:
-            if self._decoder_error is None:
-                return b"\x00" * (self.frame_samples * 2)
-            raise RuntimeError("G.722 decoder timed out") from exc
-        if out is None:
-            if self._decoder_error is not None:
-                raise RuntimeError(f"G.722 decoder failed: {self._decoder_error}")
-            return b""
-        return out
+        packet = av.Packet(wire)
+        with self._decode_lock:
+            frames = self._decoder.decode(packet)
+        if frames:
+            return b"".join(f.to_ndarray().tobytes() for f in frames)
+        return b"\x00" * (self.frame_samples * 2)
 
     def close(self) -> None:
-        if self._decoder_in is not None:
-            self._decoder_in.close_input()
-        if self._decoder_thread is not None:
-            self._decoder_thread.join(timeout=1.0)
+        self._encoder = None
+        self._decoder = None
 
 
 class _Opus(RTPCodec):

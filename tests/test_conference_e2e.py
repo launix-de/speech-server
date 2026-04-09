@@ -142,18 +142,11 @@ def _run_conference_e2e(codec_a_name: str, codec_b_name: str):
     leg_a.attach(mixer)
     leg_a.pipe(sink_a)
 
+    # SIPSink.run() drives the whole chain:
+    #   sink → [SRC 48→codec] → ConferenceLeg → [SRC codec→48] → SIPSource
+    # No separate drain thread needed — that would double-consume the generator.
     sink_a_thread = threading.Thread(target=sink_a.run, daemon=True)
     sink_a_thread.start()
-
-    def _drain(leg):
-        try:
-            for _ in leg.stream_pcm24k():
-                pass
-        except Exception:
-            pass
-
-    drain_a = threading.Thread(target=_drain, args=(leg_a,), daemon=True)
-    drain_a.start()
 
     # 3. Leg B
     rtp_b = RTPSession(port_b_local, "127.0.0.1", port_b_remote, codec=codec_b)
@@ -168,8 +161,6 @@ def _run_conference_e2e(codec_a_name: str, codec_b_name: str):
 
     sink_b_thread = threading.Thread(target=sink_b.run, daemon=True)
     sink_b_thread.start()
-    drain_b = threading.Thread(target=_drain, args=(leg_b,), daemon=True)
-    drain_b.start()
 
     time.sleep(0.15)  # let pipeline settle
 

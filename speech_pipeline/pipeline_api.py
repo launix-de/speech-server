@@ -1,43 +1,32 @@
 """Flask blueprint for pipeline control API.
 
-All endpoints require ``Authorization: Bearer <admin-token>``.
+Endpoints require account-level auth (account token or admin token).
+Pipelines that reference calls via ``call:ID`` are subject to
+ownership checks — accounts can only access their own calls.
 """
 from __future__ import annotations
 
-import functools
-import json
 import logging
+import re
 from typing import Optional
 
-from flask import Blueprint, Response, jsonify, request
+from flask import Blueprint, g, jsonify, request
 
 from . import live_pipeline as registry
+from .telephony import auth
 
 _LOGGER = logging.getLogger("pipeline-api")
 
 api = Blueprint("pipeline_api", __name__, url_prefix="/api")
 
-_admin_token: Optional[str] = None
-
 
 def init(admin_token: str) -> None:
-    global _admin_token
-    _admin_token = admin_token
+    """Initialize auth (delegates to telephony auth)."""
+    auth.init(admin_token)
 
 
-def _require_auth(f):
-    @functools.wraps(f)
-    def wrapper(*args, **kwargs):
-        if not _admin_token:
-            return ("Pipeline API disabled (no --admin-token set)\n", 403)
-        auth = request.headers.get("Authorization", "")
-        if not auth.startswith("Bearer "):
-            return ("Missing Authorization: Bearer <token>\n", 401)
-        token = auth[7:]
-        if token != _admin_token:
-            return ("Invalid token\n", 403)
-        return f(*args, **kwargs)
-    return wrapper
+# Use telephony auth: admin token OR account token
+_require_auth = auth.require_account
 
 
 # ---- Pipeline CRUD ----
@@ -57,65 +46,99 @@ def get_pipeline(pid: str):
     return jsonify(p.to_dict(detail=True))
 
 
+def _account_id() -> Optional[str]:
+    acct = getattr(g, "account", None)
+    return acct["id"] if acct else None
+
+
+def _check_call_ownership(dsl: str) -> Optional[str]:
+    """If DSL references call:ID or conference:ID, verify ownership.
+
+    Returns error string on failure, None on success.
+    """
+    aid = _account_id()
+    if not aid:
+        return None  # admin — no restriction
+
+    from .telephony import call_state
+    for call_id in re.findall(r'(?:call|conference):([^\s{|>]+)', dsl):
+        call = call_state.get_call(call_id)
+        if not call:
+            return f"Call {call_id} not found"
+        if call.account_id != aid:
+            return f"Forbidden: call {call_id} belongs to another account"
+    return None
+
+
 @api.route("/pipelines", methods=["POST"])
 @_require_auth
 def create_pipeline():
-    """Create a pipeline from DSL.  Body: {"dsl": "cli:text | tts:voice | cli:raw"}"""
+    """Create a pipeline from DSL.
+
+    Body: ``{"dsl": "sip:leg1 -> call:call-xxx -> sip:leg1"}``
+
+    The DSL supports all element types: sip, call, play, tts, stt,
+    tee, webhook, gain, delay, pitch, vc, record, conference, text_input.
+    """
     body = request.get_json(force=True, silent=True) or {}
     dsl = body.get("dsl", "").strip()
     if not dsl:
         return ("Missing 'dsl' in request body\n", 400)
 
-    from .PipelineBuilder import PipelineBuilder
+    # Ownership check
+    err = _check_call_ownership(dsl)
+    if err:
+        return (err + "\n", 403)
 
-    # Use a minimal args namespace for CLI-created pipelines
-    import argparse
-    args = argparse.Namespace(
-        whisper_model=body.get("whisper_model", "small"),
-        cuda=body.get("cuda", False),
-        voices_path=body.get("voices_path", "voices-piper"),
-        soundpath=body.get("soundpath", "../voices/%s.wav"),
-        bearer=body.get("bearer", ""),
-    )
+    from .dsl_parser import parse_dsl
+    from .telephony.pipe_executor import CallPipeExecutor
+    from .telephony import _shared
 
-    # Registry is needed for TTS voices
-    from .registry import TTSRegistry
-    tts_registry = TTSRegistry(args.voices_path, use_cuda=args.cuda)
+    # Parse to detect call references and resolve context
+    try:
+        elements = parse_dsl(dsl)
+    except ValueError as e:
+        return (f"DSL parse error: {e}\n", 400)
+
+    # Find call context from DSL (if any call/conference element present)
+    call = None
+    for typ, elem_id, _ in elements:
+        if typ in ("call", "conference") and elem_id:
+            from .telephony import call_state
+            call = call_state.get_call(elem_id)
+            break
+
+    # Build executor — call is optional for standalone pipelines
+    tts_registry = _shared.tts_registry
+    subscriber = None
+    if call:
+        from .telephony import subscriber as sub_mod
+        subscriber = sub_mod.get(call.subscriber_id) if call.subscriber_id else None
+
+    executor = CallPipeExecutor(call=call, tts_registry=tts_registry,
+                                 subscriber=subscriber)
 
     pipeline = registry.LivePipeline(dsl=dsl)
-    builder = PipelineBuilder(ws=None, registry=tts_registry, args=args, live_pipeline=pipeline)
-
-    # Inject conference mixers so DSL can reference live conferences
-    from .PipelineBuilder import inject_conference_mixers
-    inject_conference_mixers(builder, dsl)
 
     try:
-        run = builder.build(dsl)
+        results = executor.add_pipes([dsl])
     except Exception as e:
         return (f"Build error: {e}\n", 400)
 
-    # Propagate text_input queue to LivePipeline for API access
-    if hasattr(builder, '_text_input_queue'):
-        pipeline._text_input_queue = builder._text_input_queue
+    # Check for per-pipe errors
+    for r in results:
+        if not r.get("ok"):
+            return (f"Pipe error: {r.get('error', 'unknown')}\n", 400)
 
-    pipeline.run = run
+    # Propagate text_input queue
+    if executor._text_input_queue:
+        pipeline._text_input_queue = executor._text_input_queue
+
     pipeline.state = "running"
+    pipeline._executor = executor
     registry.register(pipeline)
 
-    # Run in background thread
-    import threading
-    def _run():
-        try:
-            run.run()
-        except Exception as e:
-            _LOGGER.warning("Pipeline %s error: %s", pipeline.id, e)
-        finally:
-            pipeline.state = "stopped"
-
-    t = threading.Thread(target=_run, daemon=True, name=f"pipeline-{pipeline.id}")
-    t.start()
-
-    return jsonify(pipeline.to_dict(detail=True)), 201
+    return jsonify(pipeline.to_dict()), 201
 
 
 @api.route("/pipelines/<pid>/input", methods=["POST"])

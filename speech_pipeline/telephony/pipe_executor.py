@@ -13,11 +13,12 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import secrets
 import threading
 import time
 from typing import Any, Dict, List, Tuple
+
+from speech_pipeline.dsl_parser import parse_dsl  # noqa: F401 — re-export
 
 _LOGGER = logging.getLogger("telephony.pipe-executor")
 
@@ -26,67 +27,11 @@ _PLAY_PREFILL_SECONDS = 0.12
 _TTS_CHUNK_SECONDS = 0.10
 
 # ---------------------------------------------------------------------------
-# DSL Parser
-# ---------------------------------------------------------------------------
-
-_ARROW = re.compile(r'\s*(->|\|)\s*')
-_ELEMENT = re.compile(r'\s*([a-z_]+)(?::([^{\s|>]+))?')
-
-def _consume_json(s, pos):
-    if pos >= len(s) or s[pos] != '{':
-        return {}, pos
-    depth, in_str, esc, start = 0, False, False, pos
-    while pos < len(s):
-        ch = s[pos]
-        if esc: esc = False
-        elif ch == '\\' and in_str: esc = True
-        elif ch == '"' and not esc: in_str = not in_str
-        elif not in_str:
-            if ch == '{': depth += 1
-            elif ch == '}':
-                depth -= 1
-                if depth == 0:
-                    pos += 1
-                    try:
-                        return json.loads(s[start:pos]), pos
-                    except json.JSONDecodeError as e:
-                        raise ValueError(f"Invalid JSON params: {e.msg}") from e
-        pos += 1
-    raise ValueError("Unterminated JSON params")
-
-def parse_dsl(dsl: str) -> List[Tuple[str, str, dict]]:
-    elements = []
-    pos = 0
-    s = dsl.strip()
-    expect_element = True
-    while pos < len(s):
-        if expect_element:
-            m = _ELEMENT.match(s, pos)
-            if not m:
-                snippet = s[pos:pos + 32]
-                raise ValueError(f"Invalid DSL syntax near: {snippet!r}")
-            typ, elem_id = m.group(1), m.group(2) or ""
-            pos = m.end()
-            params, pos = _consume_json(s, pos)
-            elements.append((typ, elem_id, params))
-            expect_element = False
-        else:
-            m = _ARROW.match(s, pos)
-            if not m:
-                snippet = s[pos:pos + 32]
-                raise ValueError(f"Expected pipe separator near: {snippet!r}")
-            pos = m.end()
-            expect_element = True
-    if expect_element and elements:
-        raise ValueError("DSL must not end with a pipe separator")
-    return elements
-
-# ---------------------------------------------------------------------------
 # Pipe Executor
 # ---------------------------------------------------------------------------
 
 class CallPipeExecutor:
-    def __init__(self, call, tts_registry=None, subscriber=None):
+    def __init__(self, call=None, tts_registry=None, subscriber=None):
         self.call = call
         self._tts_registry = tts_registry
         self._subscriber = subscriber
@@ -95,6 +40,7 @@ class CallPipeExecutor:
         self._sidechain_specs: set[tuple] = set()
         self._sessions: Dict[str, Any] = {} # typ -> first session (for ID reuse)
         self._lock = threading.Lock()
+        self._text_input_queue = None        # set by text_input element
 
     # -- Public API --------------------------------------------------------
 
@@ -270,12 +216,19 @@ class CallPipeExecutor:
                 raise ValueError("Direct sip output requires a non-sip source")
             return
 
+        # Treat 'conference' like 'call' for validation
+        conf_positions = [i for i, (typ, _, _) in enumerate(elements)
+                          if typ == "conference"]
+        all_call_positions = call_positions + conf_positions
+        if len(all_call_positions) > 1:
+            raise ValueError("Only one call/conference stage is allowed per pipe")
+
         if call_positions:
             call_pos = call_positions[0]
             call_id = elements[call_pos][1]
             if not call_id:
                 raise ValueError("call requires a call id")
-            if call_id and call_id != self.call.call_id:
+            if self.call and call_id != self.call.call_id:
                 raise ValueError(
                     f"Pipe targets call {call_id}, but executor is bound to {self.call.call_id}"
                 )
@@ -330,12 +283,23 @@ class CallPipeExecutor:
 
     # -- Stage creation ----------------------------------------------------
 
+    def _resolve_call(self, call_id: str):
+        """Resolve a call by ID — uses self.call if bound, otherwise registry."""
+        if self.call and (not call_id or call_id == self.call.call_id):
+            return self.call
+        from . import call_state
+        call = call_state.get_call(call_id)
+        if not call:
+            raise ValueError(f"Call {call_id} not found")
+        return call
+
     def _create_stage(self, typ, elem_id, params):
-        # -- call: substitute with ConferenceLeg --
+        # -- call / conference: substitute with ConferenceLeg --
         if typ == "call":
+            call = self._resolve_call(elem_id)
             from speech_pipeline.ConferenceLeg import ConferenceLeg
-            conf_leg = ConferenceLeg(sample_rate=self.call.mixer.sample_rate)
-            conf_leg.attach(self.call.mixer)
+            conf_leg = ConferenceLeg(sample_rate=call.mixer.sample_rate)
+            conf_leg.attach(call.mixer)
             return conf_leg
 
         # -- tee: get or create --
@@ -381,6 +345,82 @@ class CallPipeExecutor:
             bearer = self._subscriber.get("bearer_token", "") if self._subscriber else ""
             return WebhookSink(elem_id, bearer_token=bearer)
 
+        # -- conference: alias for call --
+        if typ == "conference":
+            call = self._resolve_call(elem_id)
+            from speech_pipeline.ConferenceLeg import ConferenceLeg
+            conf_leg = ConferenceLeg(sample_rate=call.mixer.sample_rate)
+            conf_leg.attach(call.mixer)
+            return conf_leg
+
+        # -- gain: volume adjustment --
+        if typ == "gain":
+            from speech_pipeline.GainStage import GainStage
+            factor = float(elem_id) if elem_id else params.get("factor", 1.0)
+            rate = params.get("rate", 48000)
+            return GainStage(rate, float(factor))
+
+        # -- delay: delay line --
+        if typ == "delay":
+            from speech_pipeline.DelayLine import DelayLine
+            ms = float(elem_id) if elem_id else params.get("ms", 0.0)
+            rate = params.get("rate", 48000)
+            return DelayLine(rate, float(ms))
+
+        # -- pitch: pitch adjustment --
+        if typ == "pitch":
+            from speech_pipeline.PitchAdjuster import PitchAdjuster
+            st = float(elem_id) if elem_id else params.get("semitones", 0.0)
+            return PitchAdjuster("", pitch_disable=(abs(st) < 0.05),
+                                 pitch_override_st=st, correction=1.0)
+
+        # -- vc: voice conversion --
+        if typ == "vc":
+            if not elem_id:
+                raise ValueError("vc requires a voice reference")
+            from speech_pipeline.VCConverter import VCConverter
+            from speech_pipeline.FileFetcher import FileFetcher
+            from pathlib import Path
+            here = Path(__file__).resolve().parent.parent.parent
+            tmpl = params.get("soundpath", "../voices/%s.wav")
+            ref = FileFetcher.build_ref(elem_id, tmpl, here)
+            bearer = params.get("bearer", "")
+            return VCConverter(ref, bearer=bearer)
+
+        # -- record: file recorder sidechain --
+        if typ == "record":
+            if not elem_id:
+                raise ValueError("record requires a filename")
+            from speech_pipeline.AudioTee import AudioTee
+            from speech_pipeline.FileRecorder import FileRecorder
+            rate = int(params.get("rate", 48000))
+            tee = AudioTee(rate, "s16le")
+            recorder = FileRecorder(elem_id, rate)
+            tee.add_sidechain(recorder)
+            return tee
+
+        # -- text_input: queue-backed text source for streaming TTS --
+        if typ == "text_input":
+            import queue as _queue
+            q = _queue.Queue()
+            self._text_input_queue = q
+            from speech_pipeline.base import AudioFormat, Stage
+
+            class _TextInputSource(Stage):
+                """Yields text strings from a queue."""
+                def __init__(self, q):
+                    super().__init__()
+                    self._q = q
+                    self.output_format = AudioFormat(0, "text")
+                def stream_pcm24k(self):
+                    while not self.cancelled:
+                        item = self._q.get()
+                        if item is None:
+                            break
+                        yield item.encode("utf-8") if isinstance(item, str) else item
+
+            return _TextInputSource(q)
+
         raise ValueError(f"Unknown element type: {typ}")
 
     def _create_sip(self, leg_id, params):
@@ -399,12 +439,13 @@ class CallPipeExecutor:
         if params:
             leg.callbacks.update(params)
 
-        leg.call_id = self.call.call_id
-        leg.status = "in-progress"
-        leg.answered_at = leg.answered_at or time.time()
-        self.call.register_participant(leg.leg_id, type="sip",
-                                       direction=leg.direction,
-                                       number=leg.number)
+        if self.call:
+            leg.call_id = self.call.call_id
+            leg.status = "in-progress"
+            leg.answered_at = leg.answered_at or time.time()
+            self.call.register_participant(leg.leg_id, type="sip",
+                                           direction=leg.direction,
+                                           number=leg.number)
 
         # Check if we already have a session for this leg
         session_key = f"sip:{leg_id}"

@@ -3,7 +3,7 @@
 Tests the parser in isolation — no Flask app or fixtures needed.
 """
 import pytest
-from speech_pipeline.telephony.pipe_executor import parse_dsl
+from speech_pipeline.dsl_parser import parse_dsl
 
 
 class TestDSLArrowSyntax:

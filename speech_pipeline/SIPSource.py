@@ -30,7 +30,9 @@ class SIPSource(Stage):
         if isinstance(call, RTPSession):
             self.output_format = AudioFormat(call.codec.sample_rate, "s16le")
         else:
-            self.output_format = AudioFormat(8000, "u8")
+            # pyVoIP path: PyVoIPCallSession._rx_pump decodes u-law → s16le
+            # before queueing, so the data in rx_queue is always s16le.
+            self.output_format = AudioFormat(8000, "s16le")
 
     def stream_pcm24k(self) -> Iterator[bytes]:
         if not self.session.connected.is_set():

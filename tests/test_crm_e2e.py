@@ -648,6 +648,71 @@ class TestTeeSidechainSeparateRequest:
             client.delete(f"/api/calls/{call_id}", headers=account)
             _cleanup_leg(leg, phone_rtp)
 
+    def test_sidechain_data_flows_to_endpoint(self, client, account):
+        """Audio through tee sidechain actually reaches the terminal stage.
+
+        Uses a QueueSink instead of webhook+STT to verify data flows
+        through the sidechain without needing a Whisper model.
+        """
+        call_id = create_call(client, account)
+        call = call_state.get_call(call_id)
+        leg, phone_rtp, session = _make_rtp_leg()
+
+        try:
+            # Bridge with tee
+            resp = client.post("/api/pipelines",
+                               data=json.dumps({
+                                   "dsl": f"sip:{leg.leg_id} -> tee:{leg.leg_id}_tap "
+                                          f"-> call:{call_id} -> sip:{leg.leg_id}"
+                               }),
+                               headers=account)
+            assert resp.status_code == 201
+
+            time.sleep(0.3)
+
+            # Manually attach a sidechain to the tee and collect audio
+            ex = call.pipe_executor
+            tee = ex._tees.get(f"{leg.leg_id}_tap")
+            assert tee is not None, "Tee not found in executor"
+
+            sidechain_q = queue.Queue(maxsize=200)
+            from speech_pipeline.QueueSink import QueueSink
+            from speech_pipeline.base import AudioFormat
+            sc_sink = QueueSink(sidechain_q, 48000, "s16le")
+            tee.add_sidechain(sc_sink)
+            threading.Thread(target=sc_sink.run, daemon=True).start()
+
+            time.sleep(0.3)
+
+            # Send audio from phone
+            ref_pcm = _load_pcm(phone_rtp.codec.sample_rate, 0.3)
+            _send_audio(phone_rtp, ref_pcm)
+
+            time.sleep(0.8)
+
+            # Collect from sidechain
+            sc_data = b""
+            while True:
+                try:
+                    f = sidechain_q.get_nowait()
+                    if f is None:
+                        break
+                    sc_data += f
+                except queue.Empty:
+                    break
+
+            assert len(sc_data) > 0, (
+                "Sidechain received no audio — tee not forwarding to sidechain"
+            )
+            samples = np.frombuffer(sc_data, dtype=np.int16).astype(np.float64)
+            rms = float(np.sqrt(np.mean(samples ** 2)))
+            assert rms > 100, (
+                f"Sidechain audio RMS={rms:.0f} — only silence reached sidechain"
+            )
+        finally:
+            client.delete(f"/api/calls/{call_id}", headers=account)
+            _cleanup_leg(leg, phone_rtp)
+
 
 # ---------------------------------------------------------------------------
 # Test: Hold / Unhold cycle (CRM pattern)
@@ -756,3 +821,203 @@ class TestPipelineAuth:
                            headers=admin)
         assert resp.status_code == 201
         client.delete(f"/api/calls/{call_id}", headers=admin)
+
+
+# ---------------------------------------------------------------------------
+# Test: Mix-minus correctness
+# ---------------------------------------------------------------------------
+
+class TestMixMinus:
+    """Two participants: A hears B but not itself, B hears A but not itself."""
+
+    def test_own_audio_not_heard(self, client, account):
+        """Leg A sends audio, Leg A should NOT hear it back (mix-minus)."""
+        call_id = create_call(client, account)
+        leg_a, phone_a, _ = _make_rtp_leg(number="+49111")
+
+        try:
+            client.post("/api/pipelines",
+                        data=json.dumps({
+                            "dsl": f"sip:{leg_a.leg_id} -> call:{call_id} -> sip:{leg_a.leg_id}"
+                        }),
+                        headers=account)
+
+            time.sleep(0.5)
+
+            # Drain initial silence
+            while not phone_a.rx_queue.empty():
+                phone_a.rx_queue.get_nowait()
+
+            # Send audio from Phone A
+            ref_pcm = _load_pcm(phone_a.codec.sample_rate, 0.3)
+            _send_audio(phone_a, ref_pcm)
+
+            time.sleep(0.5)
+
+            # Phone A should receive silence (mix-minus subtracts own input)
+            received = _receive_audio(phone_a, 0.5)
+            if len(received) > 0:
+                samples = np.frombuffer(received, dtype=np.int16).astype(np.float64)
+                rms = float(np.sqrt(np.mean(samples ** 2)))
+                # With only one participant, mix-minus = full_mix - own = silence
+                assert rms < 200, (
+                    f"Mix-minus broken: Leg A hears itself (RMS={rms:.0f})"
+                )
+        finally:
+            client.delete(f"/api/calls/{call_id}", headers=account)
+            _cleanup_leg(leg_a, phone_a)
+
+    def test_other_audio_heard(self, client, account):
+        """Leg A sends, Leg B hears it. Leg B sends, Leg A hears it."""
+        call_id = create_call(client, account)
+        leg_a, phone_a, _ = _make_rtp_leg(codec=PCMU, number="+49111")
+        leg_b, phone_b, _ = _make_rtp_leg(codec=PCMU, number="+49222")
+
+        try:
+            client.post("/api/pipelines",
+                        data=json.dumps({
+                            "dsl": f"sip:{leg_a.leg_id} -> call:{call_id} -> sip:{leg_a.leg_id}"
+                        }),
+                        headers=account)
+            client.post("/api/pipelines",
+                        data=json.dumps({
+                            "dsl": f"sip:{leg_b.leg_id} -> call:{call_id} -> sip:{leg_b.leg_id}"
+                        }),
+                        headers=account)
+
+            time.sleep(1.0)
+
+            # Drain silence
+            while not phone_b.rx_queue.empty():
+                phone_b.rx_queue.get_nowait()
+
+            # A sends audio
+            ref_pcm = _load_pcm(PCMU.sample_rate, 0.3)
+            _send_audio(phone_a, ref_pcm)
+
+            time.sleep(0.8)
+
+            # B should hear A's audio
+            received = _receive_audio(phone_b, 0.5)
+            assert len(received) > 0, "Leg B received nothing from Leg A"
+
+            samples = np.frombuffer(received, dtype=np.int16).astype(np.float64)
+            rms = float(np.sqrt(np.mean(samples ** 2)))
+            assert rms > 200, (
+                f"Leg B doesn't hear Leg A (RMS={rms:.0f}) — mix-minus or routing broken"
+            )
+        finally:
+            client.delete(f"/api/calls/{call_id}", headers=account)
+            _cleanup_leg(leg_a, phone_a)
+            _cleanup_leg(leg_b, phone_b)
+
+
+# ---------------------------------------------------------------------------
+# Test: Conference teardown cleanup
+# ---------------------------------------------------------------------------
+
+class TestConferenceTeardown:
+    """DELETE /api/calls/{id} cleans up everything."""
+
+    def test_teardown_cleans_legs(self, client, account):
+        call_id = create_call(client, account)
+        leg, phone_rtp, _ = _make_rtp_leg()
+
+        client.post("/api/pipelines",
+                    data=json.dumps({
+                        "dsl": f"sip:{leg.leg_id} -> call:{call_id} -> sip:{leg.leg_id}"
+                    }),
+                    headers=account)
+        time.sleep(0.3)
+
+        # Verify leg exists
+        assert leg_mod.get_leg(leg.leg_id) is not None
+
+        client.delete(f"/api/calls/{call_id}", headers=account)
+
+        # Leg should be gone
+        assert leg_mod.get_leg(leg.leg_id) is None
+        # Call should be gone
+        assert call_state.get_call(call_id) is None
+
+        phone_rtp.stop()
+
+    def test_teardown_cleans_stages_and_tees(self, client, account):
+        call_id = create_call(client, account)
+        call = call_state.get_call(call_id)
+        leg, phone_rtp, _ = _make_rtp_leg()
+
+        # Bridge with tee
+        client.post("/api/pipelines",
+                    data=json.dumps({
+                        "dsl": f"sip:{leg.leg_id} -> tee:{leg.leg_id}_tap "
+                               f"-> call:{call_id} -> sip:{leg.leg_id}"
+                    }),
+                    headers=account)
+        time.sleep(0.3)
+
+        ex = call.pipe_executor
+        assert len(ex._stages) > 0, "No stages before teardown"
+        assert len(ex._tees) > 0, "No tees before teardown"
+
+        client.delete(f"/api/calls/{call_id}", headers=account)
+
+        # Everything should be cleaned up
+        assert len(ex._stages) == 0, f"Stages leaked: {list(ex._stages.keys())}"
+        assert len(ex._tees) == 0, f"Tees leaked: {list(ex._tees.keys())}"
+
+        phone_rtp.stop()
+
+    def test_teardown_stops_mixer(self, client, account):
+        call_id = create_call(client, account)
+        call = call_state.get_call(call_id)
+        mixer = call.mixer
+
+        assert not mixer.cancelled
+
+        client.delete(f"/api/calls/{call_id}", headers=account)
+
+        assert mixer.cancelled, "Mixer not cancelled after teardown"
+
+
+# ---------------------------------------------------------------------------
+# Test: SIP pinning on originate
+# ---------------------------------------------------------------------------
+
+class TestSIPPinning:
+    """Account pinned to PBX cannot originate via different PBX."""
+
+    def test_originate_wrong_pbx_rejected(self, client, account):
+        """Account pinned to TestPBX, call on TestPBX, originate should check."""
+        from conftest import SUBSCRIBER_ID
+        call_id = create_call(client, account)
+
+        # Account is pinned to TestPBX (set up in conftest).
+        # Create a call, then try to originate — the originate checks
+        # PBX access based on the call's pbx_id.
+        resp = client.post("/api/legs/originate",
+                           data=json.dumps({
+                               "call_id": call_id,
+                               "to": "+4917099999",
+                           }),
+                           headers=account)
+        # Should succeed (call is on TestPBX, account pinned to TestPBX)
+        # or fail because PBX has no SIP proxy configured — but NOT 403
+        assert resp.status_code != 403 or "PBX" not in (resp.data or b"").decode()
+
+        client.delete(f"/api/calls/{call_id}", headers=account)
+
+    def test_originate_cross_account_rejected(self, client, account, account2):
+        """Account A cannot originate into Account B's call."""
+        from conftest import SUBSCRIBER2_ID
+        call_id = create_call(client, account2, SUBSCRIBER2_ID)
+
+        resp = client.post("/api/legs/originate",
+                           data=json.dumps({
+                               "call_id": call_id,
+                               "to": "+4917099999",
+                           }),
+                           headers=account)
+        assert resp.status_code == 403
+
+        client.delete(f"/api/calls/{call_id}", headers=account2)

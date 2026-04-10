@@ -108,6 +108,17 @@ def create_pipeline():
             call = call_state.get_call(elem_id)
             break
 
+    # If no call element but a tee sidechain (tee:X as first element),
+    # find the executor that owns this tee.
+    if not call and elements and elements[0][0] == "tee":
+        tee_id = elements[0][1]
+        from .telephony import call_state
+        for c in call_state.list_calls():
+            ex = getattr(c, "pipe_executor", None)
+            if ex and tee_id in ex._tees:
+                call = c
+                break
+
     # Reuse existing executor for the call (preserves tees/stages),
     # or create a new one for standalone pipelines.
     tts_registry = _shared.tts_registry

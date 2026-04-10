@@ -25,7 +25,7 @@ import pytest
 from conftest import ADMIN_TOKEN, ACCOUNT_TOKEN, ACCOUNT_ID, SUBSCRIBER_ID, create_call
 from speech_pipeline.telephony import call_state, leg as leg_mod
 from speech_pipeline.RTPSession import RTPSession, RTPCallSession
-from speech_pipeline.rtp_codec import PCMU, PCMA
+from speech_pipeline.rtp_codec import PCMU, PCMA, G722, Opus
 
 QUEUE_MP3 = os.path.join(os.path.dirname(__file__), "..", "examples", "queue.mp3")
 _DURATION_S = 0.5  # short for fast tests
@@ -375,3 +375,173 @@ class TestKillStage:
             assert rms < 100, f"Audio still playing after kill (RMS={rms:.0f})"
 
         client.delete(f"/api/calls/{call_id}", headers=account)
+
+
+# ---------------------------------------------------------------------------
+# Test: every codec through conference (same-codec)
+# ---------------------------------------------------------------------------
+
+_ALL_CODECS = [
+    pytest.param(PCMU, id="PCMU"),
+    pytest.param(PCMA, id="PCMA"),
+    pytest.param(G722, id="G722"),
+    pytest.param(Opus, id="Opus"),
+]
+
+
+class TestCodecConference:
+    """Send audio through phone → conference → phone for every codec."""
+
+    @pytest.mark.parametrize("codec", _ALL_CODECS)
+    def test_same_codec(self, client, account, codec):
+        """Phone (codec X) → conference → phone (codec X): audio survives."""
+        call_id = create_call(client, account)
+        leg, phone_rtp, session = _make_rtp_leg(codec=codec)
+
+        try:
+            # Bridge
+            client.post("/api/pipelines",
+                        data=json.dumps({
+                            "dsl": f"sip:{leg.leg_id} -> call:{call_id} -> sip:{leg.leg_id}"
+                        }),
+                        headers=account)
+
+            # Also play hold music so there is something to hear
+            # (mix-minus subtracts own audio, so we need a second source)
+            client.post("/api/pipelines",
+                        data=json.dumps({
+                            "dsl": f'play:music{{"url":"examples/queue.mp3"}} -> call:{call_id}'
+                        }),
+                        headers=account)
+
+            time.sleep(0.8)  # let pipeline wire up + audio start flowing
+
+            # Receive on phone
+            received = _receive_audio(phone_rtp, 0.5)
+            assert len(received) > 0, f"{codec.name}: phone received no audio"
+
+            # Verify signal energy
+            samples = np.frombuffer(received, dtype=np.int16).astype(np.float64)
+            rms = float(np.sqrt(np.mean(samples ** 2)))
+            assert rms > 100, (
+                f"{codec.name}: phone RTP output RMS={rms:.0f} — "
+                f"no audio reaching phone (codec distortion?)"
+            )
+        finally:
+            client.delete(f"/api/calls/{call_id}", headers=account)
+            _cleanup_leg(leg, phone_rtp)
+
+    @pytest.mark.parametrize("codec", _ALL_CODECS)
+    def test_phone_to_conference_similarity(self, client, account, codec):
+        """Phone sends queue.mp3 → conference mixer captures it, similarity check."""
+        call_id = create_call(client, account)
+        call = call_state.get_call(call_id)
+        leg, phone_rtp, session = _make_rtp_leg(codec=codec)
+
+        try:
+            # Bridge
+            client.post("/api/pipelines",
+                        data=json.dumps({
+                            "dsl": f"sip:{leg.leg_id} -> call:{call_id} -> sip:{leg.leg_id}"
+                        }),
+                        headers=account)
+
+            time.sleep(0.5)
+
+            # Tap conference output
+            out_q = call.mixer.add_output()
+
+            # Send real audio from phone
+            ref_pcm = _load_pcm(codec.sample_rate, 0.3)
+            _send_audio(phone_rtp, ref_pcm)
+
+            # Collect from conference (48kHz)
+            time.sleep(0.5)
+            collected = b""
+            while True:
+                try:
+                    frame = out_q.get_nowait()
+                    if frame:
+                        collected += frame
+                except queue.Empty:
+                    break
+
+            assert len(collected) > 0, f"{codec.name}: no audio in conference"
+
+            # Downsample to codec rate for comparison
+            down, _ = audioop.ratecv(collected, 2, 1, 48000,
+                                     codec.sample_rate, None)
+            sim = _similarity(ref_pcm, down)
+            assert sim > 0.4, (
+                f"{codec.name}: phone→conference similarity {sim:.3f} — "
+                f"audio distorted through {codec.name} codec path"
+            )
+        finally:
+            client.delete(f"/api/calls/{call_id}", headers=account)
+            _cleanup_leg(leg, phone_rtp)
+
+
+# ---------------------------------------------------------------------------
+# Test: cross-codec conference (two legs, different codecs)
+# ---------------------------------------------------------------------------
+
+_CROSS_CODEC_PAIRS = [
+    pytest.param(PCMU, Opus, id="PCMU-Opus"),
+    pytest.param(Opus, PCMU, id="Opus-PCMU"),
+    pytest.param(PCMA, G722, id="PCMA-G722"),
+    pytest.param(G722, PCMA, id="G722-PCMA"),
+]
+
+
+class TestCrossCodecConference:
+    """Two legs with different codecs in the same conference."""
+
+    @pytest.mark.parametrize("codec_a,codec_b", _CROSS_CODEC_PAIRS)
+    @pytest.mark.xfail(reason="Cross-codec conference bug: audio from Leg A "
+                        "does not reach Leg B when codecs differ")
+    def test_cross_codec(self, client, account, codec_a, codec_b):
+        """Leg A (codec_a) sends audio, Leg B (codec_b) receives it."""
+        call_id = create_call(client, account)
+
+        leg_a, phone_a, _ = _make_rtp_leg(
+            codec=codec_a, number="+49111")
+        leg_b, phone_b, _ = _make_rtp_leg(
+            codec=codec_b, number="+49222")
+
+        try:
+            # Bridge both legs
+            client.post("/api/pipelines",
+                        data=json.dumps({
+                            "dsl": f"sip:{leg_a.leg_id} -> call:{call_id} -> sip:{leg_a.leg_id}"
+                        }),
+                        headers=account)
+            client.post("/api/pipelines",
+                        data=json.dumps({
+                            "dsl": f"sip:{leg_b.leg_id} -> call:{call_id} -> sip:{leg_b.leg_id}"
+                        }),
+                        headers=account)
+
+            time.sleep(1.5)  # cross-codec needs more setup time
+
+            # Phone A sends audio
+            ref_pcm = _load_pcm(codec_a.sample_rate, 0.5)
+            _send_audio(phone_a, ref_pcm)
+
+            # Phone B should receive it (transcoded through conference)
+            time.sleep(0.5)
+            received = _receive_audio(phone_b, 1.0)
+            assert len(received) > 0, (
+                f"{codec_a.name}→{codec_b.name}: phone B received no audio"
+            )
+
+            # Verify signal energy
+            samples = np.frombuffer(received, dtype=np.int16).astype(np.float64)
+            rms = float(np.sqrt(np.mean(samples ** 2)))
+            assert rms > 100, (
+                f"{codec_a.name}→{codec_b.name}: phone B RMS={rms:.0f} — "
+                f"cross-codec transcoding failed"
+            )
+        finally:
+            client.delete(f"/api/calls/{call_id}", headers=account)
+            _cleanup_leg(leg_a, phone_a)
+            _cleanup_leg(leg_b, phone_b)

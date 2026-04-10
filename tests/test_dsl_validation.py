@@ -252,6 +252,34 @@ class TestTeeSidechainRules:
 # Valid patterns (positive tests)
 # ===========================================================================
 
+class TestConferenceAlias:
+    """conference is an alias for call in validation."""
+
+    def test_conference_counted_as_call(self):
+        ex = _make_executor()
+        elements = [("play", "x", {}), ("call", "call-test123", {}),
+                     ("conference", "call-test123", {})]
+        with pytest.raises(ValueError, match="Only one call/conference"):
+            ex._validate_elements(elements)
+
+    def test_conference_valid_as_terminal(self):
+        ex = _make_executor()
+        elements = [("play", "x", {}), ("conference", "call-test123", {})]
+        ex._validate_elements(elements)  # should not raise
+
+    def test_standalone_gain_delay_pitch(self):
+        """Non-telephony elements pass validation (no call/sip rules)."""
+        ex = _make_executor()
+        elements = [("gain", "2.0", {})]
+        ex._validate_elements(elements)
+
+    def test_standalone_no_call_needed(self):
+        """Executor without call: elements without call/sip pass."""
+        ex = CallPipeExecutor(call=None)
+        elements = [("stt", "de", {}), ("webhook", "https://example.com", {})]
+        ex._validate_elements(elements)
+
+
 class TestValidPatterns:
     def test_play_to_call(self):
         ex = _make_executor()

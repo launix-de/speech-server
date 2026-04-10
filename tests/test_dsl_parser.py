@@ -114,6 +114,105 @@ class TestDSLWhitespace:
         assert len(result) == 2
 
 
+class TestDSLAllElementTypes:
+    """Verify parser handles every supported element type."""
+
+    def test_gain(self):
+        result = parse_dsl("gain:2.5")
+        assert result == [("gain", "2.5", {})]
+
+    def test_delay(self):
+        result = parse_dsl("delay:100")
+        assert result == [("delay", "100", {})]
+
+    def test_pitch(self):
+        result = parse_dsl("pitch:3.5")
+        assert result == [("pitch", "3.5", {})]
+
+    def test_vc(self):
+        result = parse_dsl("vc:target_voice")
+        assert result == [("vc", "target_voice", {})]
+
+    def test_record(self):
+        result = parse_dsl('record:output.wav{"rate":16000}')
+        assert result == [("record", "output.wav", {"rate": 16000})]
+
+    def test_conference_alias(self):
+        result = parse_dsl("conference:call-abc123")
+        assert result == [("conference", "call-abc123", {})]
+
+    def test_text_input(self):
+        result = parse_dsl("text_input | tts:de_DE-thorsten-medium")
+        assert len(result) == 2
+        assert result[0] == ("text_input", "", {})
+        assert result[1] == ("tts", "de_DE-thorsten-medium", {})
+
+    def test_codec(self):
+        result = parse_dsl("codec:wc-session123")
+        assert result == [("codec", "wc-session123", {})]
+
+    def test_ws(self):
+        result = parse_dsl("ws:pcm | stt:de | ws:ndjson")
+        assert len(result) == 3
+        assert result[0] == ("ws", "pcm", {})
+        assert result[2] == ("ws", "ndjson", {})
+
+    def test_cli(self):
+        result = parse_dsl("cli:text | tts:de | cli:raw")
+        assert len(result) == 3
+        assert result[0] == ("cli", "text", {})
+        assert result[2] == ("cli", "raw", {})
+
+    def test_mix(self):
+        result = parse_dsl("mix:stt_tap | stt:de | webhook:https://example.com")
+        assert result[0] == ("mix", "stt_tap", {})
+
+    def test_mixminus(self):
+        result = parse_dsl("mix:conf | mixminus:own | codec:wc-abc")
+        assert result[1] == ("mixminus", "own", {})
+
+    def test_full_crm_inbound_pipe(self):
+        """Complete CRM inbound DSL: sip bridge + tee + STT sidechain."""
+        bridge = parse_dsl(
+            'sip:leg-abc{"completed":"/cb"} -> tee:leg-abc_tap '
+            '-> call:call-xyz -> sip:leg-abc'
+        )
+        assert len(bridge) == 4
+        assert bridge[0][0] == "sip"
+        assert bridge[0][2]["completed"] == "/cb"
+        assert bridge[1] == ("tee", "leg-abc_tap", {})
+        assert bridge[2] == ("call", "call-xyz", {})
+        assert bridge[3] == ("sip", "leg-abc", {})
+
+        sidechain = parse_dsl(
+            "tee:leg-abc_tap -> stt:de -> webhook:https://crm.example.com/stt"
+        )
+        assert len(sidechain) == 3
+        assert sidechain[0] == ("tee", "leg-abc_tap", {})
+        assert sidechain[1] == ("stt", "de", {})
+        assert sidechain[2] == ("webhook", "https://crm.example.com/stt", {})
+
+    def test_hold_music_pipe(self):
+        dsl = 'play:call-xyz_wait{"url":"https://cdn.example.com/hold.mp3","loop":true,"volume":50} -> call:call-xyz'
+        result = parse_dsl(dsl)
+        assert len(result) == 2
+        assert result[0][0] == "play"
+        assert result[0][2]["loop"] is True
+        assert result[0][2]["volume"] == 50
+
+    def test_tts_announcement_pipe(self):
+        dsl = 'tts:de{"text":"Bitte warten Sie."} -> call:call-xyz'
+        result = parse_dsl(dsl)
+        assert result[0][2]["text"] == "Bitte warten Sie."
+
+    def test_streaming_tts_pipeline(self):
+        dsl = "text_input | tts:de_DE-thorsten-medium | conference:call-xyz"
+        result = parse_dsl(dsl)
+        assert len(result) == 3
+        assert result[0][0] == "text_input"
+        assert result[2] == ("conference", "call-xyz", {})
+
+
 class TestDSLErrors:
     def test_empty_string(self):
         result = parse_dsl("")

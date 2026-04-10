@@ -497,8 +497,6 @@ class TestCrossCodecConference:
     """Two legs with different codecs in the same conference."""
 
     @pytest.mark.parametrize("codec_a,codec_b", _CROSS_CODEC_PAIRS)
-    @pytest.mark.xfail(reason="Cross-codec conference bug: audio from Leg A "
-                        "does not reach Leg B when codecs differ")
     def test_cross_codec(self, client, account, codec_a, codec_b):
         """Leg A (codec_a) sends audio, Leg B (codec_b) receives it."""
         call_id = create_call(client, account)
@@ -521,14 +519,25 @@ class TestCrossCodecConference:
                         }),
                         headers=account)
 
-            time.sleep(1.5)  # cross-codec needs more setup time
+            time.sleep(1.0)
+
+            # Drain any initial silence from Phone B's rx_queue
+            # (mixer outputs silence before Leg A sends real audio)
+            while not phone_b.rx_queue.empty():
+                try:
+                    phone_b.rx_queue.get_nowait()
+                except queue.Empty:
+                    break
 
             # Phone A sends audio
             ref_pcm = _load_pcm(codec_a.sample_rate, 0.5)
             _send_audio(phone_a, ref_pcm)
 
-            # Phone B should receive it (transcoded through conference)
-            time.sleep(0.5)
+            # Wait for audio to traverse the pipeline
+            time.sleep(0.8)
+
+            # Drain initial silence again (pipeline has ~500ms latency)
+            # then collect real audio
             received = _receive_audio(phone_b, 1.0)
             assert len(received) > 0, (
                 f"{codec_a.name}→{codec_b.name}: phone B received no audio"

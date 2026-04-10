@@ -472,7 +472,7 @@ class TestCodecConference:
             down, _ = audioop.ratecv(collected, 2, 1, 48000,
                                      codec.sample_rate, None)
             sim = _similarity(ref_pcm, down)
-            assert sim > 0.4, (
+            assert sim > 0.7, (
                 f"{codec.name}: phone→conference similarity {sim:.3f} — "
                 f"audio distorted through {codec.name} codec path"
             )
@@ -554,3 +554,205 @@ class TestCrossCodecConference:
             client.delete(f"/api/calls/{call_id}", headers=account)
             _cleanup_leg(leg_a, phone_a)
             _cleanup_leg(leg_b, phone_b)
+
+
+# ---------------------------------------------------------------------------
+# Test: Tee sidechain as separate pipeline request (the CRM pattern)
+# ---------------------------------------------------------------------------
+
+class TestTeeSidechainSeparateRequest:
+    """CRM sends bridge+tee in one request, sidechain in another.
+
+    This was broken when /api/calls/{id}/pipes was replaced by
+    /api/pipelines: the sidechain request couldn't find the tee
+    because it created a new executor (no call: in the DSL).
+    """
+
+    def test_sidechain_attaches_to_existing_tee(self, client, account):
+        """Bridge with tee, then sidechain in separate request."""
+        call_id = create_call(client, account)
+        call = call_state.get_call(call_id)
+        leg, phone_rtp, session = _make_rtp_leg()
+
+        try:
+            # Request 1: bridge with tee
+            resp = client.post("/api/pipelines",
+                               data=json.dumps({
+                                   "dsl": f"sip:{leg.leg_id} -> tee:{leg.leg_id}_tap "
+                                          f"-> call:{call_id} -> sip:{leg.leg_id}"
+                               }),
+                               headers=account)
+            assert resp.status_code == 201, f"Bridge failed: {resp.data}"
+
+            # Verify tee exists in executor
+            ex = call.pipe_executor
+            assert f"{leg.leg_id}_tap" in ex._tees, "Tee not created by bridge pipe"
+
+            # Request 2: sidechain (no call: in DSL!)
+            resp = client.post("/api/pipelines",
+                               data=json.dumps({
+                                   "dsl": f"tee:{leg.leg_id}_tap -> stt:de "
+                                          f"-> webhook:https://example.com/stt"
+                               }),
+                               headers=account)
+            assert resp.status_code == 201, (
+                f"Sidechain failed: {resp.data} — "
+                f"tee lookup across executors broken?"
+            )
+        finally:
+            client.delete(f"/api/calls/{call_id}", headers=account)
+            _cleanup_leg(leg, phone_rtp)
+
+    def test_sidechain_receives_audio(self, client, account):
+        """Audio from phone goes through tee into sidechain."""
+        call_id = create_call(client, account)
+        call = call_state.get_call(call_id)
+        leg, phone_rtp, session = _make_rtp_leg()
+
+        try:
+            # Bridge with tee
+            client.post("/api/pipelines",
+                        data=json.dumps({
+                            "dsl": f"sip:{leg.leg_id} -> tee:{leg.leg_id}_tap "
+                                   f"-> call:{call_id} -> sip:{leg.leg_id}"
+                        }),
+                        headers=account)
+
+            time.sleep(0.5)
+
+            # Verify audio still reaches conference through the tee
+            out_q = call.mixer.add_output()
+
+            ref_pcm = _load_pcm(phone_rtp.codec.sample_rate, 0.3)
+            _send_audio(phone_rtp, ref_pcm)
+
+            time.sleep(0.5)
+            collected = b""
+            while True:
+                try:
+                    frame = out_q.get_nowait()
+                    if frame:
+                        collected += frame
+                except queue.Empty:
+                    break
+
+            assert len(collected) > 0, "No audio through tee into conference"
+
+            down, _ = audioop.ratecv(collected, 2, 1, 48000,
+                                     phone_rtp.codec.sample_rate, None)
+            sim = _similarity(ref_pcm, down)
+            assert sim > 0.5, (
+                f"Audio through tee similarity {sim:.3f} — tee corrupts audio"
+            )
+        finally:
+            client.delete(f"/api/calls/{call_id}", headers=account)
+            _cleanup_leg(leg, phone_rtp)
+
+
+# ---------------------------------------------------------------------------
+# Test: Hold / Unhold cycle (CRM pattern)
+# ---------------------------------------------------------------------------
+
+class TestHoldUnhold:
+    """Kill bridge → play hold jingle → rebridge."""
+
+    def test_hold_unhold_cycle(self, client, account):
+        call_id = create_call(client, account)
+        call = call_state.get_call(call_id)
+        leg, phone_rtp, session = _make_rtp_leg()
+
+        try:
+            # 1. Bridge leg
+            client.post("/api/pipelines",
+                        data=json.dumps({
+                            "dsl": f"sip:{leg.leg_id} -> call:{call_id} -> sip:{leg.leg_id}"
+                        }),
+                        headers=account)
+            time.sleep(0.3)
+
+            # 2. Put on hold: kill bridge, start hold music
+            client.delete(
+                f"/api/calls/{call_id}/stages/bridge:{leg.leg_id}",
+                headers=account)
+
+            client.post("/api/pipelines",
+                        data=json.dumps({
+                            "dsl": f'play:{call_id}_hold_{leg.leg_id}'
+                                   f'{{"url":"examples/queue.mp3","loop":true,"volume":50}}'
+                                   f' -> sip:{leg.leg_id}'
+                        }),
+                        headers=account)
+
+            time.sleep(0.5)
+
+            # Phone should hear hold music
+            while not phone_rtp.rx_queue.empty():
+                phone_rtp.rx_queue.get_nowait()
+            time.sleep(0.3)
+            hold_audio = _receive_audio(phone_rtp, 0.5)
+            if len(hold_audio) > 0:
+                hold_rms = float(np.sqrt(np.mean(
+                    np.frombuffer(hold_audio, dtype=np.int16).astype(np.float64) ** 2
+                )))
+                assert hold_rms > 50, f"Hold music too quiet: RMS={hold_rms:.0f}"
+
+            # 3. Unhold: kill hold music, rebridge
+            client.delete(
+                f"/api/calls/{call_id}/stages/play:{call_id}_hold_{leg.leg_id}",
+                headers=account)
+
+            client.post("/api/pipelines",
+                        data=json.dumps({
+                            "dsl": f"sip:{leg.leg_id} -> call:{call_id} -> sip:{leg.leg_id}"
+                        }),
+                        headers=account)
+            time.sleep(0.3)
+
+            # Verify leg is rebridged (status in-progress)
+            assert leg.status == "in-progress"
+
+        finally:
+            client.delete(f"/api/calls/{call_id}", headers=account)
+            _cleanup_leg(leg, phone_rtp)
+
+
+# ---------------------------------------------------------------------------
+# Test: Pipeline API auth
+# ---------------------------------------------------------------------------
+
+class TestPipelineAuth:
+    """Account-level auth on /api/pipelines."""
+
+    def test_no_auth_rejected(self, client):
+        resp = client.post("/api/pipelines",
+                           data=json.dumps({"dsl": "play:test"}))
+        assert resp.status_code == 401
+
+    def test_wrong_token_rejected(self, client):
+        h = {"Authorization": "Bearer wrong-token",
+             "Content-Type": "application/json"}
+        resp = client.post("/api/pipelines",
+                           data=json.dumps({"dsl": "play:test"}),
+                           headers=h)
+        assert resp.status_code == 403
+
+    def test_account_token_accepted(self, client, account):
+        """Account token must be accepted (not just admin)."""
+        call_id = create_call(client, account)
+        resp = client.post("/api/pipelines",
+                           data=json.dumps({
+                               "dsl": f'play:test{{"url":"examples/queue.mp3"}} -> call:{call_id}'
+                           }),
+                           headers=account)
+        assert resp.status_code == 201
+        client.delete(f"/api/calls/{call_id}", headers=account)
+
+    def test_admin_token_accepted(self, client, admin, account):
+        call_id = create_call(client, account)
+        resp = client.post("/api/pipelines",
+                           data=json.dumps({
+                               "dsl": f'play:test{{"url":"examples/queue.mp3"}} -> call:{call_id}'
+                           }),
+                           headers=admin)
+        assert resp.status_code == 201
+        client.delete(f"/api/calls/{call_id}", headers=admin)

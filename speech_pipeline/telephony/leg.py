@@ -336,12 +336,24 @@ class PyVoIPCallSession:
         self._rx_pump_running = True
         import audioop
 
+        # Detect codec from pyVoIP call — A-law or µ-law
+        decode = audioop.ulaw2lin  # default: µ-law
+        try:
+            from pyVoIP.RTP import PayloadType
+            if call.RTPClients and call.RTPClients[0].preference == PayloadType.PCMA:
+                decode = audioop.alaw2lin
+                _LOGGER.info("PyVoIPCallSession: using A-law decoder")
+            else:
+                _LOGGER.info("PyVoIPCallSession: using µ-law decoder")
+        except Exception:
+            pass
+
         def _rx_pump():
             while self._rx_pump_running:
                 try:
                     data = self._call.read_audio(160, blocking=True)
                     if data and len(data) == 160:
-                        pcm = audioop.ulaw2lin(data, 2)
+                        pcm = decode(data, 2)
                         try:
                             self.rx_queue.put_nowait(pcm)
                         except queue.Full:

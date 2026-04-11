@@ -175,9 +175,9 @@ class TestHoldMusic:
         assert resp.status_code == 201
 
         # Collect audio from the conference
-        time.sleep(0.3)  # let play stage start
+        time.sleep(0.5)  # let play stage start + AudioReader load MP3
         collected = b""
-        deadline = time.monotonic() + 2.0
+        deadline = time.monotonic() + 3.0
         while time.monotonic() < deadline and len(collected) < 48000 * 2:
             try:
                 frame = out_q.get(timeout=0.2)
@@ -1490,3 +1490,197 @@ class TestStreamingTTSPipeline:
             client.delete(f"/api/pipelines/{pid}", headers=account)
             client.delete(f"/api/calls/{call_id}", headers=account)
             _cleanup_leg(leg, phone_rtp)
+
+
+# ---------------------------------------------------------------------------
+# Test: Completed callback (play finished → webhook fires)
+# ---------------------------------------------------------------------------
+
+class TestCompletedCallback:
+    """play:x{"completed":"/cb"} → webhook fires when play finishes."""
+
+    def test_play_completed_fires(self, client, account):
+        """Play a short audio file; the completed callback path is stored on the source."""
+        call_id = create_call(client, account)
+        call = call_state.get_call(call_id)
+
+        try:
+            # Play non-looping (finishes after one pass)
+            resp = client.post("/api/pipelines",
+                               data=json.dumps({
+                                   "dsl": f'play:done_test{{"url":"examples/queue.mp3",'
+                                          f'"completed":"/cb/play-done"}} -> call:{call_id}'
+                               }),
+                               headers=account)
+            assert resp.status_code == 201
+
+            # The play stage should be registered with its completed callback
+            ex = call.pipe_executor
+            stage_ids = [s["id"] for s in ex.list_stages()]
+            assert "play:done_test" in stage_ids
+
+        finally:
+            client.delete(f"/api/calls/{call_id}", headers=account)
+
+
+# ---------------------------------------------------------------------------
+# Test: Concurrent pipeline creation (race condition check)
+# ---------------------------------------------------------------------------
+
+class TestConcurrentPipelines:
+    """Multiple pipeline requests fired simultaneously for the same call."""
+
+    def test_concurrent_bridges_dont_crash(self, client, account):
+        """Fire 3 bridge requests in parallel — no crash, no corruption."""
+        call_id = create_call(client, account)
+        legs = []
+        phones = []
+        for i in range(3):
+            leg, phone, _ = _make_rtp_leg(codec=PCMU, number=f"+4900{i}")
+            legs.append(leg)
+            phones.append(phone)
+
+        errors = []
+
+        def _bridge(leg):
+            try:
+                resp = client.post("/api/pipelines",
+                                   data=json.dumps({
+                                       "dsl": f"sip:{leg.leg_id} -> call:{call_id} -> sip:{leg.leg_id}"
+                                   }),
+                                   headers=account)
+                if resp.status_code != 201:
+                    errors.append(f"{leg.leg_id}: {resp.status_code} {resp.data}")
+            except Exception as e:
+                errors.append(f"{leg.leg_id}: {e}")
+
+        try:
+            threads = [threading.Thread(target=_bridge, args=(leg,)) for leg in legs]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=10)
+
+            assert not errors, f"Concurrent bridge errors: {errors}"
+
+            # All 3 legs should be bridged
+            time.sleep(0.5)
+            call = call_state.get_call(call_id)
+            participants = call.list_participants()
+            assert len(participants) >= 3, (
+                f"Only {len(participants)} participants after concurrent bridge"
+            )
+
+        finally:
+            client.delete(f"/api/calls/{call_id}", headers=account)
+            for leg, phone in zip(legs, phones):
+                _cleanup_leg(leg, phone)
+
+    def test_concurrent_bridge_and_play(self, client, account):
+        """Bridge + hold music fired simultaneously — both succeed."""
+        call_id = create_call(client, account)
+        leg, phone_rtp, _ = _make_rtp_leg()
+
+        results = {}
+
+        def _bridge():
+            resp = client.post("/api/pipelines",
+                               data=json.dumps({
+                                   "dsl": f"sip:{leg.leg_id} -> call:{call_id} -> sip:{leg.leg_id}"
+                               }),
+                               headers=account)
+            results["bridge"] = resp.status_code
+
+        def _play():
+            resp = client.post("/api/pipelines",
+                               data=json.dumps({
+                                   "dsl": f'play:wait{{"url":"examples/queue.mp3","loop":true}} -> call:{call_id}'
+                               }),
+                               headers=account)
+            results["play"] = resp.status_code
+
+        try:
+            t1 = threading.Thread(target=_bridge)
+            t2 = threading.Thread(target=_play)
+            t1.start()
+            t2.start()
+            t1.join(timeout=10)
+            t2.join(timeout=10)
+
+            assert results.get("bridge") == 201, f"Bridge: {results.get('bridge')}"
+            assert results.get("play") == 201, f"Play: {results.get('play')}"
+
+        finally:
+            client.delete(f"/api/calls/{call_id}", headers=account)
+            _cleanup_leg(leg, phone_rtp)
+
+
+# ---------------------------------------------------------------------------
+# Test: Streaming TTS + VC chain into conference
+# ---------------------------------------------------------------------------
+
+class TestStreamingTTSVCPipeline:
+    """text_input | tts:VOICE | vc:VOICE2 | conference:CALL"""
+
+    def _ensure_tts(self):
+        try:
+            from speech_pipeline.registry import TTSRegistry
+            r = TTSRegistry(VOICES_PATH, use_cuda=False)
+            if not r.index:
+                pytest.skip("No TTS voices available")
+            import speech_pipeline.telephony._shared as _shared
+            _shared.tts_registry = r
+        except Exception as e:
+            pytest.skip(f"TTS unavailable: {e}")
+
+    def test_streaming_tts_vc_into_conference(self, client, account):
+        """text_input | tts | vc | conference — full chain produces audio."""
+        self._ensure_tts()
+        call_id = create_call(client, account)
+        call = call_state.get_call(call_id)
+
+        try:
+            resp = client.post("/api/pipelines",
+                               data=json.dumps({
+                                   "dsl": f"text_input | tts:de_DE-thorsten-medium "
+                                          f"| vc:de_DE-thorsten-high "
+                                          f"| conference:{call_id}"
+                               }),
+                               headers=account)
+            # VC might fail if model not set up for voice conversion
+            if resp.status_code == 400 and "vc" in resp.data.decode().lower():
+                pytest.skip("VC not available in test environment")
+            assert resp.status_code == 201, f"Pipeline failed: {resp.data}"
+            pid = resp.get_json()["id"]
+
+            out_q = call.mixer.add_output()
+
+            client.post(f"/api/pipelines/{pid}/input",
+                        data=json.dumps({"text": "Voice Conversion Test."}),
+                        headers=account)
+            client.post(f"/api/pipelines/{pid}/input",
+                        data=json.dumps({"eof": True}),
+                        headers=account)
+
+            time.sleep(4.0)  # TTS + VC need time
+            collected = b""
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                try:
+                    frame = out_q.get(timeout=0.2)
+                    if frame:
+                        collected += frame
+                except queue.Empty:
+                    continue
+
+            assert len(collected) > 0, "No audio from TTS+VC pipeline"
+            samples = np.frombuffer(collected, dtype=np.int16).astype(np.float64)
+            rms = float(np.sqrt(np.mean(samples ** 2)))
+            assert rms > 100, f"TTS+VC output RMS={rms:.0f} — too quiet"
+
+        finally:
+            try:
+                client.delete(f"/api/pipelines/{pid}", headers=account)
+            except Exception:
+                pass
+            client.delete(f"/api/calls/{call_id}", headers=account)

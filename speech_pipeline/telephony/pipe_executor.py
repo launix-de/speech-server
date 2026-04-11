@@ -370,6 +370,8 @@ class CallPipeExecutor:
         if typ == "webhook":
             if not elem_id:
                 raise ValueError("webhook requires a target URL")
+            from speech_pipeline.url_safety import require_safe_url
+            require_safe_url(elem_id)
             from speech_pipeline.WebhookSink import WebhookSink
             bearer = self._subscriber.get("bearer_token", "") if self._subscriber else ""
             return WebhookSink(elem_id, bearer_token=bearer)
@@ -416,17 +418,9 @@ class CallPipeExecutor:
             bearer = params.get("bearer", "")
             return VCConverter(ref, bearer=bearer)
 
-        # -- record: file recorder sidechain --
-        if typ == "record":
-            if not elem_id:
-                raise ValueError("record requires a filename")
-            from speech_pipeline.AudioTee import AudioTee
-            from speech_pipeline.FileRecorder import FileRecorder
-            rate = int(params.get("rate", 48000))
-            tee = AudioTee(rate, "s16le")
-            recorder = FileRecorder(elem_id, rate)
-            tee.add_sidechain(recorder)
-            return tee
+        # -- record/save: managed file recording with download URL --
+        if typ in ("record", "save"):
+            return self._create_save(elem_id, params)
 
         # -- text_input: queue-backed text source for streaming TTS --
         if typ == "text_input":
@@ -492,6 +486,10 @@ class CallPipeExecutor:
         url = params.get("url", play_id)
         if not url:
             raise ValueError("play requires url")
+        # SSRF check: only allow http(s) URLs to public hosts
+        if url.startswith("http://") or url.startswith("https://"):
+            from speech_pipeline.url_safety import require_safe_url
+            require_safe_url(url)
         volume = params.get("volume", 100)
         stage_id = f"play:{play_id or secrets.token_urlsafe(6)}"
 
@@ -518,6 +516,45 @@ class CallPipeExecutor:
             source = g
         source._play_handle = handle
         return source
+
+    def _create_save(self, save_id, params):
+        """Create a managed file recording with download URL.
+
+        Writes to a safe managed directory. When recording finishes,
+        fires a webhook with the download URL (if ``completed`` param set).
+
+        DSL: ``save:name{"completed":"/callback/path"}``
+        """
+        import os
+        import tempfile
+
+        ext = params.get("format", "wav")
+        if ext not in ("wav", "mp3", "ogg", "flac"):
+            ext = "wav"
+
+        # Managed save directory — no user-controlled paths
+        save_dir = os.path.join(tempfile.gettempdir(), "speech-pipeline-saves")
+        os.makedirs(save_dir, exist_ok=True)
+
+        filename = f"{save_id or secrets.token_urlsafe(8)}.{ext}"
+        # Sanitize: strip path separators
+        filename = filename.replace("/", "_").replace("..", "_")
+        filepath = os.path.join(save_dir, filename)
+
+        rate = int(params.get("rate", 48000))
+        from speech_pipeline.AudioTee import AudioTee
+        from speech_pipeline.FileRecorder import FileRecorder
+
+        tee = AudioTee(rate, "s16le")
+        recorder = FileRecorder(filepath, rate)
+        tee.add_sidechain(recorder)
+
+        # Store metadata for download URL generation
+        tee._save_filepath = filepath
+        tee._save_filename = filename
+        tee._save_completed = params.get("completed", "")
+
+        return tee
 
     def _create_tts(self, voice_name, params):
         # Allow language shortcut: tts:de → de_DE-thorsten-medium

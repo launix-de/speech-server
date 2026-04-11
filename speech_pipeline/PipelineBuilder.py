@@ -360,18 +360,21 @@ class PipelineBuilder:
                 run.stages.append(stage)
                 current_output_type = "pcm"
 
-            elif typ == "record":
-                # record:FILE or record:FILE:RATE
-                # Middle element: wraps in AudioTee, adds FileRecorder sidechain.
+            elif typ in ("record", "save"):
+                # save:NAME or record:NAME — managed file recording.
+                # Writes to safe managed directory, not user-controlled paths.
                 if not params:
-                    raise ValueError("record requires a filename (e.g. record:output.mp3)")
-                filename = params[0]
-                rate = int(params[1]) if len(params) > 1 else None
+                    raise ValueError("save requires a name (e.g. save:recording1)")
 
                 if not current_stage or current_output_type != "pcm":
-                    raise ValueError("record requires PCM upstream")
+                    raise ValueError("save requires PCM upstream")
 
-                # Derive rate from upstream if not specified
+                rate = None
+                if len(params) > 1:
+                    try:
+                        rate = int(params[1])
+                    except ValueError:
+                        pass
                 if rate is None:
                     if current_stage.output_format and current_stage.output_format.sample_rate > 0:
                         rate = current_stage.output_format.sample_rate
@@ -382,6 +385,14 @@ class PipelineBuilder:
                 if current_stage.output_format:
                     encoding = current_stage.output_format.encoding
 
+                import os, tempfile, secrets as _secrets
+                save_dir = os.path.join(tempfile.gettempdir(), "speech-pipeline-saves")
+                os.makedirs(save_dir, exist_ok=True)
+                safe_name = params[0].replace("/", "_").replace("..", "_")
+                if "." not in safe_name:
+                    safe_name += ".wav"
+                filepath = os.path.join(save_dir, safe_name)
+
                 from .AudioTee import AudioTee
                 from .FileRecorder import FileRecorder
 
@@ -390,7 +401,7 @@ class PipelineBuilder:
                     current_stage.pipe(tee)
                 run.stages.append(tee)
 
-                recorder = FileRecorder(filename, rate)
+                recorder = FileRecorder(filepath, rate)
                 tee.add_sidechain(recorder)
                 run.stages.append(recorder)
 

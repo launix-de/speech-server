@@ -210,6 +210,10 @@ def validate_nonce(nonce: str) -> Optional[dict]:
     if time.time() - entry["created"] > entry["ttl"]:
         del _nonces[nonce]
         return None
+    # Single-use: mark as connected, reject reuse
+    if entry.get("connected"):
+        return None
+    entry["connected"] = True
     return entry
 
 

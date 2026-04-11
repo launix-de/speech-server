@@ -931,6 +931,52 @@ def create_app(args: argparse.Namespace) -> Flask:
         resp.call_on_close(lambda: source.cancel())
         return resp
 
+    # ---- WebSocket concurrency limiter (1 per IP for STT/TTS) ----
+    import threading as _ws_threading
+    _ws_active: dict[str, int] = {}   # ip -> count
+    _ws_active_lock = _ws_threading.Lock()
+
+    class _WSConcurrencyGuard:
+        """Context manager: limits concurrent WS connections per IP."""
+        def __init__(self, ip: str, limit: int = 1):
+            self.ip = ip
+            self.limit = limit
+            self.acquired = False
+
+        def __enter__(self):
+            with _ws_active_lock:
+                current = _ws_active.get(self.ip, 0)
+                if current >= self.limit:
+                    return False
+                _ws_active[self.ip] = current + 1
+                self.acquired = True
+                return True
+
+        def __exit__(self, *exc):
+            if self.acquired:
+                with _ws_active_lock:
+                    _ws_active[self.ip] = max(0, _ws_active.get(self.ip, 1) - 1)
+
+    def _ws_require_auth(ws) -> dict | None:
+        """Check Bearer token from query param or first WS message.
+        Returns account dict (or None for admin). Sends error and returns False on failure."""
+        token = request.args.get("token", "")
+        if not token:
+            auth_header = request.headers.get("Authorization", "")
+            if auth_header.startswith("Bearer "):
+                token = auth_header[7:]
+        if not token:
+            return False
+        if not admin_token:
+            return False
+        if token == admin_token:
+            return None  # admin
+        from speech_pipeline.telephony.auth import _find_account_by_token
+        acct = _find_account_by_token(token)
+        if not acct:
+            return False
+        return acct
+
     # ---- WebSocket STT streaming endpoint ----
     @sock.route("/ws/stt")
     def ws_stt(ws):
@@ -939,7 +985,19 @@ def create_app(args: argparse.Namespace) -> Flask:
         Protocol:
         - Client → Server: hello handshake, then binary codec frames
         - Server → Client: hello response, then text NDJSON lines, "__END__" when done
+
+        Rate limit: 1 concurrent connection per IP.
         """
+        client_ip = request.remote_addr or "unknown"
+        guard = _WSConcurrencyGuard(client_ip, limit=1)
+        with guard as allowed:
+            if not allowed:
+                import json as _json
+                ws.send(_json.dumps({"error": "Rate limit: only 1 concurrent STT session per IP"}))
+                return
+            _ws_stt_inner(ws)
+
+    def _ws_stt_inner(ws):
         from lib import SampleRateConverter
         from lib.WhisperSTT import WhisperTranscriber
         from lib import fourier_codec as codec
@@ -1023,7 +1081,19 @@ def create_app(args: argparse.Namespace) -> Flask:
         - Client → Server: hello handshake, then text messages, "__END__" to signal done
         - Server → Client: hello response, then binary codec frames, "__END__" when done
         - Voice via query param: ?voice=de_DE-thorsten-medium
+
+        Rate limit: 1 concurrent connection per IP.
         """
+        client_ip = request.remote_addr or "unknown"
+        guard = _WSConcurrencyGuard(client_ip, limit=1)
+        with guard as allowed:
+            if not allowed:
+                import json as _json
+                ws.send(_json.dumps({"error": "Rate limit: only 1 concurrent TTS session per IP"}))
+                return
+            _ws_tts_inner(ws)
+
+    def _ws_tts_inner(ws):
         from lib import StreamingTTSProducer, SampleRateConverter
         from lib import fourier_codec as codec
         import json as _json
@@ -1107,6 +1177,9 @@ def create_app(args: argparse.Namespace) -> Flask:
     def ws_pipe(ws):
         """Generic pipeline endpoint: client sends JSON config, then data flows.
 
+        Requires authentication: pass token as ?token=... query param
+        or Authorization: Bearer header.
+
         Protocol:
         - Client -> Server: first message is JSON config:
             {"pipe": "ws:pcm | resample:48000:16000 | stt:de | ws:ndjson"}
@@ -1115,8 +1188,14 @@ def create_app(args: argparse.Namespace) -> Flask:
                         "ws:text | tts:de_DE-thorsten-medium | resample:24000:8000 | sip:100@pbx"]}
         - Then data flows according to the pipeline definition.
         """
-        from lib.PipelineBuilder import PipelineBuilder
         import json as _json
+        if admin_token:
+            auth_result = _ws_require_auth(ws)
+            if auth_result is False:
+                ws.send(_json.dumps({"error": "Unauthorized — pass ?token=... or Authorization header"}))
+                return
+
+        from lib.PipelineBuilder import PipelineBuilder
 
         try:
             config_msg = ws.receive(timeout=10)

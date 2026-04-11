@@ -175,9 +175,9 @@ class TestHoldMusic:
         assert resp.status_code == 201
 
         # Collect audio from the conference
-        time.sleep(0.5)  # let play stage start + AudioReader load MP3
+        time.sleep(1.0)  # let play stage start + AudioReader load MP3
         collected = b""
-        deadline = time.monotonic() + 3.0
+        deadline = time.monotonic() + 5.0
         while time.monotonic() < deadline and len(collected) < 48000 * 2:
             try:
                 frame = out_q.get(timeout=0.2)

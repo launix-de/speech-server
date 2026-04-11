@@ -206,8 +206,16 @@ def create_call():
     if aid and sub["account_id"] != aid:
         return ("Forbidden\n", 403)
 
-    # Resolve PBX — account pin takes precedence
+    # Enforce max_concurrent_calls
     acct = auth.get_account(sub["account_id"]) if sub["account_id"] != "__admin__" else None
+    if acct:
+        max_calls = acct.get("max_concurrent_calls", 0)
+        if max_calls > 0:
+            current = len(call_state.list_calls(account_id=sub["account_id"]))
+            if current >= max_calls:
+                return ("Max concurrent calls exceeded\n", 429)
+
+    # Resolve PBX — account pin takes precedence
     requested_pbx = body.get("pbx", "")
     if acct and acct.get("pbx"):
         pbx_id = acct["pbx"]

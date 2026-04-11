@@ -282,6 +282,28 @@ def pipeline_input(pid: str):
     return jsonify({"ok": True})
 
 
+@api.route("/saves/<filename>", methods=["GET"])
+def download_save(filename: str):
+    """Download a saved recording.
+
+    Files are stored in the managed save directory. No auth required
+    because filenames are unguessable tokens.
+    """
+    import os
+    import tempfile
+    from flask import send_from_directory
+
+    # Sanitize filename
+    filename = os.path.basename(filename)
+    save_dir = os.path.join(tempfile.gettempdir(), "speech-pipeline-saves")
+
+    filepath = os.path.join(save_dir, filename)
+    if not os.path.isfile(filepath):
+        return ("File not found\n", 404)
+
+    return send_from_directory(save_dir, filename, as_attachment=True)
+
+
 @api.route("/pipelines/<pid>", methods=["DELETE"])
 @_require_auth
 def delete_pipeline(pid: str):

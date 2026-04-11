@@ -31,10 +31,11 @@ _TTS_CHUNK_SECONDS = 0.10
 # ---------------------------------------------------------------------------
 
 class CallPipeExecutor:
-    def __init__(self, call=None, tts_registry=None, subscriber=None):
+    def __init__(self, call=None, tts_registry=None, subscriber=None, ws=None):
         self.call = call
         self._tts_registry = tts_registry
         self._subscriber = subscriber
+        self._ws = ws                        # WebSocket connection (for ws: elements)
         self._stages: Dict[str, Any] = {}   # play handles for kill
         self._tees: Dict[str, Any] = {}     # tee_id -> AudioTee
         self._sidechain_specs: set[tuple] = set()
@@ -112,9 +113,47 @@ class CallPipeExecutor:
 
     # -- Pipe execution ----------------------------------------------------
 
+    # -- Action elements (single-element, no pipe) --------------------------
+
+    _ACTION_TYPES = {"kill", "answer"}
+
+    def _execute_action(self, typ, elem_id, params) -> bool:
+        """Execute a single-element action. Returns True if handled."""
+        if typ == "kill":
+            if not elem_id:
+                raise ValueError("kill requires a stage ID")
+            if not self.kill_stage(elem_id):
+                raise ValueError(f"Stage '{elem_id}' not found")
+            return True
+
+        if typ == "answer":
+            if not elem_id:
+                raise ValueError("answer requires a leg ID")
+            from . import leg as leg_mod
+            leg = leg_mod.get_leg(elem_id)
+            if not leg:
+                raise ValueError(f"Leg '{elem_id}' not found")
+            # Send 200 OK via sip_stack or pyVoIP
+            from . import sip_stack
+            sip_call_id = getattr(leg, '_sip_call_id', '')
+            if sip_call_id:
+                sip_stack.answer_trunk_leg(sip_call_id)
+            elif leg.voip_call and hasattr(leg.voip_call, 'answer'):
+                leg.voip_call.answer()
+            return True
+
+        return False
+
     def _execute_pipe(self, elements):
         if not elements:
             return
+
+        # Check for single-element actions (kill, answer)
+        if len(elements) == 1:
+            typ, elem_id, params = elements[0]
+            if typ in self._ACTION_TYPES:
+                self._execute_action(typ, elem_id, params)
+                return
 
         # Phase 1: fill in missing IDs (sip without ID = first sip predecessor)
         self._fill_ids(elements)
@@ -230,7 +269,7 @@ class CallPipeExecutor:
         if first_typ == "tee":
             raise ValueError("tee may only start a pipe when attaching to an existing tee sidechain")
 
-        sip_positions = [(i, elem_id) for i, (typ, elem_id, _) in enumerate(elements) if typ == "sip"]
+        sip_positions = [(i, elem_id) for i, (typ, elem_id, _) in enumerate(elements) if typ in ("sip", "originate")]
         sip_ids = [elem_id for _, elem_id in sip_positions]
         if len(sip_ids) > 2:
             raise ValueError("At most two sip stages are allowed per pipe")
@@ -348,6 +387,10 @@ class CallPipeExecutor:
             with self._lock:
                 self._tees[elem_id] = tee
             return tee
+
+        # -- originate: dial outbound, create SIP leg --
+        if typ == "originate":
+            return self._create_originate(elem_id, params)
 
         # -- sip: resolve leg session, create Source or Sink --
         if typ == "sip":
@@ -517,6 +560,69 @@ class CallPipeExecutor:
         source._play_handle = handle
         return source
 
+    def _create_originate(self, number, params):
+        """Originate an outbound SIP call. Returns session (like _create_sip).
+
+        DSL: originate:+49170...{"ringing":"/cb","answered":"/cb","completed":"/cb"}
+        Bidirectional: originate:NUM{...} -> call:X -> originate:NUM
+        """
+        if not number:
+            raise ValueError("originate requires a phone number")
+        if not self.call:
+            raise ValueError("originate requires a call context (use call:ID in the DSL)")
+
+        from . import leg as leg_mod, pbx as pbx_reg, auth as auth_mod
+
+        # Resolve PBX from call
+        pbx_entry = pbx_reg.get(self.call.pbx_id)
+        if not pbx_entry:
+            raise ValueError(f"PBX {self.call.pbx_id} not found")
+
+        # PBX access check
+        if self.call.account_id and self.call.account_id != "__admin__":
+            if not auth_mod.check_pbx_access(self.call.account_id, self.call.pbx_id):
+                raise ValueError(f"Account not allowed to use PBX {self.call.pbx_id}")
+
+        # Create leg
+        leg = leg_mod.create_leg("outbound", number, self.call.pbx_id,
+                                  self.call.subscriber_id)
+        leg.callbacks = {k: v for k, v in params.items()
+                         if k in ("ringing", "answered", "completed", "failed",
+                                  "no-answer", "busy", "canceled", "caller_id")}
+        leg.call_id = self.call.call_id
+        leg.caller_id = params.get("caller_id", "")
+
+        # Originate in background — fires callbacks, waits for answer
+        # On answer, the leg gets a sip_session that SIPSource/SIPSink can use.
+        leg_mod.originate_only(leg, pbx_entry)
+
+        # Wait for answer (up to 30s)
+        deadline = time.time() + 30
+        while leg.status not in ("answered", "in-progress", "failed", "completed"):
+            if time.time() > deadline:
+                raise ValueError(f"Originate to {number} timed out")
+            time.sleep(0.2)
+
+        if leg.status in ("failed", "completed"):
+            raise ValueError(f"Originate to {number} failed (status={leg.status})")
+
+        # Leg is answered — get session for SIPSource/SIPSink wrapping
+        session = leg.sip_session
+        if not session:
+            raise ValueError(f"Leg {leg.leg_id} answered but no SIP session")
+
+        # Store in sessions cache (same as _create_sip)
+        session_key = f"sip:{leg.leg_id}"
+        self._sessions[session_key] = session
+        self._sessions[f"_leg:{leg.leg_id}"] = leg
+
+        leg.status = "in-progress"
+        leg.answered_at = leg.answered_at or time.time()
+        self.call.register_participant(leg.leg_id, type="sip",
+                                       direction="outbound",
+                                       number=number)
+        return session
+
     def _create_save(self, save_id, params):
         """Create a managed file recording with download URL.
 
@@ -590,7 +696,7 @@ class CallPipeExecutor:
     # -- SIP wrapping ------------------------------------------------------
 
     def _wrap_sip(self, resolved):
-        """Replace sip sessions with SIPSource (first) / SIPSink (last)."""
+        """Replace sip/originate sessions with SIPSource (first) / SIPSink (last)."""
         from speech_pipeline.SIPSource import SIPSource
         from speech_pipeline.SIPSink import SIPSink
 
@@ -598,11 +704,11 @@ class CallPipeExecutor:
         sip_seen = {}  # leg_id -> "source" created
         sip_counts = {}
         for typ, elem_id, _, _ in resolved:
-            if typ == "sip":
+            if typ in ("sip", "originate"):
                 sip_counts[elem_id] = sip_counts.get(elem_id, 0) + 1
 
         for i, (typ, elem_id, params, stage) in enumerate(resolved):
-            if typ != "sip":
+            if typ not in ("sip", "originate"):
                 result.append((typ, elem_id, params, stage))
                 continue
 

@@ -119,6 +119,16 @@ def create_pipeline():
                 call = c
                 break
 
+    # If kill: action, find the executor that owns the stage.
+    if not call and elements and elements[0][0] == "kill":
+        stage_id = elements[0][1]
+        from .telephony import call_state
+        for c in call_state.list_calls():
+            ex = getattr(c, "pipe_executor", None)
+            if ex and stage_id in ex._stages:
+                call = c
+                break
+
     # Reuse existing executor for the call (preserves tees/stages),
     # or create a new one for standalone pipelines.
     tts_registry = _shared.tts_registry

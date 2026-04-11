@@ -150,6 +150,113 @@ def create_pipeline():
     return jsonify(pipeline.to_dict()), 201
 
 
+@api.route("/pipelines/render", methods=["POST"])
+@_require_auth
+def render_pipeline():
+    """Render a pipeline synchronously and return the audio as WAV.
+
+    Body: ``{"dsl": "tts:de{\"text\":\"Hallo\"} | pitch:2.0"}``
+
+    The pipeline must be a pure audio chain (no sip, call, conference,
+    webhook). The output is collected in memory and returned as a WAV
+    file with Content-Type audio/wav.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    dsl = body.get("dsl", "").strip()
+    if not dsl:
+        return ("Missing 'dsl' in request body\n", 400)
+
+    from .dsl_parser import parse_dsl
+
+    try:
+        elements = parse_dsl(dsl)
+    except ValueError as e:
+        return (f"DSL parse error: {e}\n", 400)
+
+    # Reject elements that require a live call
+    live_types = {"sip", "call", "conference", "webhook", "text_input"}
+    for typ, _, _ in elements:
+        if typ in live_types:
+            return (f"render does not support '{typ}' — use POST /api/pipelines instead\n", 400)
+
+    from .telephony.pipe_executor import CallPipeExecutor
+    from .telephony import _shared
+
+    executor = CallPipeExecutor(call=None, tts_registry=_shared.tts_registry)
+
+    try:
+        results = executor.add_pipes([dsl])
+    except Exception as e:
+        return (f"Build error: {e}\n", 400)
+
+    for r in results:
+        if not r.get("ok"):
+            return (f"Pipe error: {r.get('error', 'unknown')}\n", 400)
+
+    # The executor ran the pipeline — for offline TTS, the stages have
+    # already produced audio. But add_pipes runs asynchronously.
+    # For synchronous rendering, we need to build and drain manually.
+    import io
+    import struct
+    import wave
+
+    try:
+        resolved_elements = parse_dsl(dsl)
+        stages = []
+        for typ, elem_id, params in resolved_elements:
+            stages.append(executor._create_stage(typ, elem_id, params))
+
+        # Resolve streaming TTS
+        for i, stage in enumerate(stages):
+            if getattr(stage, '_streaming', False):
+                if i == 0:
+                    return ("Streaming tts requires upstream text source\n", 400)
+                upstream = stages[i - 1]
+                def _text_iter(src):
+                    for chunk in src.stream_pcm24k():
+                        yield chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
+                from .StreamingTTSProducer import StreamingTTSProducer
+                stages[i] = StreamingTTSProducer(_text_iter(upstream), stage.voice, stage.syn)
+
+        # Chain stages via pipe()
+        from .StreamingTTSProducer import StreamingTTSProducer as _STTS
+        for i in range(len(stages) - 1):
+            if isinstance(stages[i + 1], _STTS):
+                continue  # StreamingTTS reads from its own iterator
+            stages[i].pipe(stages[i + 1])
+
+        # Drain the last stage
+        last = stages[-1]
+        pcm = b""
+        sample_rate = 22050  # default
+        if last.output_format and last.output_format.sample_rate > 0:
+            sample_rate = last.output_format.sample_rate
+        for chunk in last.stream_pcm24k():
+            pcm += chunk
+
+    except Exception as e:
+        return (f"Render error: {e}\n", 400)
+
+    if not pcm:
+        return ("Pipeline produced no audio\n", 422)
+
+    # Build WAV
+    buf = io.BytesIO()
+    w = wave.open(buf, "wb")
+    w.setnchannels(1)
+    w.setsampwidth(2)
+    w.setframerate(sample_rate)
+    w.writeframes(pcm)
+    w.close()
+
+    from flask import Response
+    return Response(
+        buf.getvalue(),
+        mimetype="audio/wav",
+        headers={"Content-Disposition": "attachment; filename=render.wav"},
+    )
+
+
 @api.route("/pipelines/<pid>/input", methods=["POST"])
 @_require_auth
 def pipeline_input(pid: str):

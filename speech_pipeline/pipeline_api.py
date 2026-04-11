@@ -85,6 +85,10 @@ def create_pipeline():
     if not dsl:
         return ("Missing 'dsl' in request body\n", 400)
 
+    # Render mode: synchronous execution, returns WAV
+    if body.get("render"):
+        return _render_pipeline(dsl)
+
     # Ownership check
     err = _check_call_ownership(dsl)
     if err:
@@ -160,22 +164,8 @@ def create_pipeline():
     return jsonify(pipeline.to_dict()), 201
 
 
-@api.route("/pipelines/render", methods=["POST"])
-@_require_auth
-def render_pipeline():
-    """Render a pipeline synchronously and return the audio as WAV.
-
-    Body: ``{"dsl": "tts:de{\"text\":\"Hallo\"} | pitch:2.0"}``
-
-    The pipeline must be a pure audio chain (no sip, call, conference,
-    webhook). The output is collected in memory and returned as a WAV
-    file with Content-Type audio/wav.
-    """
-    body = request.get_json(force=True, silent=True) or {}
-    dsl = body.get("dsl", "").strip()
-    if not dsl:
-        return ("Missing 'dsl' in request body\n", 400)
-
+def _render_pipeline(dsl: str):
+    """Render a pipeline synchronously and return audio as WAV."""
     from .dsl_parser import parse_dsl
 
     try:
@@ -290,6 +280,17 @@ def pipeline_input(pid: str):
         q.put(None)
 
     return jsonify({"ok": True})
+
+
+@api.route("/pipelines/render", methods=["POST"])
+@_require_auth
+def render_pipeline_legacy():
+    """Deprecated: use POST /api/pipelines with {"render": true} instead."""
+    body = request.get_json(force=True, silent=True) or {}
+    dsl = body.get("dsl", "").strip()
+    if not dsl:
+        return ("Missing 'dsl' in request body\n", 400)
+    return _render_pipeline(dsl)
 
 
 @api.route("/saves/<filename>", methods=["GET"])

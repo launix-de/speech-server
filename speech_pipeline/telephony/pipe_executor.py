@@ -115,7 +115,7 @@ class CallPipeExecutor:
 
     # -- Action elements (single-element, no pipe) --------------------------
 
-    _ACTION_TYPES = {"kill", "answer"}
+    _ACTION_TYPES = {"kill", "answer", "webclient"}
 
     def _execute_action(self, typ, elem_id, params) -> bool:
         """Execute a single-element action. Returns True if handled."""
@@ -140,6 +140,63 @@ class CallPipeExecutor:
                 sip_stack.answer_trunk_leg(sip_call_id)
             elif leg.voip_call and hasattr(leg.voip_call, 'answer'):
                 leg.voip_call.answer()
+            return True
+
+        if typ == "webclient":
+            if not self.call:
+                raise ValueError("webclient requires a call context")
+            user = elem_id or "anonymous"
+            callback = params.get("callback", "")
+            base_url = params.get("base_url", "")
+            if not base_url:
+                raise ValueError("webclient requires base_url")
+
+            from . import auth, webclient as wc, _shared
+            from . import subscriber as sub_mod
+
+            if not auth.check_feature(self.call.account_id, "webclient"):
+                raise ValueError("Account lacks webclient feature")
+
+            nonce_entry = auth.create_nonce(
+                account_id=self.call.account_id,
+                subscriber_id=self.call.subscriber_id,
+                user=user)
+            nonce = nonce_entry["nonce"]
+
+            sess = wc.register_webclient(self.call, user, nonce,
+                                          dsl=params.get("dsl"),
+                                          pipes=params.get("pipes"))
+            session_id = sess["session_id"]
+
+            self.call.register_participant(session_id, type="webclient",
+                                           user=user, nonce=nonce,
+                                           callback=callback)
+
+            from urllib.parse import urlencode
+            query = urlencode({
+                "base": base_url,
+                "session": session_id,
+                "dsl": sess["dsl"],
+            })
+            iframe_url = f"{base_url}/phone/{nonce}?{query}"
+            _LOGGER.info("WebClient slot for call %s: %s",
+                         self.call.call_id, iframe_url)
+
+            # Fire callback with iframe_url
+            if callback:
+                sub = sub_mod.get(self.call.subscriber_id)
+                if sub:
+                    url = _shared.subscriber_url(sub, callback)
+                    _shared.post_webhook(url, {
+                        "callId": self.call.call_id,
+                        "command": "webclient",
+                        "participantId": session_id,
+                        "result": "ready",
+                        "iframe_url": iframe_url,
+                        "nonce": nonce,
+                        "user": user,
+                        "session_id": session_id,
+                    }, sub["bearer_token"])
             return True
 
         return False

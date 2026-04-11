@@ -94,56 +94,26 @@ Happy to answer questions!
 
 ---
 
-## r/Python
+## r/Python (Monthly Showcase Thread — no standalone posts allowed)
 
-**Title:** speech-server: composable audio pipeline library with automatic format conversion -- TTS, STT, SIP conferencing, voice conversion
+**Comment in pinned "What did you build" thread:**
 
-**Body:**
+**[speech-server](https://github.com/launix-de/speech-server)** -- composable audio pipeline library with automatic format conversion. TTS, STT, SIP conferencing, voice conversion.
 
-I've been working on a Python library for real-time audio processing that uses a pipe-based architecture similar to UNIX pipes. Stages snap together with `.pipe()` and format conversion (sample rate, encoding) is inserted automatically:
+Stages snap together with `.pipe()` and format conversion is inserted automatically:
 
 ```python
 source = TTSProducer(voice, syn, text="Hello!")
-pipeline = (
-    source
-    .pipe(VCConverter("target_voice.wav"))    # voice conversion
-    .pipe(PitchAdjuster(pitch_override_st=2.0))  # pitch shift
-    .pipe(FileRecorder("output.wav", sample_rate=24000))
-)
-pipeline.run()
+source.pipe(VCConverter("target.wav")).pipe(PitchAdjuster(pitch_override_st=2.0)).pipe(FileRecorder("out.wav"))
 ```
 
-Or as a DSL string:
+Or as a DSL: `cli:text | tts:de_DE-thorsten-medium | cli:raw`
 
-```python
-# CLI
-echo "Hello" | speech-pipeline run "cli:text | tts:en_US-amy-medium | cli:raw" > out.raw
-```
+The architecture: every Stage declares `input_format` and `output_format`. `a.pipe(b)` auto-inserts sample rate and encoding converters. A 48kHz Opus SIP leg piped into 16kHz Whisper STT just works.
 
-The interesting part architecturally: every `Stage` declares `input_format` and `output_format` (sample rate + encoding). When you call `a.pipe(b)`, it inspects both formats and auto-inserts `SampleRateConverter` or `EncodingConverter` stages as needed. So you can pipe a 48kHz Opus SIP leg into a 16kHz Whisper STT without thinking about resampling.
+Includes a full SIP telephony platform (conferencing, mix-minus, Opus/G722/PCMU/PCMA codec negotiation), real-time Whisper STT, Piper TTS, FreeVC voice conversion. REST API for pipeline control. 430+ tests with RTP audio quality verification.
 
-**What's in the box:**
-
-- **TTS:** Piper ONNX (streaming, multi-voice)
-- **STT:** faster-whisper (real-time, chunked)
-- **Voice Conversion:** FreeVC
-- **SIP telephony:** Full conferencing platform with mix-minus, codec negotiation (Opus/G722/PCMU/PCMA), webhook-driven call control
-- **Browser audio:** Custom FFT codec over WebSocket
-- **REST API:** Create pipelines via DSL, render TTS as WAV, stream text into live conferences
-
-The pipeline DSL supports both `|` and `->` separators with inline JSON params:
-
-```
-sip:leg1{"completed":"/callback"} -> tee:tap -> call:conference1 -> sip:leg1
-tee:tap -> stt:de -> webhook:https://example.com/transcript
-text_input | tts:de_DE-thorsten-medium | vc:target_voice | conference:call1
-```
-
-One parser, one API endpoint for everything.
-
-~430 tests including end-to-end audio quality checks -- we pump real audio (MP3) through RTP sessions and measure output similarity via cross-correlation. Every codec (PCMU, PCMA, G722, Opus) is tested individually and in cross-codec conferences.
-
-GPLv3 licensed, production-tested. GitHub: https://github.com/launix-de/speech-server
+We use it in production as a self-hosted Twilio alternative. GPLv3. https://github.com/launix-de/speech-server
 
 ---
 

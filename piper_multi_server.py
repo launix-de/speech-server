@@ -865,49 +865,26 @@ def create_app(args: argparse.Namespace) -> Flask:
         resp.call_on_close(lambda: writer.cancel())
         return resp
 
-    # ---- STT: Whisper streaming endpoint ----
-    @app.route("/inputstream", methods=["POST", "PUT", "OPTIONS"])
-    def inputstream():
-        """Receive raw PCM (s16le, mono) and stream back NDJSON transcription.
-
-        Accepts X-Sample-Rate header (default 16000). If != 16000,
-        a SampleRateConverter stage resamples via ffmpeg.
-
-        Pipeline: PCMInputReader -> [SampleRateConverter] -> WhisperTranscriber -> NDJSON
-        """
-        if request.method == "OPTIONS":
-            return ("", 204)
-
-        from lib import PCMInputReader, SampleRateConverter
-        from lib.WhisperSTT import WhisperTranscriber
-
-        src_rate = int(request.headers.get('X-Sample-Rate', 16000))
-        model_size = getattr(args, 'whisper_model', 'small')
-
-        # Use raw WSGI input — Werkzeug returns empty BytesIO() for
-        # chunked requests without Content-Length (browser streaming).
-        source = PCMInputReader(request.environ['wsgi.input'])
-        pipeline = source
-        if src_rate != 16000:
-            pipeline = pipeline.pipe(SampleRateConverter(src_rate, 16000))
-        pipeline = pipeline.pipe(WhisperTranscriber(model_size))
-
-        def generate():
-            for chunk in pipeline.stream_pcm24k():
-                if source.cancelled:
-                    break
-                yield chunk
-
-        resp = Response(stream_with_context(generate()), mimetype="application/x-ndjson")
-        resp.headers["X-Accel-Buffering"] = "no"
-        resp.call_on_close(lambda: source.cancel())
-        return resp
+    # /inputstream removed — use /ws/stt or POST /api/pipelines instead
 
     # ---- Streaming TTS: params via GET, POST body = text stream, response = audio stream ----
     @app.route("/tts/stream", methods=["POST", "PUT", "OPTIONS"])
     def tts_stream():
         if request.method == "OPTIONS":
             return ("", 204)
+        # Rate limit: 1 concurrent per IP (same as /tts/say)
+        client_ip = _get_real_ip()
+        with _http_tts_lock:
+            if _http_tts_active.get(client_ip, 0) >= 1:
+                return ("Rate limit: only 1 concurrent TTS request per IP\n", 429)
+            _http_tts_active[client_ip] = _http_tts_active.get(client_ip, 0) + 1
+        try:
+            return _tts_stream_inner()
+        finally:
+            with _http_tts_lock:
+                _http_tts_active[client_ip] = max(0, _http_tts_active.get(client_ip, 1) - 1)
+
+    def _tts_stream_inner():
         model_id = request.args.get("voice", default_model_id)
         voice = registry.ensure_loaded(model_id)
         syn = registry.create_synthesis_config(voice, request.args.to_dict())

@@ -28,6 +28,7 @@ from speech_pipeline.RTPSession import RTPSession, RTPCallSession
 from speech_pipeline.rtp_codec import PCMU, PCMA, G722, Opus
 
 QUEUE_MP3 = os.path.join(os.path.dirname(__file__), "..", "examples", "queue.mp3")
+VOICES_PATH = os.path.join(os.path.dirname(__file__), "..", "voices-piper")
 _DURATION_S = 0.5  # short for fast tests
 
 
@@ -1350,5 +1351,142 @@ class TestInboundFlow:
             assert resp.status_code == 200
 
         finally:
+            client.delete(f"/api/calls/{call_id}", headers=account)
+            _cleanup_leg(leg, phone_rtp)
+
+
+# ---------------------------------------------------------------------------
+# Test: Streaming TTS → Conference (source-only input)
+# ---------------------------------------------------------------------------
+
+class TestStreamingTTSPipeline:
+    """text_input | tts:VOICE | conference:CALL — streaming TTS into conference."""
+
+    def _ensure_tts(self):
+        try:
+            from speech_pipeline.registry import TTSRegistry
+            r = TTSRegistry(VOICES_PATH, use_cuda=False)
+            if not r.index:
+                pytest.skip("No TTS voices available")
+            import speech_pipeline.telephony._shared as _shared
+            _shared.tts_registry = r
+            return r
+        except Exception as e:
+            pytest.skip(f"TTS unavailable: {e}")
+
+    def test_streaming_tts_into_conference(self, client, account):
+        """text_input | tts:VOICE | conference:CALL — text produces audio."""
+        self._ensure_tts()
+        call_id = create_call(client, account)
+        call = call_state.get_call(call_id)
+
+        try:
+            resp = client.post("/api/pipelines",
+                               data=json.dumps({
+                                   "dsl": f"text_input | tts:de_DE-thorsten-medium | conference:{call_id}"
+                               }),
+                               headers=account)
+            assert resp.status_code == 201, f"Pipeline creation failed: {resp.data}"
+            pid = resp.get_json()["id"]
+
+            out_q = call.mixer.add_output()
+
+            client.post(f"/api/pipelines/{pid}/input",
+                        data=json.dumps({"text": "Hallo, das ist ein Test."}),
+                        headers=account)
+            client.post(f"/api/pipelines/{pid}/input",
+                        data=json.dumps({"eof": True}),
+                        headers=account)
+
+            time.sleep(3.0)
+            collected = b""
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                try:
+                    frame = out_q.get(timeout=0.2)
+                    if frame:
+                        collected += frame
+                except queue.Empty:
+                    continue
+
+            assert len(collected) > 0, "No TTS audio in conference"
+            samples = np.frombuffer(collected, dtype=np.int16).astype(np.float64)
+            rms = float(np.sqrt(np.mean(samples ** 2)))
+            assert rms > 200, f"TTS audio RMS={rms:.0f} — too quiet"
+
+        finally:
+            client.delete(f"/api/pipelines/{pid}", headers=account)
+            client.delete(f"/api/calls/{call_id}", headers=account)
+
+    def test_streaming_tts_heard_by_sip_leg(self, client, account):
+        """SIP leg hears streaming TTS in same conference."""
+        self._ensure_tts()
+        call_id = create_call(client, account)
+        leg, phone_rtp, _ = _make_rtp_leg(codec=PCMU)
+
+        try:
+            client.post("/api/pipelines",
+                        data=json.dumps({
+                            "dsl": f"sip:{leg.leg_id} -> call:{call_id} -> sip:{leg.leg_id}"
+                        }),
+                        headers=account)
+
+            resp = client.post("/api/pipelines",
+                               data=json.dumps({
+                                   "dsl": f"text_input | tts:de_DE-thorsten-medium | conference:{call_id}"
+                               }),
+                               headers=account)
+            assert resp.status_code == 201
+            pid = resp.get_json()["id"]
+
+            time.sleep(0.5)
+
+            # Start collecting audio from phone in a background thread
+            # BEFORE feeding text — so we catch the TTS output as it arrives
+            phone_collected = []
+
+            def _collect():
+                deadline = time.monotonic() + 8.0
+                while time.monotonic() < deadline:
+                    try:
+                        frame = phone_rtp.rx_queue.get(timeout=0.2)
+                        if frame:
+                            phone_collected.append(frame)
+                    except queue.Empty:
+                        continue
+
+            collector = threading.Thread(target=_collect, daemon=True)
+            collector.start()
+
+            # Feed text (TTS synthesis takes 1-3s)
+            client.post(f"/api/pipelines/{pid}/input",
+                        data=json.dumps({"text": "Das ist eine Testansage."}),
+                        headers=account)
+            client.post(f"/api/pipelines/{pid}/input",
+                        data=json.dumps({"eof": True}),
+                        headers=account)
+
+            collector.join(timeout=10)
+
+            received = b"".join(phone_collected)
+            assert len(received) > 0, "Phone received no audio at all"
+
+            # Check non-silent frames (TTS arrives after initial silence)
+            samples = np.frombuffer(received, dtype=np.int16).astype(np.float64)
+            # Find peak RMS in 100ms windows
+            window = int(phone_rtp.codec.sample_rate * 0.1) * 2  # bytes
+            peak_rms = 0.0
+            for i in range(0, len(received) - window, window):
+                chunk = np.frombuffer(received[i:i + window],
+                                       dtype=np.int16).astype(np.float64)
+                r = float(np.sqrt(np.mean(chunk ** 2)))
+                peak_rms = max(peak_rms, r)
+
+            assert peak_rms > 100, (
+                f"Phone peak RMS={peak_rms:.0f} — TTS not reaching SIP leg"
+            )
+
+        finally:
+            client.delete(f"/api/pipelines/{pid}", headers=account)
             client.delete(f"/api/calls/{call_id}", headers=account)
             _cleanup_leg(leg, phone_rtp)

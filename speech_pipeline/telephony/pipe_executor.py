@@ -132,6 +132,30 @@ class CallPipeExecutor:
             stage = self._create_stage(typ, elem_id, params)
             resolved.append((typ, elem_id, params, stage))
 
+        # Phase 3b: resolve streaming TTS placeholders.
+        # If tts has no fixed text, it needs an upstream text source
+        # (text_input or similar). Wire them via StreamingTTSProducer.
+        for i, (typ, elem_id, params, stage) in enumerate(resolved):
+            if not getattr(stage, '_streaming', False):
+                continue
+            if i == 0:
+                raise ValueError("Streaming tts requires an upstream text source")
+            # Find the upstream stage and create a text iterator from it
+            _, _, _, upstream = resolved[i - 1]
+            def _text_iter_from_stage(src):
+                for chunk in src.stream_pcm24k():
+                    if isinstance(chunk, bytes):
+                        yield chunk.decode("utf-8", errors="replace")
+                    else:
+                        yield str(chunk)
+            from speech_pipeline.StreamingTTSProducer import StreamingTTSProducer
+            tts_stage = StreamingTTSProducer(
+                _text_iter_from_stage(upstream),
+                stage.voice,
+                stage.syn,
+            )
+            resolved[i] = (typ, elem_id, params, tts_stage)
+
         # Phase 4: wrap SIP sessions with SIPSource/SIPSink
         resolved = self._wrap_sip(resolved)
 
@@ -149,12 +173,17 @@ class CallPipeExecutor:
         # Skip source→ConferenceLeg ONLY when ConferenceLeg is the LAST element
         # (source-only pipe like play:→call: or tts:→call:).
         # For bidirectional pipes (sip:→call:→sip:), pipe() must connect everything.
+        # Also skip upstream→StreamingTTS (TTS reads text directly from iterator).
         from speech_pipeline.ConferenceLeg import ConferenceLeg as _CL
+        from speech_pipeline.StreamingTTSProducer import StreamingTTSProducer as _STTS
         for i in range(len(resolved) - 1):
             l_typ, _, _, l_stage = resolved[i]
             _, _, _, r_stage = resolved[i + 1]
             if isinstance(r_stage, _CL) and i + 1 == len(resolved) - 1:
                 # Last element is ConferenceLeg → source-only, use mixer.add_source
+                continue
+            if isinstance(r_stage, _STTS):
+                # StreamingTTS reads text from its own iterator, not via pipe()
                 continue
             l_stage.pipe(r_stage)
 
@@ -494,21 +523,32 @@ class CallPipeExecutor:
         # Allow language shortcut: tts:de → de_DE-thorsten-medium
         if not voice_name or voice_name == "de":
             voice_name = "de_DE-thorsten-medium"
-        text = params.get("text", "")
-        if not text:
-            raise ValueError("tts requires text")
         if not self._tts_registry:
             raise ValueError("TTS not available")
-        from speech_pipeline.TTSProducer import TTSProducer
         voice = self._tts_registry.ensure_loaded(voice_name)
         syn = self._tts_registry.create_synthesis_config(voice, {})
-        return TTSProducer(
-            voice,
-            syn,
-            text,
-            sentence_silence=0.0,
-            chunk_seconds=_TTS_CHUNK_SECONDS,
-        )
+
+        text = params.get("text", "")
+        if text:
+            # Fixed text mode: TTSProducer with known text
+            from speech_pipeline.TTSProducer import TTSProducer
+            return TTSProducer(
+                voice,
+                syn,
+                text,
+                sentence_silence=0.0,
+                chunk_seconds=_TTS_CHUNK_SECONDS,
+            )
+        else:
+            # Streaming mode: will be wired to upstream text source.
+            # Mark as streaming — _execute_pipe will connect the iterator.
+            from speech_pipeline.StreamingTTSProducer import StreamingTTSProducer
+            placeholder = type("_StreamingTTSPlaceholder", (), {
+                "voice": voice,
+                "syn": syn,
+                "_streaming": True,
+            })()
+            return placeholder
 
     # -- SIP wrapping ------------------------------------------------------
 

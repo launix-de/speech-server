@@ -598,10 +598,30 @@ def create_app(args: argparse.Namespace) -> Flask:
         return jsonify(result)
 
     @app.route("/", methods=["OPTIONS"])  # CORS preflight
+    @app.route("/tts/say", methods=["OPTIONS"])
     def options_root() -> Tuple[str, int, Dict[str, str]]:
         return ("", 204, {})
 
-    @app.route("/", methods=["GET", "POST"])  # synthesize
+    # ---- Rate limiter for HTTP TTS (1 concurrent per real client IP) ----
+    _http_tts_active: dict[str, int] = {}
+    _http_tts_lock = _ws_threading.Lock()
+
+    @app.route("/tts/say", methods=["GET", "POST"])
+    @app.route("/", methods=["GET", "POST"])  # legacy compat
+    def synthesize() -> Any:
+        # Rate limit: 1 concurrent TTS request per IP
+        client_ip = _get_real_ip()
+        with _http_tts_lock:
+            if _http_tts_active.get(client_ip, 0) >= 1:
+                return ("Rate limit: only 1 concurrent TTS request per IP\n", 429)
+            _http_tts_active[client_ip] = _http_tts_active.get(client_ip, 0) + 1
+        try:
+            return _synthesize_inner()
+        finally:
+            with _http_tts_lock:
+                _http_tts_active[client_ip] = max(0, _http_tts_active.get(client_ip, 1) - 1)
+
+    def _synthesize_inner() -> Any:
     def synthesize() -> Any:
         # Accept JSON or form/query parameters for flexibility
         payload: Dict[str, Any] = {}
@@ -931,8 +951,17 @@ def create_app(args: argparse.Namespace) -> Flask:
         resp.call_on_close(lambda: source.cancel())
         return resp
 
-    # ---- WebSocket concurrency limiter (1 per IP for STT/TTS) ----
+    # ---- Real IP detection (for rate limiting behind reverse proxy) ----
     import threading as _ws_threading
+
+    def _get_real_ip() -> str:
+        """Get real client IP behind reverse proxy (X-Forwarded-For)."""
+        forwarded = request.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+        return request.remote_addr or "unknown"
+
+    # ---- WebSocket concurrency limiter (1 per IP for STT/TTS) ----
     _ws_active: dict[str, int] = {}   # ip -> count
     _ws_active_lock = _ws_threading.Lock()
 
@@ -988,7 +1017,7 @@ def create_app(args: argparse.Namespace) -> Flask:
 
         Rate limit: 1 concurrent connection per IP.
         """
-        client_ip = request.remote_addr or "unknown"
+        client_ip = _get_real_ip()
         guard = _WSConcurrencyGuard(client_ip, limit=1)
         with guard as allowed:
             if not allowed:
@@ -1084,7 +1113,7 @@ def create_app(args: argparse.Namespace) -> Flask:
 
         Rate limit: 1 concurrent connection per IP.
         """
-        client_ip = request.remote_addr or "unknown"
+        client_ip = _get_real_ip()
         guard = _WSConcurrencyGuard(client_ip, limit=1)
         with guard as allowed:
             if not allowed:

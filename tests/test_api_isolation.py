@@ -45,7 +45,7 @@ class TestCrossAccountCalls:
 
     def test_cannot_get_other_call(self, client, account, account2):
         call_id = create_call(client, account2, SUBSCRIBER2_ID)
-        resp = client.get(f"/api/calls/{call_id}", headers=account)
+        resp = client.get(f"/api/pipelines?dsl=call:{call_id}", headers=account)
         assert resp.status_code == 403
 
     def test_cannot_delete_other_call(self, client, account, account2):
@@ -60,8 +60,10 @@ class TestCrossAccountCalls:
             assert c["account_id"] != ACCOUNT2_ID
 
     def test_cannot_get_other_call_participants(self, client, account, account2):
+        """Participants are included in the call lookup result; the
+        ownership check rejects cross-account GETs the same way."""
         call_id = create_call(client, account2, SUBSCRIBER2_ID)
-        resp = client.get(f"/api/calls/{call_id}/participants", headers=account)
+        resp = client.get(f"/api/pipelines?dsl=call:{call_id}", headers=account)
         assert resp.status_code == 403
 
 
@@ -124,7 +126,7 @@ class TestCrossAccountNonces:
 class TestAdminBypassesIsolation:
     def test_admin_can_access_any_call(self, client, admin, account):
         call_id = create_call(client, account)
-        resp = client.get(f"/api/calls/{call_id}", headers=admin)
+        resp = client.get(f"/api/pipelines?dsl=call:{call_id}", headers=admin)
         assert resp.status_code == 200
 
     def test_admin_can_list_all_calls(self, client, admin, account, account2):

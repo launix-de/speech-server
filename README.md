@@ -424,7 +424,9 @@ Leg operations use the pipeline DSL:
 | `POST /api/legs/{id}/bridge` | `POST /api/pipelines {"dsl": "sip:LEG -> call:C -> sip:LEG"}` |
 | `GET /api/legs/{id}` | `GET /api/pipelines?dsl=sip:LEG` |
 | `DELETE /api/calls/{id}/stages/{sid}` | `DELETE /api/pipelines {"dsl": "STAGE_ID"}` |
-| `POST /api/calls/{id}/commands (webclient)` | `POST /api/pipelines {"dsl": "webclient:USER{cb,base_url}"}` |
+| `POST /api/calls/{id}/commands (webclient)` | `POST /api/pipelines {"dsl": "webclient:USER{cb,base_url,call_id}"}` |
+| `GET /api/calls/{id}` | `GET /api/pipelines?dsl=call:ID` (participants included) |
+| `GET /api/calls/{id}/participants` | `GET /api/pipelines?dsl=call:ID` (nested `participants`) |
 
 #### Nonce Management (for webclient auth)
 

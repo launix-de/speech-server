@@ -62,6 +62,19 @@ def start_listener(pbx_id: str, pbx_entry: dict) -> None:
     if pbx_id in _phones:
         return
 
+    # Skip listeners for PBX entries without SIP credentials — otherwise
+    # pyVoIP's ``VoIPPhone.start`` blocks on REGISTER against ``""`` / a
+    # nonexistent proxy and deadlocks the caller (the HTTP request
+    # creating the PBX).  Tests/configurations that only use the
+    # built-in sip_stack for trunking don't need this listener.
+    sip_proxy = pbx_entry.get("sip_proxy") or ""
+    sip_user = pbx_entry.get("sip_user") or ""
+    if not sip_proxy or not sip_user:
+        _LOGGER.info("PBX %s: no sip_proxy/sip_user set — skipping "
+                     "in-process SIP listener (built-in sip_stack handles trunking)",
+                     pbx_id)
+        return
+
     try:
         from pyVoIP.VoIP.VoIP import VoIPPhone
     except ImportError:
@@ -70,9 +83,7 @@ def start_listener(pbx_id: str, pbx_entry: dict) -> None:
 
     from speech_pipeline.SIPSession import _find_free_udp_port, _patch_voip_phone
 
-    sip_proxy = pbx_entry.get("sip_proxy", "127.0.0.1")
     sip_port = int(pbx_entry.get("sip_port", 5060))
-    sip_user = pbx_entry.get("sip_user", "piper")
     sip_pass = pbx_entry.get("sip_password", "")
     local_port = _find_free_udp_port()
 

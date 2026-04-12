@@ -21,7 +21,7 @@ class TestCallCRUD:
 
     def test_get_call(self, client, account):
         call_id = create_call(client, account)
-        resp = client.get(f"/api/calls/{call_id}", headers=account)
+        resp = client.get(f"/api/pipelines?dsl=call:{call_id}", headers=account)
         assert resp.status_code == 200
         assert resp.get_json()["call_id"] == call_id
 
@@ -29,7 +29,7 @@ class TestCallCRUD:
         call_id = create_call(client, account)
         resp = client.delete(f"/api/calls/{call_id}", headers=account)
         assert resp.status_code == 204
-        resp = client.get(f"/api/calls/{call_id}", headers=account)
+        resp = client.get(f"/api/pipelines?dsl=call:{call_id}", headers=account)
         assert resp.status_code == 404
 
     def test_delete_nonexistent_call(self, client, account):
@@ -37,19 +37,19 @@ class TestCallCRUD:
         assert resp.status_code == 404
 
     def test_get_nonexistent_call(self, client, account):
-        resp = client.get("/api/calls/no-such-call", headers=account)
+        resp = client.get("/api/pipelines?dsl=call:no-such-call", headers=account)
         assert resp.status_code == 404
 
 
 class TestCallParticipants:
     def test_list_participants_empty(self, client, account):
         call_id = create_call(client, account)
-        resp = client.get(f"/api/calls/{call_id}/participants", headers=account)
+        resp = client.get(f"/api/pipelines?dsl=call:{call_id}", headers=account)
         assert resp.status_code == 200
-        assert resp.get_json() == []
+        assert resp.get_json()["participants"] == []
 
     def test_participants_nonexistent_call(self, client, account):
-        resp = client.get("/api/calls/no-such/participants", headers=account)
+        resp = client.get("/api/pipelines?dsl=call:no-such", headers=account)
         assert resp.status_code == 404
 
 
@@ -89,22 +89,22 @@ class TestCallMetadata:
 
     def test_call_default_direction_inbound(self, client, account):
         call_id = create_call(client, account)
-        resp = client.get(f"/api/calls/{call_id}", headers=account)
+        resp = client.get(f"/api/pipelines?dsl=call:{call_id}", headers=account)
         assert resp.get_json()["direction"] == "inbound"
 
     def test_call_status_active(self, client, account):
         call_id = create_call(client, account)
-        resp = client.get(f"/api/calls/{call_id}", headers=account)
+        resp = client.get(f"/api/pipelines?dsl=call:{call_id}", headers=account)
         assert resp.get_json()["status"] == "active"
 
     def test_call_subscriber_stored(self, client, account):
         call_id = create_call(client, account)
-        resp = client.get(f"/api/calls/{call_id}", headers=account)
+        resp = client.get(f"/api/pipelines?dsl=call:{call_id}", headers=account)
         assert resp.get_json()["subscriber_id"] == SUBSCRIBER_ID
 
     def test_call_has_created_at(self, client, account):
         call_id = create_call(client, account)
-        resp = client.get(f"/api/calls/{call_id}", headers=account)
+        resp = client.get(f"/api/pipelines?dsl=call:{call_id}", headers=account)
         assert "created_at" in resp.get_json()
         assert isinstance(resp.get_json()["created_at"], float)
 
@@ -121,5 +121,5 @@ class TestCallMultiple:
         id1 = create_call(client, account)
         id2 = create_call(client, account)
         client.delete(f"/api/calls/{id1}", headers=account)
-        resp = client.get(f"/api/calls/{id2}", headers=account)
+        resp = client.get(f"/api/pipelines?dsl=call:{id2}", headers=account)
         assert resp.status_code == 200

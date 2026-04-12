@@ -75,6 +75,7 @@ class Stage:
         self.upstream: Optional[Stage] = None
         self.downstream: Optional[Stage] = None
         self.cancelled: bool = False
+        self.closed: bool = False
 
     def set_upstream(self, up: Stage) -> Stage:
         self.upstream = up
@@ -115,6 +116,45 @@ class Stage:
                 self.downstream.cancel()
         except Exception:
             pass
+
+    def close(self) -> None:
+        """Orderly teardown — signal that upstream has completed.
+
+        Distinct from ``cancel()``:
+
+        * ``cancel()`` = abort immediately, skip remaining buffered data
+          (forced teardown; propagates up AND down).
+        * ``close()`` = orderly finish; in-flight data must drain first.
+          The caller invokes ``close()`` AFTER upstream's generator has
+          exhausted.  Default implementation propagates the signal
+          downstream (letting the drain cascade continue) and invokes
+          the subclass hook ``_on_close()`` for resource release.
+
+        Idempotent.
+        """
+        if self.closed:
+            return
+        self.closed = True
+        try:
+            self._on_close()
+        except Exception as e:
+            _LOGGER.warning("Stage %s _on_close raised: %s", type(self).__name__, e)
+        # Propagate in BOTH directions — idempotent via ``closed`` flag.
+        # A downstream-initiated close (e.g. HangupSink) flows upstream;
+        # an upstream-initiated close (generator exhausted) flows down.
+        for neighbour in (self.upstream, self.downstream):
+            try:
+                if neighbour is not None and not neighbour.closed:
+                    neighbour.close()
+            except Exception as e:
+                _LOGGER.warning("Stage %s close propagation raised: %s",
+                                type(self).__name__, e)
+
+    def _on_close(self) -> None:
+        """Subclass hook: release resources tied to this stage.
+
+        Called exactly once by ``close()``.  Default: no-op.
+        """
 
     def estimate_frames_24k(self) -> Optional[int]:
         return None

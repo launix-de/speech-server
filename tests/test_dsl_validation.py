@@ -31,12 +31,32 @@ class TestEmptyPipe:
 # ===========================================================================
 
 class TestCallStageRules:
-    def test_multiple_call_stages_rejected(self):
+    def test_three_call_stages_rejected(self):
+        """At most two occurrences of ``call:ID`` per pipe (input+output)."""
         ex = _make_executor()
-        elements = [("sip", "l1", {}), ("call", "call-test123", {}),
-                     ("call", "call-test123", {})]
-        with pytest.raises(ValueError, match="Only one call"):
+        elements = [("call", "call-test123", {}),
+                    ("sip", "l1", {}),
+                    ("call", "call-test123", {}),
+                    ("call", "call-test123", {})]
+        with pytest.raises(ValueError, match="At most two call"):
             ex._validate_elements(elements)
+
+    def test_two_call_stages_different_ids_rejected(self):
+        """Two call stages must reference the SAME id (coupled leg)."""
+        ex = _make_executor()
+        elements = [("call", "call-test123", {}),
+                    ("sip", "l1", {}),
+                    ("call", "other", {})]
+        with pytest.raises(ValueError, match="same call id"):
+            ex._validate_elements(elements)
+
+    def test_two_call_stages_same_id_valid(self):
+        """``call:C -> sip:A -> call:C`` ≡ ``sip:A -> call:C -> sip:A``."""
+        ex = _make_executor()
+        elements = [("call", "call-test123", {}),
+                    ("sip", "l1", {}),
+                    ("call", "call-test123", {})]
+        ex._validate_elements(elements)  # must not raise
 
     def test_call_as_first_element_rejected(self):
         ex = _make_executor()
@@ -103,30 +123,30 @@ class TestSipStageRules:
         with pytest.raises(ValueError, match="same leg"):
             ex._validate_elements(elements)
 
-    def test_sip_without_call_not_terminal_rejected(self):
+    def test_sip_without_call_in_middle_valid(self):
+        """`A -> sip:L -> B` is allowed — wrap_sip splits into two chains."""
         ex = _make_executor()
-        elements = [("sip", "l1", {}), ("stt", "de", {})]
-        with pytest.raises(ValueError, match="Without call.*terminal sink"):
-            ex._validate_elements(elements)
+        elements = [("play", "x", {}), ("sip", "l1", {}), ("stt", "de", {})]
+        ex._validate_elements(elements)  # must not raise
 
     def test_sip_as_sole_element_rejected(self):
         ex = _make_executor()
         elements = [("sip", "l1", {})]
-        with pytest.raises(ValueError, match="upstream source"):
+        with pytest.raises(ValueError, match="at least one neighbouring"):
             ex._validate_elements(elements)
 
-    def test_sip_to_sip_without_call_rejected(self):
+    def test_sip_to_sip_different_legs_rejected(self):
+        """Two sip stages in the same pipe must share the same leg."""
         ex = _make_executor()
-        elements = [("sip", "l1", {}), ("sip", "l1", {})]
-        with pytest.raises(ValueError, match="Without call.*terminal sink"):
+        elements = [("sip", "l1", {}), ("sip", "l2", {})]
+        with pytest.raises(ValueError, match="same leg"):
             ex._validate_elements(elements)
 
-    def test_sip_as_source_then_sip_as_sink(self):
-        """sip:l1 -> sip:l1 without call — not valid (needs call in between)."""
+    def test_sip_to_hangup_valid(self):
+        """`sip:L -> hangup` reject without answering."""
         ex = _make_executor()
-        elements = [("sip", "l1", {}), ("sip", "l1", {})]
-        with pytest.raises(ValueError):
-            ex._validate_elements(elements)
+        elements = [("sip", "l1", {}), ("hangup", "", {})]
+        ex._validate_elements(elements)
 
     def test_source_to_sip_terminal_valid(self):
         """tts -> sip:l1 (no call, sip as terminal sink)."""
@@ -134,12 +154,11 @@ class TestSipStageRules:
         elements = [("tts", "de", {}), ("sip", "l1", {})]
         ex._validate_elements(elements)
 
-    def test_sip_source_to_sip_sink_rejected_without_call(self):
-        """Direct sip -> sip requires source in front."""
+    def test_play_sip_save_valid(self):
+        """`play -> sip:L -> save` — sip in middle, both sides wired."""
         ex = _make_executor()
-        elements = [("sip", "l1", {}), ("sip", "l2", {})]
-        with pytest.raises(ValueError):
-            ex._validate_elements(elements)
+        elements = [("play", "x", {}), ("sip", "l1", {}), ("save", "out", {})]
+        ex._validate_elements(elements)
 
 
 # ===========================================================================
@@ -259,7 +278,7 @@ class TestConferenceAlias:
         ex = _make_executor()
         elements = [("play", "x", {}), ("call", "call-test123", {}),
                      ("conference", "call-test123", {})]
-        with pytest.raises(ValueError, match="Only one call/conference"):
+        with pytest.raises(ValueError, match="Use either 'call' or 'conference'"):
             ex._validate_elements(elements)
 
     def test_conference_valid_as_terminal(self):

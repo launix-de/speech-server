@@ -568,9 +568,10 @@ def create_app(args: argparse.Namespace) -> Flask:
     def serve_examples(filename):
         return _send_from_directory(str(_examples_dir), filename)
 
-    @app.route("/healthz", methods=["GET"])  # liveness
-    def healthz() -> Tuple[str, int, Dict[str, str]]:
-        return ("ok", 200, {"Content-Type": "text/plain"})
+    # Operational endpoints (/healthz + /metrics) live in a shared
+    # blueprint so the test app can exercise them too.
+    from speech_pipeline.metrics_api import api as metrics_bp
+    app.register_blueprint(metrics_bp)
 
     @app.route("/voices", methods=["GET"])  # list models
     def voices() -> Any:
@@ -604,7 +605,7 @@ def create_app(args: argparse.Namespace) -> Flask:
 
     # ---- Rate limiter for HTTP TTS (1 concurrent per real client IP) ----
     _http_tts_active: dict[str, int] = {}
-    _http_tts_lock = _ws_threading.Lock()
+    _http_tts_lock = threading.Lock()
 
     @app.route("/tts/say", methods=["GET", "POST"])
     @app.route("/", methods=["GET", "POST"])  # legacy compat
@@ -622,7 +623,6 @@ def create_app(args: argparse.Namespace) -> Flask:
                 _http_tts_active[client_ip] = max(0, _http_tts_active.get(client_ip, 1) - 1)
 
     def _synthesize_inner() -> Any:
-    def synthesize() -> Any:
         # Accept JSON or form/query parameters for flexibility
         payload: Dict[str, Any] = {}
         if request.is_json:
@@ -1231,7 +1231,7 @@ def create_app(args: argparse.Namespace) -> Flask:
             try:
                 from speech_pipeline.ConferenceLeg import ConferenceLeg
                 from speech_pipeline.telephony.webclient import get_webclient_session
-                from speech_pipeline.telephony import call_state as _cs, subscriber as _sub, commands as _cmd
+                from speech_pipeline.telephony import call_state as _cs, subscriber as _sub
                 import requests as _http
                 import re as _re
 
@@ -1263,20 +1263,24 @@ def create_app(args: argparse.Namespace) -> Flask:
                                 if not cb_path:
                                     return
                                 url = sub_info["base_url"].rstrip("/") + "/" + cb_path.lstrip("/")
-                                try:
-                                    resp = _http.post(url, json={
-                                        "callId": call_obj.call_id,
-                                        "command": "webclient",
-                                        "participantId": part_id,
-                                        "result": "joined",
-                                    }, headers={"Authorization": f"Bearer {sub_info['bearer_token']}"}, timeout=5)
-                                    if resp.status_code == 200 and resp.content:
-                                        body = resp.json()
-                                        cmds = body.get("commands", [])
-                                        if cmds:
-                                            _cmd.execute_commands(call_obj, cmds)
-                                except Exception:
-                                    pass
+                                # MUST be async — this fires from the
+                                # mixer's yield loop; a blocking POST
+                                # deadlocks the whole conference until
+                                # the CRM responds.
+                                def _send():
+                                    try:
+                                        _http.post(url, json={
+                                            "callId": call_obj.call_id,
+                                            "command": "webclient",
+                                            "participantId": part_id,
+                                            "result": "joined",
+                                        }, headers={"Authorization": f"Bearer {sub_info['bearer_token']}"}, timeout=5)
+                                    except Exception:
+                                        pass
+                                threading.Thread(
+                                    target=_send, daemon=True,
+                                    name=f"wc-attach-{part_id}",
+                                ).start()
                             return _on_attached
 
                         stage.on_attached = _make_on_attached(sub, call, callback_path, sess["session_id"])
@@ -1286,20 +1290,20 @@ def create_app(args: argparse.Namespace) -> Flask:
                                 if not cb_path:
                                     return
                                 url = sub_info["base_url"].rstrip("/") + "/" + cb_path.lstrip("/")
-                                try:
-                                    resp = _http.post(url, json={
-                                        "callId": call_obj.call_id,
-                                        "command": "webclient",
-                                        "participantId": part_id,
-                                        "result": "left",
-                                    }, headers={"Authorization": f"Bearer {sub_info['bearer_token']}"}, timeout=5)
-                                    if resp.status_code == 200 and resp.content:
-                                        body = resp.json()
-                                        cmds = body.get("commands", [])
-                                        if cmds:
-                                            _cmd.execute_commands(call_obj, cmds)
-                                except Exception:
-                                    pass
+                                def _send():
+                                    try:
+                                        _http.post(url, json={
+                                            "callId": call_obj.call_id,
+                                            "command": "webclient",
+                                            "participantId": part_id,
+                                            "result": "left",
+                                        }, headers={"Authorization": f"Bearer {sub_info['bearer_token']}"}, timeout=5)
+                                    except Exception:
+                                        pass
+                                threading.Thread(
+                                    target=_send, daemon=True,
+                                    name=f"wc-detach-{part_id}",
+                                ).start()
                             return _on_detached
 
                         stage.on_detached = _make_on_detached(sub, call, callback_path, sess["session_id"])
@@ -1368,6 +1372,13 @@ def create_app(args: argparse.Namespace) -> Flask:
             ws.send(_json.dumps({"error": "Unknown session ID", "session_id": session_id}))
             return
         session.handle_ws(ws)
+        # NB: don't close_webclient_session here — browsers do a normal
+        # disconnect-reconnect cycle on page load, and tearing down the
+        # session on the first WS end makes every reconnect fail.
+        # Cleanup happens on:
+        #   - explicit DELETE /api/calls/<id>  → close_call_sessions
+        #   - reaper thread for never-connected sessions (5 min TTL)
+        #   - call idle-timeout (ConferenceMixer.on_idle_cancel)
 
     # ---- WebSocket TTS streaming endpoint (alternative path) ----
     @sock.route("/tts/ws")
@@ -1438,6 +1449,32 @@ def main() -> None:
         _LOGGER.info("Built-in SIP stack enabled on port %d", args.sip_port)
 
     app = create_app(args)
+
+    # Graceful shutdown: on SIGTERM/SIGINT, hang up active legs + close
+    # webclient sessions so SIP/WebSocket peers see a clean BYE/close
+    # instead of a dead socket.
+    import signal as _signal
+
+    def _graceful_shutdown(signum, _frame):
+        _LOGGER.info("Signal %d received — draining active calls", signum)
+        try:
+            from speech_pipeline.telephony import call_state as _cs
+            for call_id in list(_cs._calls.keys()):
+                try:
+                    _cs.delete_call(call_id)
+                except Exception as e:
+                    _LOGGER.warning("shutdown: delete_call(%s) failed: %s",
+                                    call_id, e)
+        except Exception as e:
+            _LOGGER.warning("shutdown drain error: %s", e)
+        # Re-raise default behaviour so the process exits.
+        _signal.signal(signum, _signal.SIG_DFL)
+        import os
+        os.kill(os.getpid(), signum)
+
+    _signal.signal(_signal.SIGTERM, _graceful_shutdown)
+    _signal.signal(_signal.SIGINT, _graceful_shutdown)
+
     app.run(host=args.host, port=args.port, threaded=True)
 
 

@@ -187,13 +187,21 @@ def create_pipeline():
     except ValueError as e:
         return (f"DSL parse error: {e}\n", 400)
 
-    # Find call context from DSL (if any call/conference element present)
+    # Find call context from DSL (if any call/conference element present).
+    # Single-element actions (webclient, answer) may carry a ``call_id``
+    # param to target a specific call.
     call = None
-    for typ, elem_id, _ in elements:
+    for typ, elem_id, params in elements:
         if typ in ("call", "conference") and elem_id:
             from .telephony import call_state
             call = call_state.get_call(elem_id)
             break
+        if typ == "webclient":
+            cid = (params or {}).get("call_id")
+            if cid:
+                from .telephony import call_state
+                call = call_state.get_call(cid)
+                break
 
     # If no call element but a tee sidechain (tee:X as first element),
     # find the executor that owns this tee.
@@ -217,25 +225,33 @@ def create_pipeline():
 
     pipeline = registry.LivePipeline(dsl=dsl)
 
+    # Build synchronously.  Stages must be registered in the
+    # executor's ``_stages`` dict before this response returns so that
+    # a quick follow-up ``DELETE /api/pipelines {dsl: "play:..."}``
+    # finds them.  The heavy operations inside add_pipes (AudioReader,
+    # SIPSink, etc.) already hand off to threads in ``_start_all``, so
+    # this stays in the tens of milliseconds — fast enough for PHP.
     try:
         results = executor.add_pipes([dsl])
     except Exception as e:
         return (f"Build error: {e}\n", 400)
 
-    # Check for per-pipe errors
     for r in results:
         if not r.get("ok"):
             return (f"Pipe error: {r.get('error', 'unknown')}\n", 400)
 
-    # Propagate text_input queue
     if executor._text_input_queue:
         pipeline._text_input_queue = executor._text_input_queue
-
     pipeline.state = "running"
     pipeline._executor = executor
     registry.register(pipeline)
 
-    return jsonify(pipeline.to_dict()), 201
+    # Surface side-effect IDs (e.g. originate leg_id) in the response.
+    body = pipeline.to_dict()
+    for r in results:
+        if r.get("leg_id"):
+            body["leg_id"] = r["leg_id"]
+    return jsonify(body), 201
 
 
 def _render_pipeline(dsl: str):
@@ -399,10 +415,14 @@ def kill_stage_by_dsl():
     Searches all active call executors for a stage matching the ID
     and kills it. Returns 204 on success, 404 if not found.
     """
+    # Accept the stage ID from EITHER the JSON body or a ``?dsl=`` query
+    # parameter.  Some HTTP clients (PHP curl with CURLOPT_CUSTOMREQUEST
+    # ``DELETE``) silently drop the body — the query-string fallback
+    # saves the request from a 400.
     body = request.get_json(force=True, silent=True) or {}
-    stage_id = body.get("dsl", "").strip()
+    stage_id = (body.get("dsl") or request.args.get("dsl") or "").strip()
     if not stage_id:
-        return ("Missing 'dsl' (stage ID) in request body\n", 400)
+        return ("Missing 'dsl' (stage ID) in request body or ?dsl= query\n", 400)
 
     # DELETE accepts only a single stage ID, not a pipeline expression
     if "->" in stage_id or "|" in stage_id:

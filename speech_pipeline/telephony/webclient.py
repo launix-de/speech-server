@@ -17,6 +17,8 @@ from __future__ import annotations
 import json
 import logging
 import secrets
+import threading
+import time
 from typing import Optional
 
 import requests as http_requests
@@ -28,8 +30,62 @@ _LOGGER = logging.getLogger("telephony.webclient")
 
 bp = Blueprint("telephony_webclient", __name__)
 
-# session_id -> {call_id, src_id (from add_source), nonce, user, ...}
+# session_id -> {call_id, src_id (from add_source), nonce, user,
+#                created_at, last_seen, ...}
 _sessions: dict = {}
+_sessions_lock = threading.Lock()
+
+# Sessions that never get a connected codec socket are reaped after this long.
+SESSION_CONNECT_TIMEOUT_SECONDS = 300.0     # 5 min to connect
+
+# How often the reaper wakes up.
+_REAPER_INTERVAL_SECONDS = 30.0
+
+_reaper_started = False
+_reaper_lock = threading.Lock()
+
+
+def _ensure_reaper_started() -> None:
+    """Launch the reaper thread on first session creation."""
+    global _reaper_started
+    with _reaper_lock:
+        if _reaper_started:
+            return
+        _reaper_started = True
+    t = threading.Thread(target=_reaper_loop, daemon=True, name="webclient-reaper")
+    t.start()
+
+
+def _reaper_loop() -> None:
+    while True:
+        try:
+            time.sleep(_REAPER_INTERVAL_SECONDS)
+            _reap_stale_sessions()
+        except Exception as e:
+            _LOGGER.warning("webclient reaper error: %s", e)
+
+
+def _reap_stale_sessions() -> None:
+    """Drop sessions whose browser never connected within the TTL."""
+    from speech_pipeline.CodecSocketSession import get_session as _get_codec
+    now = time.time()
+    stale: list[str] = []
+    with _sessions_lock:
+        for sid, entry in _sessions.items():
+            created = entry.get("created_at", now)
+            age = now - created
+            codec_session = _get_codec(sid)
+            # Already connected → let the WS-disconnect path handle cleanup.
+            if codec_session is not None and codec_session.connected.is_set():
+                continue
+            if age > SESSION_CONNECT_TIMEOUT_SECONDS:
+                stale.append(sid)
+    for sid in stale:
+        _LOGGER.info(
+            "WebClient session %s never connected within %ds — reaping",
+            sid, int(SESSION_CONNECT_TIMEOUT_SECONDS),
+        )
+        close_webclient_session(sid)
 
 
 def register_webclient(call: call_state.Call, user: str,
@@ -42,7 +98,8 @@ def register_webclient(call: call_state.Call, user: str,
     placeholders are substituted.  Otherwise the default bidirectional
     codec-conference pipeline is used.
     """
-    session_id = session_id or ("wc-" + secrets.token_urlsafe(8))
+    # 16 bytes = 128 bit random — not guessable within the reap window.
+    session_id = session_id or ("wc-" + secrets.token_urlsafe(16))
 
     if pipes:
         resolved = [p.replace("{session_id}", session_id)
@@ -60,8 +117,11 @@ def register_webclient(call: call_state.Call, user: str,
         "nonce": nonce,
         "user": user,
         "dsl": dsl,
+        "created_at": time.time(),
     }
-    _sessions[session_id] = entry
+    with _sessions_lock:
+        _sessions[session_id] = entry
+    _ensure_reaper_started()
     _LOGGER.info("WebClient session %s for call %s (user=%s)",
                  session_id, call.call_id, user)
     return entry
@@ -153,11 +213,15 @@ def get_webclient_session(session_id: str) -> Optional[dict]:
 
 
 def remove_webclient_session(session_id: str) -> None:
-    _sessions.pop(session_id, None)
+    with _sessions_lock:
+        _sessions.pop(session_id, None)
 
 
 def close_webclient_session(session_id: str) -> None:
-    entry = _sessions.pop(session_id, None)
+    """Idempotent teardown: drop from registry, revoke nonce, close codec,
+    unregister participant from the call, detach any ConferenceLeg."""
+    with _sessions_lock:
+        entry = _sessions.pop(session_id, None)
     if not entry:
         return
 
@@ -176,18 +240,31 @@ def close_webclient_session(session_id: str) -> None:
     except Exception:
         pass
 
+    # Detach from the call: unregister participant so the mixer can idle out.
+    call_id = entry.get("call_id")
+    if call_id:
+        try:
+            call = call_state.get_call(call_id)
+            if call:
+                call.unregister_participant(session_id)
+        except Exception:
+            pass
+
     _LOGGER.info("WebClient session %s closed", session_id)
 
 
 def close_call_sessions(call_id: str) -> None:
-    for session_id, entry in list(_sessions.items()):
-        if entry.get("call_id") == call_id:
-            close_webclient_session(session_id)
+    with _sessions_lock:
+        to_close = [sid for sid, entry in _sessions.items()
+                    if entry.get("call_id") == call_id]
+    for session_id in to_close:
+        close_webclient_session(session_id)
 
 
 def get_mixer_for_session(session_id: str):
     """Called by pipe pre-hook to inject the conference mixer."""
-    entry = _sessions.get(session_id)
+    with _sessions_lock:
+        entry = _sessions.get(session_id)
     if not entry:
         return None, None
     call = call_state.get_call(entry["call_id"])

@@ -21,10 +21,8 @@ Account-scoped (account token **or** admin):
 - ``DELETE /api/subscribers/<id>``     – unsubscribe
 - ``POST   /api/calls``               – create a call (conference)
 - ``GET    /api/calls``               – list own calls
-- ``GET    /api/calls/<call_id>``     – get call details
-- ``POST   /api/calls/<call_id>/commands`` – send commands to a call
-- ``DELETE /api/calls/<call_id>/stages/<stage_id>`` – kill a named stage
 - ``DELETE /api/calls/<call_id>``     – end a call
+  (details/participants: GET /api/pipelines?dsl=call:<id>)
 - ``POST   /api/nonce``               – create webclient nonce
 - ``GET    /api/nonces``              – list own nonces
 - ``DELETE /api/nonce/<nonce>``       – revoke nonce
@@ -243,29 +241,8 @@ def list_calls():
     return jsonify([c.to_dict() for c in calls])
 
 
-@api.route("/calls/<call_id>", methods=["GET"])
-@auth.require_account
-def get_call(call_id: str):
-    call = call_state.get_call(call_id)
-    if not call:
-        return ("Call not found\n", 404)
-    aid = _account_id()
-    if aid and call.account_id != aid:
-        return ("Forbidden\n", 403)
-    return jsonify(call.to_dict())
-
-
-@api.route("/calls/<call_id>/participants", methods=["GET"])
-@auth.require_account
-def list_participants(call_id: str):
-    """List active participants of a call (conference)."""
-    call = call_state.get_call(call_id)
-    if not call:
-        return ("Call not found\n", 404)
-    aid = _account_id()
-    if aid and call.account_id != aid:
-        return ("Forbidden\n", 403)
-    return jsonify(call.list_participants())
+# Legacy GET /api/calls/<id> and /participants endpoints removed —
+# use GET /api/pipelines?dsl=call:ID instead (returns participants too).
 
 
 @api.route("/calls/<call_id>", methods=["DELETE"])

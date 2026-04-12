@@ -124,6 +124,14 @@ class ConferenceMixer(Stage):
         Returns a queue to push s16le PCM into (same as AudioMixer).
         Used by PipelineBuilder's ``tee:NAME`` element.
         """
+        return self.add_input_with_id()[0]
+
+    def add_input_with_id(self) -> tuple[queue.Queue, str]:
+        """Like :meth:`add_input` but also returns the generated src_id.
+
+        Callers that need to couple an output (mix-minus) to this input
+        use the src_id in :meth:`add_output`.
+        """
         src_id = _next_id("src")
         in_q: queue.Queue = queue.Queue(maxsize=200)
         entry = _Source(id=src_id, queue=in_q, sink=None)
@@ -131,7 +139,7 @@ class ConferenceMixer(Stage):
             self._sources[src_id] = entry
         self._has_sources.set()
         _LOGGER.info("ConferenceMixer '%s': +input %s", self.name, src_id)
-        return in_q
+        return in_q, src_id
 
     def remove_input(self, q: queue.Queue) -> None:
         """Compat with AudioMixer: remove by queue reference."""
@@ -370,6 +378,15 @@ class ConferenceMixer(Stage):
                     frames[sid] = silence
                     if src.finished:
                         src.done.set()
+                        # Auto-remove drained sources so idle-timeout can
+                        # fire when all participants have left.  Without
+                        # this, non-loop plays leave zombie entries that
+                        # block ``IDLE_TIMEOUT_SECONDS`` forever.
+                        with self._lock:
+                            self._sources.pop(sid, None)
+                        _LOGGER.info(
+                            "ConferenceMixer '%s': source %s drained, removed",
+                            self.name, sid)
 
             # Step 2: full mix
             full_mix = silence

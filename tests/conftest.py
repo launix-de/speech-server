@@ -90,6 +90,9 @@ def app():
     from speech_pipeline.pipeline_api import api as pipeline_bp
     app.register_blueprint(pipeline_bp)
 
+    from speech_pipeline.metrics_api import api as metrics_bp
+    app.register_blueprint(metrics_bp)
+
     import speech_pipeline.telephony._shared as _shared
     _shared.flask_app = app
 

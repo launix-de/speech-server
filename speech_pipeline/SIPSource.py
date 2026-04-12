@@ -22,9 +22,10 @@ class SIPSource(Stage):
     Output format depends on what the session puts in rx_queue.
     """
 
-    def __init__(self, session) -> None:
+    def __init__(self, session, leg=None) -> None:
         super().__init__()
         self.session = session
+        self.leg = leg
         from speech_pipeline.RTPSession import RTPSession
         call = session.call if hasattr(session, 'call') else None
         if isinstance(call, RTPSession):
@@ -33,6 +34,21 @@ class SIPSource(Stage):
             # pyVoIP path: PyVoIPCallSession._rx_pump decodes u-law → s16le
             # before queueing, so the data in rx_queue is always s16le.
             self.output_format = AudioFormat(8000, "s16le")
+
+    def _on_close(self) -> None:
+        """Orderly teardown: send SIP BYE/CANCEL (idempotent)."""
+        if self.session.hungup.is_set():
+            return
+        if self.leg is not None:
+            try:
+                self.leg.hangup()
+                return
+            except Exception as e:
+                _LOGGER.debug("SIPSource: leg.hangup raised: %s", e)
+        try:
+            self.session.hangup()
+        except Exception as e:
+            _LOGGER.debug("SIPSource: session.hangup raised: %s", e)
 
     def stream_pcm24k(self) -> Iterator[bytes]:
         if not self.session.connected.is_set():
@@ -44,12 +60,22 @@ class SIPSource(Stage):
             return
 
         _LOGGER.info("SIPSource: streaming audio (%s)", self.output_format)
-        while not self.cancelled and not self.session.hungup.is_set():
-            try:
-                frame = self.session.rx_queue.get(timeout=0.5)
-            except Empty:
-                continue
-            if frame:
+        natural_eof = False
+        try:
+            while not self.cancelled and not self.session.hungup.is_set():
+                try:
+                    frame = self.session.rx_queue.get(timeout=0.5)
+                except Empty:
+                    continue
+                if frame is None:
+                    natural_eof = True
+                    break
                 yield frame
-
-        _LOGGER.info("SIPSource: stream ended")
+            # Remote BYE (session.hungup) also counts as natural EOF.
+            if self.session.hungup.is_set():
+                natural_eof = True
+        finally:
+            _LOGGER.info("SIPSource: stream ended (eof=%s, cancelled=%s)",
+                         natural_eof, self.cancelled)
+            if natural_eof and not self.cancelled:
+                self.close()

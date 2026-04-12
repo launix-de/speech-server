@@ -41,7 +41,6 @@ class Call:
         self.status = "active"
         self.created_at = time.time()
         self.events = events or {}
-        self.command_queue: List[dict] = []
         self.stt_pipeline_id: Optional[str] = None
         self.stt_callback: Optional[str] = None
 

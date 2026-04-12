@@ -74,15 +74,31 @@ class SIPSink(Stage):
     Terminal sink — drives the pipeline.
     """
 
-    def __init__(self, session) -> None:
+    def __init__(self, session, leg=None) -> None:
         super().__init__()
         self.session = session
+        self.leg = leg  # optional — enables BYE/CANCEL via leg.hangup()
         from speech_pipeline.RTPSession import RTPSession
         call = session.call if hasattr(session, "call") else None
         if isinstance(call, RTPSession):
             self.input_format = AudioFormat(call.codec.sample_rate, "s16le")
         else:
             self.input_format = AudioFormat(8000, "s16le")
+
+    def _on_close(self) -> None:
+        """Orderly teardown: send SIP BYE/CANCEL (idempotent)."""
+        if self.session.hungup.is_set():
+            return
+        if self.leg is not None:
+            try:
+                self.leg.hangup()
+                return
+            except Exception as e:
+                _LOGGER.debug("SIPSink: leg.hangup raised: %s", e)
+        try:
+            self.session.hangup()
+        except Exception as e:
+            _LOGGER.debug("SIPSink: session.hangup raised: %s", e)
 
     def _session_writer_lock(self):
         lock = getattr(self.session, "_sink_writer_lock", None)
@@ -120,19 +136,27 @@ class SIPSink(Stage):
 
         call = self.session.call
         self._claim_session_writer()
+        natural_eof = False
 
-        # Detect call type: RTPSession (has codec) or pyVoIP (has RTPClients)
         from speech_pipeline.RTPSession import RTPSession
         try:
             if isinstance(call, RTPSession):
-                self._run_rtp_session(call)
+                natural_eof = self._run_rtp_session(call)
             else:
-                self._run_pyvoip(call)
+                natural_eof = self._run_pyvoip(call)
         finally:
             self._release_session_writer()
+            # Natural upstream EOF → orderly teardown via Stage.close().
+            # External cancels and early returns skip this; the pipeline
+            # owner is responsible for teardown in those cases.
+            # The extra ``not self.cancelled`` guard covers the race where
+            # cancel propagates via upstream's None-sentinel (the for-loop
+            # exits "naturally" but cancel already flipped the flag).
+            if natural_eof and not self.cancelled:
+                self.close()
 
-    def _run_rtp_session(self, rtp_session) -> None:
-        """Direct RTP: pass s16le to RTPSession, codec handles encoding."""
+    def _run_rtp_session(self, rtp_session) -> bool:
+        """Direct RTP: pass s16le to RTPSession. Returns True on natural EOF."""
         _LOGGER.info("SIPSink: streaming via RTPSession %s to %s:%d",
                      rtp_session.codec, rtp_session.remote_host,
                      rtp_session.remote_port)
@@ -143,19 +167,21 @@ class SIPSink(Stage):
                     or self.session.hungup.is_set()
                     or not self._owns_session_writer()
                 ):
-                    break
+                    return False
                 rtp_session.write_s16le(pcm)
+            return True
         except Exception as e:
             if not self.cancelled:
                 _LOGGER.warning("SIPSink write error: %s", e)
+            return False
         finally:
             _LOGGER.info("SIPSink: stream ended")
 
-    def _run_pyvoip(self, call) -> None:
-        """pyVoIP: encode to codec, write to ring buffer, trans() sends."""
+    def _run_pyvoip(self, call) -> bool:
+        """pyVoIP: encode + ring-buffer. Returns True on natural EOF."""
         if not call.RTPClients:
             _LOGGER.warning("SIPSink: no RTP clients")
-            return
+            return False
 
         rtp = call.RTPClients[0]
 
@@ -193,10 +219,12 @@ class SIPSink(Stage):
                     or self.session.hungup.is_set()
                     or not self._owns_session_writer()
                 ):
-                    break
+                    return False
                 call.write_audio(encode(pcm))
+            return True
         except Exception as e:
             if not self.cancelled:
                 _LOGGER.warning("SIPSink write error: %s", e)
+            return False
         finally:
             _LOGGER.info("SIPSink: stream ended")

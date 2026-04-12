@@ -15,6 +15,7 @@ from __future__ import annotations
 import functools
 import logging
 import secrets
+import threading
 import time
 from typing import Dict, Optional
 
@@ -29,6 +30,7 @@ _accounts: Dict[str, dict] = {}
 
 # nonce -> {nonce, subscriber_id, user, account_id, created, ttl, ws?}
 _nonces: Dict[str, dict] = {}
+_nonce_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -204,17 +206,18 @@ def create_nonce(account_id: str, subscriber_id: str, user: str,
 
 
 def validate_nonce(nonce: str) -> Optional[dict]:
-    entry = _nonces.get(nonce)
-    if not entry:
-        return None
-    if time.time() - entry["created"] > entry["ttl"]:
-        del _nonces[nonce]
-        return None
-    # Single-use: mark as connected, reject reuse
-    if entry.get("connected"):
-        return None
-    entry["connected"] = True
-    return entry
+    """Atomic check-and-mark: a concurrent second caller always loses."""
+    with _nonce_lock:
+        entry = _nonces.get(nonce)
+        if not entry:
+            return None
+        if time.time() - entry["created"] > entry["ttl"]:
+            del _nonces[nonce]
+            return None
+        if entry.get("connected"):
+            return None
+        entry["connected"] = True
+        return entry
 
 
 def revoke_nonce(nonce: str) -> bool:

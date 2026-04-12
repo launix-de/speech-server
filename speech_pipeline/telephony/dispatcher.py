@@ -15,7 +15,7 @@ from typing import Optional
 
 import requests as http_requests
 
-from . import call_state, commands, subscriber
+from . import call_state, subscriber
 
 _LOGGER = logging.getLogger("telephony.dispatcher")
 
@@ -79,9 +79,3 @@ def fire_event(call: call_state.Call, event_key: str,
     })
 
 
-def fire_event_and_execute(call: call_state.Call, event_key: str,
-                           payload: dict) -> None:
-    """Fire event, then execute any commands from the response."""
-    cmds = fire_event(call, event_key, payload)
-    if cmds:
-        commands.execute_commands(call, cmds)

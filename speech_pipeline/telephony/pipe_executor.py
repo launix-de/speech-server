@@ -2,12 +2,36 @@
 
 Left-to-right chain. Normal stages are connected via pipe().
 Special substitutions:
-- call:ID → ConferenceLeg (becomes normal stage)
+- call:ID → ConferenceLeg (single, bidirectional) OR ConferenceSource/
+  ConferenceSink pair (two occurrences → coupled via _Coupling)
 - tee:ID as first element + already exists → add_sidechain mode
-- sip/codec without ID → reuse first same-type predecessor's session
+- sip/originate/codec without ID → reuse first same-type predecessor's session
 
 Element syntax: ``type:id{json_params}``
 Separator: ``->`` or ``|``
+
+Invariante: ``call:ID`` = virtueller Leg auf der Konferenz
+------------------------------------------------------------
+Wenn ``call`` in einer DSL verwendet wird, wird **genau ein** Leg auf
+die Konferenz abgezweigt.  Wird derselbe ``call:ID`` **zweimal** in
+derselben DSL verwendet, meinen diese beiden Positionen **Input und
+Output desselben Legs**:
+
+    sip:A -> call:C -> sip:A       # Bridge aus SIP-Sicht
+    call:C -> sip:A -> call:C      # dieselbe Bridge aus Konferenz-Sicht
+
+Beide DSLs beschreiben dieselbe bidirektionale Kopplung — mix-minus
+subtrahiert den eigenen Input aus dem Output.
+
+DELETE-Kaskade
+--------------
+``DELETE sip:ID`` → ``leg.hangup()`` → SIPSource/SIPSink beenden →
+``close()`` cascadiert → ConferenceSink/Source schließen → mixer
+source drained → idle-timeout → ``_auto_cleanup`` → call weg.
+
+``DELETE call:ID`` → ``call_state.delete_call`` → mixer cancel →
+alle Endpoints cancellen → verbundene SIP legs via ``delete_leg``
+hangupt.
 """
 from __future__ import annotations
 
@@ -42,6 +66,7 @@ class CallPipeExecutor:
         self._sessions: Dict[str, Any] = {} # typ -> first session (for ID reuse)
         self._lock = threading.Lock()
         self._text_input_queue = None        # set by text_input element
+        self._call_couplings: Dict[str, Any] = {}  # call_id -> _Coupling
 
     # -- Public API --------------------------------------------------------
 
@@ -50,8 +75,14 @@ class CallPipeExecutor:
         for pipe_str in pipes:
             try:
                 elements = parse_dsl(pipe_str)
+                self._last_originated_leg_id = None
                 self._execute_pipe(elements)
-                results.append({"pipe": pipe_str, "ok": True})
+                result = {"pipe": pipe_str, "ok": True}
+                # Originate:NUM -> call:C returns a leg_id so callers can
+                # track the leg via callbacks.
+                if self._last_originated_leg_id:
+                    result["leg_id"] = self._last_originated_leg_id
+                results.append(result)
             except Exception as e:
                 _LOGGER.warning("Pipe failed: %s — %s", pipe_str, e, exc_info=True)
                 results.append({"pipe": pipe_str, "ok": False, "error": str(e)})
@@ -140,6 +171,34 @@ class CallPipeExecutor:
 
         return False
 
+    def _pre_create_originate_leg(self, number: str, params: dict,
+                                   call) -> str:
+        """Create the outbound leg synchronously (no SIP IO) so the
+        HTTP response can return its ``leg_id`` before the async build
+        runs.  Used by ``pipeline_api.POST /api/pipelines`` to keep the
+        request fast — PHP callers (CRM) need immediate return because
+        their session lock blocks follow-up calls.
+
+        Idempotent: subsequent ``_execute_async_originate`` with the
+        same number will reuse this leg if we pre-registered it.
+        """
+        from . import leg as leg_mod
+        if call is None:
+            raise ValueError("originate requires a call context")
+        leg = leg_mod.create_leg(
+            "outbound", number, call.pbx_id, call.subscriber_id,
+        )
+        leg.callbacks = {
+            k: v for k, v in (params or {}).items()
+            if k in ("ringing", "answered", "completed", "failed",
+                     "no-answer", "busy", "canceled")
+        }
+        leg.call_id = call.call_id
+        leg.caller_id = (params or {}).get("caller_id", "")
+        # Stash for pickup by _execute_async_originate.
+        self._sessions[f"_prealloc_leg:{number}"] = leg
+        return leg.leg_id
+
     def _execute_async_originate(self, originate_elem, call_elem):
         """Async originate: fire-and-forget + auto-bridge on answer.
 
@@ -161,13 +220,18 @@ class CallPipeExecutor:
             if not auth_mod.check_pbx_access(call.account_id, call.pbx_id):
                 raise ValueError(f"Account not allowed to use PBX {call.pbx_id}")
 
-        leg = leg_mod.create_leg("outbound", number, call.pbx_id,
-                                  call.subscriber_id)
-        leg.callbacks = {k: v for k, v in params.items()
-                         if k in ("ringing", "answered", "completed", "failed",
-                                  "no-answer", "busy", "canceled")}
-        leg.call_id = call.call_id
-        leg.caller_id = params.get("caller_id", "")
+        # Reuse the leg pre-allocated by ``_pre_create_originate_leg``
+        # (called inline from pipeline_api to return leg_id fast).
+        leg = self._sessions.pop(f"_prealloc_leg:{number}", None)
+        if leg is None:
+            leg = leg_mod.create_leg("outbound", number, call.pbx_id,
+                                      call.subscriber_id)
+            leg.callbacks = {
+                k: v for k, v in params.items()
+                if k in ("ringing", "answered", "completed", "failed",
+                         "no-answer", "busy", "canceled")}
+            leg.call_id = call.call_id
+            leg.caller_id = params.get("caller_id", "")
 
         # Return leg_id via a special callback for the CRM to track
         # Alternative: include leg_id in the 'ringing' callback payload.
@@ -179,6 +243,8 @@ class CallPipeExecutor:
             daemon=True,
             name=f"orig-{leg.leg_id}",
         ).start()
+        # Expose leg_id to ``add_pipes`` / HTTP response.
+        self._last_originated_leg_id = leg.leg_id
         return True
 
     def _execute_action_webclient(self, typ, elem_id, params) -> bool:
@@ -301,41 +367,43 @@ class CallPipeExecutor:
             )
             resolved[i] = (typ, elem_id, params, tts_stage)
 
-        # Phase 4: wrap SIP sessions with SIPSource/SIPSink
-        resolved = self._wrap_sip(resolved)
+        # Phase 4a: substitute duplicate ``call:ID`` positions with
+        # ConferenceSource/ConferenceSink coupled via a shared
+        # ``_Coupling`` — this is how ``call:C -> sip:A -> call:C``
+        # gets the same mix-minus wiring as ``sip:A -> call:C -> sip:A``.
+        resolved = self._wrap_calls(resolved)
 
-        # Phase 5: link play handles to their terminal stage (for kill_stage)
-        for i in range(len(resolved) - 1):
-            _, _, _, l_stage = resolved[i]
-            _, _, _, r_stage = resolved[i + 1]
-            play_handle = getattr(l_stage, '_play_handle', None)
-            from speech_pipeline.ConferenceLeg import ConferenceLeg
-            from speech_pipeline.SIPSink import SIPSink
-            if play_handle and isinstance(r_stage, (ConferenceLeg, SIPSink)):
-                play_handle._stage = r_stage
+        # Phase 4b: wrap SIP sessions — returns list of sub-chains (one
+        # per connected piping segment; a middle `sip:L` splits).
+        chains = self._wrap_sip(resolved)
 
-        # Phase 6: chain via pipe()
-        # Skip source→ConferenceLeg ONLY when ConferenceLeg is the LAST element
-        # (source-only pipe like play:→call: or tts:→call:).
-        # For bidirectional pipes (sip:→call:→sip:), pipe() must connect everything.
-        # Also skip upstream→StreamingTTS (TTS reads text directly from iterator).
         from speech_pipeline.ConferenceLeg import ConferenceLeg as _CL
         from speech_pipeline.StreamingTTSProducer import StreamingTTSProducer as _STTS
-        for i in range(len(resolved) - 1):
-            l_typ, _, _, l_stage = resolved[i]
-            _, _, _, r_stage = resolved[i + 1]
-            if isinstance(r_stage, _CL) and i + 1 == len(resolved) - 1:
-                # Last element is ConferenceLeg → source-only, use mixer.add_source
-                continue
-            if isinstance(r_stage, _STTS):
-                # StreamingTTS reads text from its own iterator, not via pipe()
-                continue
-            l_stage.pipe(r_stage)
+        from speech_pipeline.SIPSink import SIPSink
 
-        self._register_bridge_handles(resolved)
+        for chain in chains:
+            # Phase 5: link play handles to their terminal stage (for kill_stage)
+            for i in range(len(chain) - 1):
+                _, _, _, l_stage = chain[i]
+                _, _, _, r_stage = chain[i + 1]
+                play_handle = getattr(l_stage, '_play_handle', None)
+                if play_handle and isinstance(r_stage, (_CL, SIPSink)):
+                    play_handle._stage = r_stage
 
-        # Phase 7: start terminal + monitors
-        self._start_all(resolved)
+            # Phase 6: chain via pipe()
+            for i in range(len(chain) - 1):
+                l_typ, _, _, l_stage = chain[i]
+                _, _, _, r_stage = chain[i + 1]
+                if isinstance(r_stage, _CL) and i + 1 == len(chain) - 1:
+                    continue  # source → terminal ConferenceLeg uses mixer.add_source
+                if isinstance(r_stage, _STTS):
+                    continue  # StreamingTTS reads text directly from its iterator
+                l_stage.pipe(r_stage)
+
+            self._register_bridge_handles(chain)
+
+            # Phase 7: start terminal + monitors
+            self._start_all(chain)
 
     # -- Fill missing IDs --------------------------------------------------
 
@@ -356,8 +424,13 @@ class CallPipeExecutor:
             raise ValueError("Empty pipe")
 
         call_positions = [i for i, (typ, _, _) in enumerate(elements) if typ == "call"]
-        if len(call_positions) > 1:
-            raise ValueError("Only one call stage is allowed per pipe")
+        call_ids = [elements[i][1] for i in call_positions]
+        if len(call_positions) > 2:
+            raise ValueError("At most two call stages are allowed per pipe")
+        if len(call_positions) == 2 and call_ids[0] != call_ids[1]:
+            raise ValueError(
+                "Two call stages in one pipe must reference the same call id "
+                "(input and output of the same virtual leg)")
 
         webhook_positions = [i for i, (typ, _, _) in enumerate(elements) if typ == "webhook"]
         if webhook_positions and webhook_positions[-1] != len(elements) - 1:
@@ -382,37 +455,43 @@ class CallPipeExecutor:
         if len(sip_ids) == 2 and sip_ids[0] != sip_ids[1]:
             raise ValueError("Bidirectional sip pipes must use the same leg on both sides")
         if sip_ids and not call_positions:
-            if len(sip_ids) != 1 or sip_positions[0][0] != len(elements) - 1:
-                raise ValueError("Without call, sip may only appear once as the terminal sink")
             if len(elements) < 2:
-                raise ValueError("Direct sip output requires an upstream source")
-            if elements[0][0] == "sip":
-                raise ValueError("Direct sip output requires a non-sip source")
+                raise ValueError("sip requires at least one neighbouring stage")
+            # Each sip:LEG position must have a neighbour — `_wrap_sip`
+            # decides Source/Sink based on left/right neighbour.  The
+            # legacy "terminal sink only" rule is intentionally dropped
+            # so that patterns like `play -> sip:L -> record`, `sip:L
+            # -> record`, and `sip:L -> hangup` all work.
             return
 
-        # Treat 'conference' like 'call' for validation
+        # Treat 'conference' like 'call' for validation (alias).
         conf_positions = [i for i, (typ, _, _) in enumerate(elements)
                           if typ == "conference"]
         all_call_positions = call_positions + conf_positions
-        if len(all_call_positions) > 1:
-            raise ValueError("Only one call/conference stage is allowed per pipe")
+        if call_positions and conf_positions:
+            raise ValueError("Use either 'call' or 'conference', not both in the same pipe")
 
         if call_positions:
-            call_pos = call_positions[0]
-            call_id = elements[call_pos][1]
-            if not call_id:
-                raise ValueError("call requires a call id")
-            if self.call and call_id != self.call.call_id:
-                raise ValueError(
-                    f"Pipe targets call {call_id}, but executor is bound to {self.call.call_id}"
-                )
-            if call_pos == 0:
-                raise ValueError("call stage cannot be the first element")
-            if call_pos != len(elements) - 1:
-                if call_pos != len(elements) - 2 or elements[-1][0] != "sip":
-                    raise ValueError("call may only be followed by a single terminal sip stage")
-            if sip_ids and len(sip_ids) == 1 and call_pos != len(elements) - 2:
-                raise ValueError("A single sip stage is only valid as terminal sink after call")
+            for cp in call_positions:
+                cid = elements[cp][1]
+                if not cid:
+                    raise ValueError("call requires a call id")
+                if self.call and cid != self.call.call_id:
+                    raise ValueError(
+                        f"Pipe targets call {cid}, but executor is bound to {self.call.call_id}"
+                    )
+            # Single-call legacy rules (one call only): first-element
+            # block + layout constraints. Two-call (coupled) form is
+            # exempt — the wrap phase handles it.
+            if len(call_positions) == 1:
+                call_pos = call_positions[0]
+                if call_pos == 0:
+                    raise ValueError("call stage cannot be the first element")
+                if call_pos != len(elements) - 1:
+                    if call_pos != len(elements) - 2 or elements[-1][0] != "sip":
+                        raise ValueError("call may only be followed by a single terminal sip stage")
+                if sip_ids and len(sip_ids) == 1 and call_pos != len(elements) - 2:
+                    raise ValueError("A single sip stage is only valid as terminal sink after call")
 
     # -- Sidechain: tee:ID -> stage -> stage -> ...  -------------------------
 
@@ -570,6 +649,11 @@ class CallPipeExecutor:
         # -- record/save: managed file recording with download URL --
         if typ in ("record", "save"):
             return self._create_save(elem_id, params)
+
+        # -- hangup: sink that immediately closes upstream (triggers BYE/CANCEL) --
+        if typ == "hangup":
+            from speech_pipeline.HangupSink import HangupSink
+            return HangupSink()
 
         # -- text_input: queue-backed text source for streaming TTS --
         if typ == "text_input":
@@ -799,39 +883,119 @@ class CallPipeExecutor:
             })()
             return placeholder
 
+    # -- Call coupling ------------------------------------------------------
+
+    def _get_call_coupling(self, call_id: str):
+        """Return the shared ``_Coupling`` for a call id (lazy-create)."""
+        from speech_pipeline.ConferenceEndpoint import _Coupling
+        coupling = self._call_couplings.get(call_id)
+        if coupling is None:
+            call = self._resolve_call(call_id)
+            coupling = _Coupling(call.mixer)
+            self._call_couplings[call_id] = coupling
+        return coupling
+
+    def _wrap_calls(self, resolved):
+        """Substitute duplicate ``call:ID`` positions with coupled endpoints.
+
+        Invariant: a ``call:ID`` appearing twice in the same DSL
+        represents **input and output of the same virtual leg** on the
+        conference — mix-minus couples them automatically.
+
+        Single-occurrence ``call:ID`` is left as ``ConferenceLeg``
+        (bidirectional) or is handled by the existing terminal-mixer
+        path in ``_start_all``.
+        """
+        from speech_pipeline.ConferenceEndpoint import ConferenceSource, ConferenceSink
+
+        call_counts: dict[str, int] = {}
+        for typ, elem_id, _, _ in resolved:
+            if typ in ("call", "conference"):
+                call_counts[elem_id] = call_counts.get(elem_id, 0) + 1
+
+        seen: set[str] = set()
+        out = []
+        for typ, elem_id, params, stage in resolved:
+            if typ not in ("call", "conference") or call_counts.get(elem_id, 0) < 2:
+                out.append((typ, elem_id, params, stage))
+                continue
+            coupling = self._get_call_coupling(elem_id)
+            if elem_id not in seen:
+                out.append(("call_source", elem_id, params,
+                            ConferenceSource(coupling)))
+                seen.add(elem_id)
+            else:
+                out.append(("call_sink", elem_id, params,
+                            ConferenceSink(coupling)))
+        return out
+
     # -- SIP wrapping ------------------------------------------------------
 
     def _wrap_sip(self, resolved):
-        """Replace sip/originate sessions with SIPSource (first) / SIPSink (last)."""
+        """Split into sub-chains and wrap sip sessions with SIPSource/SIPSink.
+
+        Rule: neighbour-based piping. For each ``sip:LEG`` element,
+        decide which wrapper(s) the position needs based on whether
+        a left and/or right neighbour exists:
+
+        * Left neighbour only  (``A -> sip:L``)       → SIPSink (terminal)
+        * Right neighbour only (``sip:L -> B``)       → SIPSource (originator)
+        * Both (``A -> sip:L -> B``, single leg)      → split into two
+          sub-chains: ``A -> SIPSink(L)`` and ``SIPSource(L) -> B``.
+        * Same leg twice (``sip:L -> X -> sip:L``)    → SIPSource at the
+          first position, SIPSink at the second — one chain (bridge).
+
+        Returns ``list[list[(typ, id, params, stage)]]`` — one list of
+        stage tuples per sub-chain.
+        """
         from speech_pipeline.SIPSource import SIPSource
         from speech_pipeline.SIPSink import SIPSink
 
-        result = []
-        sip_seen = {}  # leg_id -> "source" created
-        sip_counts = {}
+        sip_counts: dict[str, int] = {}
         for typ, elem_id, _, _ in resolved:
             if typ in ("sip", "originate"):
                 sip_counts[elem_id] = sip_counts.get(elem_id, 0) + 1
 
+        chains: list[list[tuple]] = [[]]
+        seen_source: set[str] = set()
+        n = len(resolved)
         for i, (typ, elem_id, params, stage) in enumerate(resolved):
             if typ not in ("sip", "originate"):
-                result.append((typ, elem_id, params, stage))
+                chains[-1].append((typ, elem_id, params, stage))
                 continue
 
-            if sip_counts.get(elem_id, 0) == 1:
-                sink = SIPSink(stage)
-                result.append(("sip_sink", elem_id, params, sink))
-            elif elem_id not in sip_seen:
-                # First occurrence: SIPSource
-                src = SIPSource(stage)
-                result.append(("sip_source", elem_id, params, src))
-                sip_seen[elem_id] = True
-            else:
-                # Second occurrence: SIPSink
-                sink = SIPSink(stage)
-                result.append(("sip_sink", elem_id, params, sink))
+            leg = self._sessions.get(f"_leg:{elem_id}")
+            has_left = i > 0
+            has_right = i < n - 1
+            count = sip_counts.get(elem_id, 0)
 
-        return result
+            if count >= 2:
+                if elem_id not in seen_source:
+                    chains[-1].append(("sip_source", elem_id, params,
+                                       SIPSource(stage, leg=leg)))
+                    seen_source.add(elem_id)
+                else:
+                    chains[-1].append(("sip_sink", elem_id, params,
+                                       SIPSink(stage, leg=leg)))
+                continue
+
+            if has_left and has_right:
+                # Middle position, single occurrence → split.
+                chains[-1].append(("sip_sink", elem_id, params,
+                                   SIPSink(stage, leg=leg)))
+                chains.append([("sip_source", elem_id, params,
+                                SIPSource(stage, leg=leg))])
+            elif has_right:
+                chains[-1].append(("sip_source", elem_id, params,
+                                   SIPSource(stage, leg=leg)))
+            elif has_left:
+                chains[-1].append(("sip_sink", elem_id, params,
+                                   SIPSink(stage, leg=leg)))
+            else:
+                raise ValueError(
+                    f"sip:{elem_id} standalone has no neighbours to pipe into")
+
+        return [c for c in chains if c]
 
     def _register_bridge_handles(self, resolved):
         """Register bidirectional SIP bridges so they can be detached live."""
@@ -1023,7 +1187,11 @@ class CallPipeExecutor:
             if hasattr(leg, 'conf_leg') and leg.conf_leg:
                 try: leg.conf_leg.cancel()
                 except: pass
-            self.call.unregister_participant(leg.leg_id)
+            if self.call is not None:
+                try:
+                    self.call.unregister_participant(leg.leg_id)
+                except Exception:
+                    pass
             leg_mod.fire_callback(leg, "completed", duration=dur)
             _LOGGER.info("Leg %s ended (%.1fs)", leg_id, dur)
             leg_mod.delete_leg(leg_id)

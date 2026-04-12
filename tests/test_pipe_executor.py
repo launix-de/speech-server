@@ -145,11 +145,13 @@ class TestExecutorValidation:
             ex._execute_pipe(parse_dsl("call:call-test-1 -> sip:leg1"))
         _cleanup_call(call)
 
-    def test_rejects_multiple_calls(self):
+    def test_rejects_more_than_two_calls(self):
+        """At most two occurrences of ``call:ID`` per pipe."""
         call = _make_call()
         ex = CallPipeExecutor(call)
-        with pytest.raises(Exception, match="one call"):
-            ex._execute_pipe(parse_dsl("sip:l1 -> call:call-test-1 -> call:call-test-1 -> sip:l1"))
+        with pytest.raises(Exception, match="At most two call"):
+            ex._execute_pipe(parse_dsl(
+                "call:call-test-1 -> sip:l1 -> call:call-test-1 -> call:call-test-1"))
         _cleanup_call(call)
 
 

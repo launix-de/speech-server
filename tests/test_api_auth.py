@@ -100,11 +100,8 @@ class TestNoAuthOnAccountRoutes:
                            data=json.dumps({"subscriber_id": "x", "user": "y"})
                            ).status_code == 401
 
-    def test_call_detail(self, client):
-        assert client.get("/api/calls/call-xxx").status_code == 401
-
-    def test_call_participants(self, client):
-        assert client.get("/api/calls/call-xxx/participants").status_code == 401
+    def test_call_detail_via_pipelines(self, client):
+        assert client.get("/api/pipelines?dsl=call:call-xxx").status_code == 401
 
     def test_pipelines_create(self, client):
         assert client.post("/api/pipelines",

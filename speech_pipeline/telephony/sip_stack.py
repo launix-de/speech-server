@@ -1135,6 +1135,13 @@ def _find_subscriber_by_base_url(base_url: str) -> Optional[dict]:
     return None
 
 
+# Cache successful HA1 lookups so SIP re-REGISTERs (every ~60 s per
+# device) don't hit the CRM each time.  Short TTL — we re-verify with
+# CRM periodically so password changes propagate.
+_HA1_CACHE: Dict[str, Tuple[float, dict]] = {}
+_HA1_TTL = 300.0   # 5 min
+
+
 def _crm_login(
     subscriber: dict, username: str, realm: str, full_sip_user: str,
 ) -> Optional[dict]:
@@ -1143,12 +1150,20 @@ def _crm_login(
     GET {base_url}/Telephone/SpeechServer/login?username={user}&realm={realm}&sip_user={full_sip_user}
     Authorization: Bearer {bearer_token}
     Response: {"ha1": "md5hash", "user_id": 123}
+
+    Caches successful results for 5 min so frequent re-REGISTERs don't
+    stall on CRM latency.
     """
     base_url = subscriber.get("base_url", "").rstrip("/")
     token = subscriber.get("bearer_token", "")
     if not base_url or not token:
         _LOGGER.warning("CRM login: subscriber missing base_url or token")
         return None
+
+    cache_key = f"{subscriber.get('id','')}|{username}|{realm}|{full_sip_user}"
+    cached = _HA1_CACHE.get(cache_key)
+    if cached and (time.time() - cached[0]) < _HA1_TTL:
+        return cached[1]
 
     url = f"{base_url}/Telephone/SpeechServer/login"
     params = {
@@ -1159,10 +1174,13 @@ def _crm_login(
     headers = {"Authorization": f"Bearer {token}"}
 
     try:
-        resp = requests.get(url, params=params, headers=headers, timeout=10)
+        # 3s timeout — any longer and the SIP device's REGISTER times
+        # out (typical 5s) before we can answer with 401/200.
+        resp = requests.get(url, params=params, headers=headers, timeout=3)
         if resp.status_code == 200:
             data = resp.json()
             if "ha1" in data:
+                _HA1_CACHE[cache_key] = (time.time(), data)
                 return data
             _LOGGER.warning("CRM login: response missing ha1: %s", data)
         else:

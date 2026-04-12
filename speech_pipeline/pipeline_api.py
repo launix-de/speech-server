@@ -34,7 +34,90 @@ _require_auth = auth.require_account
 @api.route("/pipelines", methods=["GET"])
 @_require_auth
 def list_pipelines():
-    return jsonify([p.to_dict() for p in registry.list_all()])
+    """List running pipelines, or resolve a DSL item to its live object.
+
+    Query param ``?dsl=<single_item>`` looks up a specific live object:
+    - ``call:call-xxx``   → call details + participants
+    - ``conference:xxx``  → same as call
+    - ``sip:leg-abc``     → leg details
+    - ``play:hold_music`` → stage info (exists / cancelled)
+    - ``bridge:leg-abc``  → stage info
+    - ``tee:tap``         → tee info + sidechain count
+
+    Without ``?dsl``: list all pipelines.
+    """
+    dsl = request.args.get("dsl", "").strip()
+    if not dsl:
+        return jsonify([p.to_dict() for p in registry.list_all()])
+
+    # DSL must be a single item (no pipes)
+    if "->" in dsl or "|" in dsl:
+        return ("GET only accepts a single DSL item, not a pipeline\n", 400)
+
+    # Parse the item
+    from .dsl_parser import parse_dsl
+    try:
+        elements = parse_dsl(dsl)
+    except ValueError as e:
+        return (f"DSL parse error: {e}\n", 400)
+    if len(elements) != 1:
+        return ("GET accepts only a single DSL item\n", 400)
+    typ, elem_id, _ = elements[0]
+
+    from .telephony import call_state, leg as leg_mod
+
+    if typ in ("call", "conference"):
+        if not elem_id:
+            return ("Missing ID\n", 400)
+        call = call_state.get_call(elem_id)
+        if not call:
+            return (f"Call '{elem_id}' not found\n", 404)
+        # Ownership check
+        aid = _account_id()
+        if aid and call.account_id != aid:
+            return ("Forbidden\n", 403)
+        return jsonify(call.to_dict())
+
+    if typ == "sip":
+        if not elem_id:
+            return ("Missing ID\n", 400)
+        leg = leg_mod.get_leg(elem_id)
+        if not leg:
+            return (f"Leg '{elem_id}' not found\n", 404)
+        return jsonify(leg.to_dict())
+
+    # Stage lookup (play:, bridge:, tee:, etc.) — search across executors
+    for call in call_state.list_calls():
+        ex = getattr(call, "pipe_executor", None)
+        if not ex:
+            continue
+        if typ == "tee" and elem_id in ex._tees:
+            tee = ex._tees[elem_id]
+            aid = _account_id()
+            if aid and call.account_id != aid:
+                return ("Forbidden\n", 403)
+            return jsonify({
+                "type": "tee",
+                "id": elem_id,
+                "call_id": call.call_id,
+                "cancelled": getattr(tee, "cancelled", False),
+                "sidechain_count": sum(1 for s in ex._sidechain_specs if s[0] == elem_id),
+            })
+        # Stage IDs in _stages are full strings like "play:hold" or "bridge:leg-abc"
+        full_id = dsl  # user passed e.g. "play:hold"
+        if full_id in ex._stages:
+            aid = _account_id()
+            if aid and call.account_id != aid:
+                return ("Forbidden\n", 403)
+            handle = ex._stages[full_id]
+            stage = getattr(handle, "_stage", None)
+            return jsonify({
+                "id": full_id,
+                "call_id": call.call_id,
+                "cancelled": getattr(stage, "cancelled", False) if stage else False,
+            })
+
+    return (f"'{dsl}' not found\n", 404)
 
 
 @api.route("/pipelines/<pid>", methods=["GET"])
@@ -320,6 +403,10 @@ def kill_stage_by_dsl():
     stage_id = body.get("dsl", "").strip()
     if not stage_id:
         return ("Missing 'dsl' (stage ID) in request body\n", 400)
+
+    # DELETE accepts only a single stage ID, not a pipeline expression
+    if "->" in stage_id or "|" in stage_id:
+        return ("DELETE only accepts a single stage ID, not a pipeline\n", 400)
 
     # Search all executors for this stage
     from .telephony import call_state

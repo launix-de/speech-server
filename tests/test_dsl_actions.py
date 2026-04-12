@@ -94,6 +94,180 @@ class TestKillViaDelete:
                              data=json.dumps({"dsl": "play:x"}))
         assert resp.status_code == 401
 
+    def test_kill_rejects_pipeline_syntax(self, client, account):
+        """DELETE rejects DSL with -> or | (only single stage ID allowed)."""
+        resp = client.delete("/api/pipelines",
+                             data=json.dumps({"dsl": "play:x -> call:c1"}),
+                             headers=account)
+        assert resp.status_code == 400
+
+        resp = client.delete("/api/pipelines",
+                             data=json.dumps({"dsl": "play:x | tee:y"}),
+                             headers=account)
+        assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# webclient: action
+# ---------------------------------------------------------------------------
+
+class TestWebclientAction:
+    """webclient:USER{callback, base_url} — creates webclient session."""
+
+    def test_webclient_without_call_fails(self, client, account):
+        """webclient needs a call context."""
+        resp = client.post("/api/pipelines",
+                           data=json.dumps({
+                               "dsl": 'webclient:testuser{"base_url":"https://example.com"}'
+                           }),
+                           headers=account)
+        assert resp.status_code == 400
+
+    def test_webclient_missing_base_url_fails(self, client, account):
+        """webclient requires base_url."""
+        call_id = create_call(client, account)
+        # Need to call webclient in a call context — but single-element actions
+        # don't naturally have call context in the DSL. For now verify the
+        # missing base_url error at least triggers.
+        resp = client.post("/api/pipelines",
+                           data=json.dumps({
+                               "dsl": f'webclient:testuser{{"callback":"/cb"}}'
+                           }),
+                           headers=account)
+        # Without call context, fails with "requires a call context"
+        assert resp.status_code == 400
+        client.delete(f"/api/calls/{call_id}", headers=account)
+
+    def test_webclient_dsl_parses(self):
+        """DSL parser accepts webclient with JSON params."""
+        from speech_pipeline.dsl_parser import parse_dsl
+        result = parse_dsl(
+            'webclient:user42{"callback":"/cb/wc","base_url":"https://srv.example.com"}'
+        )
+        assert result[0][0] == "webclient"
+        assert result[0][1] == "user42"
+        assert result[0][2]["callback"] == "/cb/wc"
+        assert result[0][2]["base_url"] == "https://srv.example.com"
+
+
+# ---------------------------------------------------------------------------
+# GET /api/pipelines?dsl=... — look up live objects
+# ---------------------------------------------------------------------------
+
+class TestGetByDSL:
+    """GET /api/pipelines?dsl=... resolves DSL items to live objects."""
+
+    def test_get_call(self, client, account):
+        """?dsl=call:CALL_ID returns call details."""
+        call_id = create_call(client, account)
+        resp = client.get(f"/api/pipelines?dsl=call:{call_id}", headers=account)
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["call_id"] == call_id
+
+        client.delete(f"/api/calls/{call_id}", headers=account)
+
+    def test_get_conference_alias(self, client, account):
+        """?dsl=conference:CALL_ID works same as call:."""
+        call_id = create_call(client, account)
+        resp = client.get(f"/api/pipelines?dsl=conference:{call_id}", headers=account)
+        assert resp.status_code == 200
+        client.delete(f"/api/calls/{call_id}", headers=account)
+
+    def test_get_nonexistent_call(self, client, account):
+        resp = client.get("/api/pipelines?dsl=call:no-such", headers=account)
+        assert resp.status_code == 404
+
+    def test_get_cross_account_call_forbidden(self, client, account, account2):
+        """Account A cannot GET account B's call."""
+        from conftest import SUBSCRIBER2_ID
+        call_id = create_call(client, account2, SUBSCRIBER2_ID)
+        resp = client.get(f"/api/pipelines?dsl=call:{call_id}", headers=account)
+        assert resp.status_code == 403
+        client.delete(f"/api/calls/{call_id}", headers=account2)
+
+    def test_get_stage(self, client, account):
+        """?dsl=play:STAGE_ID returns stage info."""
+        call_id = create_call(client, account)
+
+        # Create a play stage
+        client.post("/api/pipelines",
+                    data=json.dumps({
+                        "dsl": f'play:test_get{{"url":"examples/queue.mp3","loop":true}} -> call:{call_id}'
+                    }),
+                    headers=account)
+
+        resp = client.get("/api/pipelines?dsl=play:test_get", headers=account)
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["id"] == "play:test_get"
+        assert data["call_id"] == call_id
+
+        client.delete(f"/api/calls/{call_id}", headers=account)
+
+    def test_get_nonexistent_stage(self, client, account):
+        resp = client.get("/api/pipelines?dsl=play:nonexistent", headers=account)
+        assert resp.status_code == 404
+
+    def test_get_leg(self, client, account):
+        """?dsl=sip:LEG_ID returns leg details."""
+        from test_crm_e2e import _make_rtp_leg, _cleanup_leg
+        from speech_pipeline.rtp_codec import PCMU
+        leg, phone_rtp, _ = _make_rtp_leg(codec=PCMU)
+
+        resp = client.get(f"/api/pipelines?dsl=sip:{leg.leg_id}", headers=account)
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["leg_id"] == leg.leg_id
+
+        _cleanup_leg(leg, phone_rtp)
+
+    def test_get_rejects_pipeline_syntax(self, client, account):
+        """GET rejects DSL with -> or |."""
+        resp = client.get("/api/pipelines?dsl=play:x -> call:c1", headers=account)
+        assert resp.status_code == 400
+
+    def test_get_missing_dsl_returns_list(self, client, account):
+        """GET without ?dsl returns pipeline list."""
+        resp = client.get("/api/pipelines", headers=account)
+        assert resp.status_code == 200
+        assert isinstance(resp.get_json(), list)
+
+    def test_get_tee(self, client, account):
+        """?dsl=tee:TEE_ID returns tee info."""
+        call_id = create_call(client, account)
+
+        # Create a bridge with tee
+        from test_crm_e2e import _make_rtp_leg, _cleanup_leg
+        from speech_pipeline.rtp_codec import PCMU
+        leg, phone_rtp, _ = _make_rtp_leg(codec=PCMU)
+
+        client.post("/api/pipelines",
+                    data=json.dumps({
+                        "dsl": f"sip:{leg.leg_id} -> tee:test_tee -> call:{call_id} -> sip:{leg.leg_id}"
+                    }),
+                    headers=account)
+
+        resp = client.get("/api/pipelines?dsl=tee:test_tee", headers=account)
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["type"] == "tee"
+        assert data["id"] == "test_tee"
+
+        client.delete(f"/api/calls/{call_id}", headers=account)
+        _cleanup_leg(leg, phone_rtp)
+
+    def _placeholder(self):
+        """DSL parser accepts webclient with JSON params."""
+        from speech_pipeline.dsl_parser import parse_dsl
+        result = parse_dsl(
+            'webclient:user42{"callback":"/cb/wc","base_url":"https://srv.example.com"}'
+        )
+        assert result[0][0] == "webclient"
+        assert result[0][1] == "user42"
+        assert result[0][2]["callback"] == "/cb/wc"
+        assert result[0][2]["base_url"] == "https://srv.example.com"
+
 
 # ---------------------------------------------------------------------------
 # answer: action

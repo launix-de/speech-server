@@ -136,6 +136,53 @@ class CallPipeExecutor:
             return True
 
         if typ == "webclient":
+            return self._execute_action_webclient(typ, elem_id, params)
+
+        return False
+
+    def _execute_async_originate(self, originate_elem, call_elem):
+        """Async originate: fire-and-forget + auto-bridge on answer.
+
+        DSL: originate:NUM{"answered":"/cb", ...} -> call:CALL_ID
+        The CRM receives callbacks and bridges via a second pipeline.
+        """
+        typ, number, params = originate_elem
+        _, call_id, _ = call_elem
+
+        call = self._resolve_call(call_id)
+        from . import leg as leg_mod, pbx as pbx_reg, auth as auth_mod
+
+        if not number:
+            raise ValueError("originate requires a phone number")
+        pbx_entry = pbx_reg.get(call.pbx_id)
+        if not pbx_entry:
+            raise ValueError(f"PBX {call.pbx_id} not found")
+        if call.account_id and call.account_id != "__admin__":
+            if not auth_mod.check_pbx_access(call.account_id, call.pbx_id):
+                raise ValueError(f"Account not allowed to use PBX {call.pbx_id}")
+
+        leg = leg_mod.create_leg("outbound", number, call.pbx_id,
+                                  call.subscriber_id)
+        leg.callbacks = {k: v for k, v in params.items()
+                         if k in ("ringing", "answered", "completed", "failed",
+                                  "no-answer", "busy", "canceled")}
+        leg.call_id = call.call_id
+        leg.caller_id = params.get("caller_id", "")
+
+        # Return leg_id via a special callback for the CRM to track
+        # Alternative: include leg_id in the 'ringing' callback payload.
+        # For now, the CRM gets leg_id in the callback body (leg_id field).
+
+        threading.Thread(
+            target=leg_mod.originate_only,
+            args=(leg, pbx_entry),
+            daemon=True,
+            name=f"orig-{leg.leg_id}",
+        ).start()
+        return True
+
+    def _execute_action_webclient(self, typ, elem_id, params) -> bool:
+        if typ == "webclient":
             if not self.call:
                 raise ValueError("webclient requires a call context")
             user = elem_id or "anonymous"
@@ -198,12 +245,21 @@ class CallPipeExecutor:
         if not elements:
             return
 
-        # Check for single-element actions (kill, answer)
+        # Check for single-element actions (answer, webclient)
         if len(elements) == 1:
             typ, elem_id, params = elements[0]
             if typ in self._ACTION_TYPES:
                 self._execute_action(typ, elem_id, params)
                 return
+
+        # Async originate: `originate:NUM{cb} -> call:CALL` (2 elements).
+        # Fires SIP INVITE in background, callbacks fire on state changes.
+        # CRM receives 'answered' callback and bridges via a second pipe.
+        if (len(elements) == 2
+                and elements[0][0] == "originate"
+                and elements[1][0] in ("call", "conference")):
+            self._execute_async_originate(elements[0], elements[1])
+            return
 
         # Phase 1: fill in missing IDs (sip without ID = first sip predecessor)
         self._fill_ids(elements)

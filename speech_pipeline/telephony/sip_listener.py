@@ -63,10 +63,8 @@ def start_listener(pbx_id: str, pbx_entry: dict) -> None:
         return
 
     # Skip listeners for PBX entries without SIP credentials — otherwise
-    # pyVoIP's ``VoIPPhone.start`` blocks on REGISTER against ``""`` / a
-    # nonexistent proxy and deadlocks the caller (the HTTP request
-    # creating the PBX).  Tests/configurations that only use the
-    # built-in sip_stack for trunking don't need this listener.
+    # pyVoIP's ``VoIPPhone.start`` blocks on REGISTER against ``""`` /
+    # a nonexistent proxy and deadlocks the caller.
     sip_proxy = pbx_entry.get("sip_proxy") or ""
     sip_user = pbx_entry.get("sip_user") or ""
     if not sip_proxy or not sip_user:
@@ -74,6 +72,23 @@ def start_listener(pbx_id: str, pbx_entry: dict) -> None:
                      "in-process SIP listener (built-in sip_stack handles trunking)",
                      pbx_id)
         return
+
+    # If the built-in sip_stack is running it already registers this PBX
+    # as a trunk.  Running a second pyVoIP registration in parallel
+    # causes both to claim the same inbound INVITE; pyVoIP then decodes
+    # the trunk's G.722 payload as A-law (its default) → audio garbage.
+    try:
+        from . import sip_stack
+        if sip_stack.is_running():
+            _LOGGER.info(
+                "PBX %s: sip_stack is running and handles trunking — "
+                "skipping pyVoIP in-process listener to avoid "
+                "duplicate registration + codec mismatch",
+                pbx_id,
+            )
+            return
+    except Exception:
+        pass
 
     try:
         from pyVoIP.VoIP.VoIP import VoIPPhone

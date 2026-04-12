@@ -166,6 +166,40 @@ class TestPipelinePostLatency:
         finally:
             client.delete(f"/api/calls/{call_id}", headers=account)
 
+    def test_trunk_pbx_does_not_start_pyvoip_listener(
+            self, client, admin, monkeypatch):
+        """Regression: when sip_stack is running it registers the PBX as
+        a trunk.  Starting an additional pyVoIP VoIPPhone for the same
+        credentials causes both to claim inbound INVITEs; pyVoIP then
+        decodes the trunk's G.722 payload as A-law (its default) →
+        inbound audio garbage."""
+        import json as _json
+        from speech_pipeline.telephony import sip_listener, sip_stack
+
+        # Pretend sip_stack is running (production setup).
+        monkeypatch.setattr(sip_stack, "is_running", lambda: True)
+        started: list[str] = []
+        import pyVoIP.VoIP.VoIP as _pv
+        monkeypatch.setattr(_pv, "VoIPPhone",
+                            lambda *a, **kw: started.append("should_not") or None)
+
+        resp = client.put(
+            "/api/pbx/TrunkPBX",
+            data=_json.dumps({
+                "sip_proxy": "voip.example.com",
+                "sip_user": "trunk_user",
+                "sip_password": "secret",
+            }),
+            headers=admin,
+        )
+        assert resp.status_code == 200
+        assert started == [], (
+            "pyVoIP VoIPPhone was started in parallel to sip_stack — "
+            "will fight over inbound INVITEs and mis-decode the codec"
+        )
+        assert "TrunkPBX" not in sip_listener._phones
+        client.delete("/api/pbx/TrunkPBX", headers=admin)
+
     def test_put_pbx_without_sip_creds_returns_fast(self, client, admin):
         """Regression guard: ``PUT /api/pbx/<id>`` without sip_proxy/
         sip_user used to block for ~15s in ``VoIPPhone.start`` → pyVoIP

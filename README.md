@@ -218,7 +218,10 @@ All pipeline operations use a single DSL. Separators `->` and `|` are interchang
 | `delay` | ms | -- | Audio delay line |
 | `pitch` | semitones | -- | Pitch shift (formant-preserving) |
 | `vc` | voice_ref | -- | Voice conversion via FreeVC |
-| `record` | filename | `{rate}` | File recording sidechain |
+| `save` | name | `{rate, format}` | Record to managed download URL (returns via webhook) |
+| `answer` | leg_id | -- | Send SIP 200 OK on inbound leg (single-element action) |
+| `originate` | number | `{ringing, answered, completed, ...}` | Dial outbound (2-elem pipe: `originate:N{cb} -> call:C`) |
+| `webclient` | user | `{callback, base_url}` | Create webclient session + iframe URL (single action) |
 | `ws` | mode | -- | WebSocket source/sink (`ws:pcm`, `ws:text`, `ws:ndjson`) |
 | `cli` | mode | -- | CLI stdin/stdout (`cli:text`, `cli:raw`, `cli:ndjson`) |
 | `codec` | session_id | `{profile}` | Fourier codec WebSocket source/sink |
@@ -247,6 +250,19 @@ text_input | tts:de_DE-thorsten-medium | conference:call-xxx
 
 # Streaming TTS with voice conversion
 text_input | tts:de_DE-thorsten-medium | vc:de_DE-thorsten-high | conference:call-xxx
+
+# Originate outbound leg (async fire-and-forget with callbacks)
+originate:+4917099999{"answered":"/cb/ans","completed":"/cb/end"} -> call:call-xxx
+
+# Answer an inbound leg (single-element action)
+answer:leg-abc
+
+# Create webclient session (single-element action)
+webclient:user42{"callback":"/cb/wc","base_url":"https://srv.example.com"}
+
+# Record to managed download URL (webhook fires with URL when done)
+sip:leg1 -> tee:rec -> call:call-xxx -> sip:leg1
+tee:rec -> save:recording_xyz{"format":"wav"}
 ```
 
 **Offline rendering (returns WAV):**
@@ -272,27 +288,30 @@ codec:session1 | conference:call-xxx | codec:session1
 |--------|------|-------------|
 | `GET` | `/healthz` | Liveness check |
 | `GET` | `/voices` | Available voices with metadata |
-| `POST` | `/` | Synthesize speech (multipart params) |
-| `POST` | `/tts/stream` | Streaming TTS (text body in, WAV out) |
-| `POST` | `/inputstream` | Streaming STT (PCM body in, NDJSON out) |
-| `WS` | `/ws/stt` | WebSocket STT |
-| `WS` | `/ws/tts` | WebSocket TTS |
-| `WS` | `/ws/pipe` | Generic DSL pipeline over WebSocket |
-| `WS` | `/ws/socket/<id>` | Fourier codec bidirectional audio |
+| `GET/POST` | `/tts/say` | Synthesize speech (query params, returns WAV). Rate limit: 1/IP |
+| `POST` | `/tts/stream` | Streaming TTS (text body in, WAV out). Rate limit: 1/IP |
+| `WS` | `/ws/stt` | WebSocket STT. Rate limit: 1 concurrent/IP |
+| `WS` | `/ws/tts` | WebSocket TTS. Rate limit: 1 concurrent/IP |
+| `WS` | `/ws/pipe` | Generic DSL pipeline over WebSocket (requires auth) |
+| `WS` | `/ws/socket/<id>` | Fourier codec bidirectional audio (unguessable session ID) |
 
 ### Pipeline API
 
 All `/api/` endpoints require `Authorization: Bearer <token>`. Both admin tokens and account tokens are accepted. Account tokens can only access their own calls and subscribers.
 
-#### Pipeline CRUD
+#### Pipeline API — the single audio-routing endpoint
+
+All call-control and audio routing goes through `/api/pipelines`.
+HTTP method selects the operation:
 
 ```
-POST   /api/pipelines              Create pipeline from DSL: {"dsl": "..."}
-POST   /api/pipelines/render       Render offline pipeline, returns WAV audio
-GET    /api/pipelines              List running pipelines
+POST   /api/pipelines              Create/execute DSL: {"dsl": "...", "render"?: bool}
+GET    /api/pipelines              List pipelines (no args) OR lookup (?dsl=item)
+DELETE /api/pipelines              Kill a stage: {"dsl": "stage_id"}
 GET    /api/pipelines/<pid>        Pipeline detail (stages, edges, formats)
-DELETE /api/pipelines/<pid>        Stop and remove pipeline
-POST   /api/pipelines/<pid>/input  Feed text into text_input stage: {"text": "...", "eof": true}
+DELETE /api/pipelines/<pid>        Stop and remove a running pipeline
+POST   /api/pipelines/<pid>/input  Feed text into text_input: {"text": "...", "eof": true}
+GET    /api/saves/<filename>       Download a save: output (from save: DSL element)
 ```
 
 **Creating a telephony pipeline:**
@@ -302,12 +321,27 @@ curl -X POST -H "Authorization: Bearer TOKEN" \
   http://localhost:5000/api/pipelines
 ```
 
-**Rendering TTS as WAV download:**
+**Rendering TTS as WAV (synchronous, returns audio/wav):**
 ```bash
 curl -X POST -H "Authorization: Bearer TOKEN" \
-  -d '{"dsl": "tts:de{\"text\":\"Hallo Welt\"}"}' \
+  -d '{"dsl": "tts:de{\"text\":\"Hallo Welt\"}", "render": true}' \
   -o output.wav \
-  http://localhost:5000/api/pipelines/render
+  http://localhost:5000/api/pipelines
+```
+
+**Look up a live object by DSL:**
+```bash
+curl -H "Authorization: Bearer TOKEN" \
+  "http://localhost:5000/api/pipelines?dsl=call:call-xxx"   # call + participants
+  "http://localhost:5000/api/pipelines?dsl=sip:leg-abc"     # leg details
+  "http://localhost:5000/api/pipelines?dsl=play:hold"       # stage status
+```
+
+**Kill a stage:**
+```bash
+curl -X DELETE -H "Authorization: Bearer TOKEN" \
+  -d '{"dsl": "play:hold_music"}' \
+  http://localhost:5000/api/pipelines
 ```
 
 **Streaming TTS into a conference:**
@@ -369,28 +403,28 @@ DELETE /api/subscribers/<id>   Unsubscribe
 
 #### Call Management (account-scoped)
 
-Calls are conference containers. Audio routing is done via pipelines (see Pipeline API above).
+Calls are conference containers. All audio routing and leg operations
+go through `/api/pipelines`. Idle calls (no sources/sinks for 30s)
+auto-cancel to prevent memory leaks.
 
 ```
 POST   /api/calls              Create call/conference
 GET    /api/calls              List calls
 GET    /api/calls/<id>         Call details (participants, status)
 GET    /api/calls/<id>/participants  List active participants
-POST   /api/calls/<id>/commands     Execute async commands (webclient, etc.)
-DELETE /api/calls/<id>/stages/<sid> Kill a named stage (e.g. stop hold music)
 DELETE /api/calls/<id>         End call (hangs up all legs, cleans up)
 ```
 
-#### Leg Management (account-scoped)
+Leg operations use the pipeline DSL:
 
-```
-GET    /api/legs               List SIP legs
-GET    /api/legs/<id>          Leg details
-DELETE /api/legs/<id>          Hang up leg
-POST   /api/legs/<id>/answer   Answer inbound leg (send 200 OK)
-POST   /api/legs/<id>/bridge   Bridge leg into conference (auto-creates DSL pipe)
-POST   /api/legs/originate     Originate outbound call into existing conference
-```
+| Old endpoint | New DSL |
+|---|---|
+| `POST /api/legs/originate` | `POST /api/pipelines {"dsl": "originate:NUM{cb} -> call:C"}` |
+| `POST /api/legs/{id}/answer` | `POST /api/pipelines {"dsl": "answer:LEG"}` |
+| `POST /api/legs/{id}/bridge` | `POST /api/pipelines {"dsl": "sip:LEG -> call:C -> sip:LEG"}` |
+| `GET /api/legs/{id}` | `GET /api/pipelines?dsl=sip:LEG` |
+| `DELETE /api/calls/{id}/stages/{sid}` | `DELETE /api/pipelines {"dsl": "STAGE_ID"}` |
+| `POST /api/calls/{id}/commands (webclient)` | `POST /api/pipelines {"dsl": "webclient:USER{cb,base_url}"}` |
 
 #### Nonce Management (for webclient auth)
 
@@ -402,21 +436,23 @@ DELETE /api/nonce/<nonce>      Revoke nonce
 
 ### CRM Integration Pattern
 
-The typical call flow for a CRM subscriber:
+The typical call flow for a CRM subscriber — everything through `/api/pipelines`:
 
 ```
-1. Inbound call → speech-server fires webhook → CRM creates DB record
+1. Inbound call → speech-server webhook → CRM creates DB record
 2. CRM: POST /api/calls → create conference
 3. CRM: POST /api/pipelines → bridge inbound SIP leg + wait music + STT sidechain
    DSL: "sip:LEG{"completed":"/cb"} -> tee:LEG_tap -> call:CALL -> sip:LEG"
    DSL: "tee:LEG_tap -> stt:de -> webhook:https://crm/stt"
    DSL: "play:CALL_wait{"url":"hold.mp3","loop":true} -> call:CALL"
-4. CRM: POST /api/legs/originate → ring outbound participant
-5. Outbound answers → CRM: POST /api/pipelines → bridge outbound leg
-6. CRM: DELETE /api/calls/CALL/stages/play:CALL_wait → stop wait music
-7. Hold: DELETE stage bridge:LEG, play hold music to sip:LEG
-8. Unhold: DELETE hold music stage, POST /api/pipelines → rebridge
-9. CRM: DELETE /api/calls/CALL → teardown
+4. CRM: POST /api/pipelines {"dsl": "originate:+4917...{cb} -> call:CALL"}
+   → async SIP INVITE; CRM receives "answered" callback
+5. On answered: CRM: POST /api/pipelines → bridge outbound leg
+6. CRM: DELETE /api/pipelines {"dsl": "play:CALL_wait"} → stop wait music
+7. Hold: DELETE /api/pipelines {"dsl": "bridge:LEG"} +
+        POST /api/pipelines with "play:hold{...} -> sip:LEG"
+8. Unhold: DELETE hold music stage + POST /api/pipelines → rebridge
+9. CRM: DELETE /api/calls/CALL → teardown (or auto-cleanup after 30s idle)
 ```
 
 ### RTP Codecs

@@ -56,6 +56,9 @@ class ConferenceMixer(Stage):
     manages its own sources/sinks internally.
     """
 
+    # Auto-cleanup: cancel if sources+sinks stay at 0 for this long
+    IDLE_TIMEOUT_SECONDS = 30.0
+
     def __init__(self, name: str, sample_rate: int = 48000,
                  frame_ms: int = 20, frame_samples: int = 0) -> None:
         super().__init__()
@@ -74,6 +77,8 @@ class ConferenceMixer(Stage):
         self._sinks: List[_Sink] = []
         self._has_sources = threading.Event()
         self._running = False
+        self._idle_since: Optional[float] = None  # timestamp when last went idle
+        self.on_idle_cancel = None  # callback fired on auto-cancel
 
     # ------------------------------------------------------------------
     # Sources
@@ -275,10 +280,24 @@ class ConferenceMixer(Stage):
     def run(self) -> None:
         """Main loop — blocks until cancelled."""
         self._running = True
+        wait_started = time.monotonic()
 
         while not self.cancelled:
             if self._has_sources.wait(timeout=0.5):
                 break
+            # Idle check: cancel if we never got any source/sink
+            if time.monotonic() - wait_started > self.IDLE_TIMEOUT_SECONDS:
+                with self._lock:
+                    if not self._sources and not self._sinks:
+                        _LOGGER.info("ConferenceMixer '%s': never activated, auto-cancel",
+                                     self.name)
+                        if self.on_idle_cancel:
+                            try:
+                                self.on_idle_cancel(self)
+                            except Exception:
+                                pass
+                        self.cancel()
+                        return
         if self.cancelled:
             return
 
@@ -305,6 +324,24 @@ class ConferenceMixer(Stage):
 
             with self._lock:
                 sources = dict(self._sources)
+                sinks_count = len(self._sinks)
+
+            # Idle detection: no sources AND no sinks for IDLE_TIMEOUT_SECONDS → cancel
+            if not sources and sinks_count == 0:
+                if self._idle_since is None:
+                    self._idle_since = now
+                elif now - self._idle_since > self.IDLE_TIMEOUT_SECONDS:
+                    _LOGGER.info("ConferenceMixer '%s': idle for %.1fs, auto-cancel",
+                                 self.name, now - self._idle_since)
+                    if self.on_idle_cancel:
+                        try:
+                            self.on_idle_cancel(self)
+                        except Exception:
+                            pass
+                    self.cancel()
+                    break
+            else:
+                self._idle_since = None
 
             if not sources:
                 continue

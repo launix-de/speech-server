@@ -48,6 +48,8 @@ class Call:
         self.mixer = ConferenceMixer(name=self.call_id,
                                      sample_rate=MIXER_SAMPLE_RATE,
                                      frame_samples=960)  # 20ms@48kHz — aligns with RTP timing
+        # Auto-remove call from registry when mixer idles out
+        self.mixer.on_idle_cancel = lambda _m: _auto_cleanup(self.call_id)
         self._participants: Dict[str, dict] = {}
         self._lock = threading.Lock()
         self._thread: Optional[threading.Thread] = None
@@ -117,6 +119,27 @@ def create_call(subscriber_id: str, account_id: str, pbx_id: str,
     call = Call(subscriber_id, account_id, pbx_id, **kwargs)
     _calls[call.call_id] = call
     return call
+
+
+def _auto_cleanup(call_id: str) -> None:
+    """Called by ConferenceMixer when it auto-cancels (idle timeout).
+
+    Removes the call from the registry + any associated legs.
+    """
+    _LOGGER.info("Auto-cleanup call %s (idle timeout)", call_id)
+    call = _calls.pop(call_id, None)
+    if not call:
+        return
+    call.status = "completed"
+    # Hang up any leftover legs
+    from . import leg as leg_mod
+    for lg in list(leg_mod.list_legs()):
+        if lg.call_id == call_id:
+            try:
+                lg.status = "completed"
+                leg_mod.delete_leg(lg.leg_id)
+            except Exception:
+                pass
 
 def get_call(call_id: str) -> Optional[Call]:
     return _calls.get(call_id)

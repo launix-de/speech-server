@@ -100,9 +100,6 @@ class TestNoAuthOnAccountRoutes:
                            data=json.dumps({"subscriber_id": "x", "user": "y"})
                            ).status_code == 401
 
-    def test_legs(self, client):
-        assert client.get("/api/legs").status_code == 401
-
     def test_call_detail(self, client):
         assert client.get("/api/calls/call-xxx").status_code == 401
 
@@ -114,16 +111,5 @@ class TestNoAuthOnAccountRoutes:
                            data=json.dumps({"dsl": "play:x"})
                            ).status_code == 401
 
-    def test_call_commands(self, client):
-        assert client.post("/api/calls/call-xxx/commands",
-                           data=json.dumps({"commands": []})
-                           ).status_code == 401
-
     def test_nonces(self, client):
         assert client.get("/api/nonces").status_code == 401
-
-    def test_leg_detail(self, client):
-        assert client.get("/api/legs/leg-xxx").status_code == 401
-
-    def test_leg_delete(self, client):
-        assert client.delete("/api/legs/leg-xxx").status_code == 401

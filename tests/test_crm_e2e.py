@@ -345,9 +345,7 @@ class TestKillStage:
         assert len(pre_kill) > 0, "No audio before kill"
 
         # Kill the stage
-        resp = client.delete(
-            f"/api/calls/{call_id}/stages/play:{call_id}_wait",
-            headers=account)
+        resp = client.delete('/api/pipelines', data=json.dumps({"dsl": f"play:{call_id}_wait"}), headers=account)
         assert resp.status_code == 204
 
         # Drain any remaining buffered audio
@@ -737,9 +735,7 @@ class TestHoldUnhold:
             time.sleep(0.3)
 
             # 2. Put on hold: kill bridge, start hold music
-            client.delete(
-                f"/api/calls/{call_id}/stages/bridge:{leg.leg_id}",
-                headers=account)
+            client.delete('/api/pipelines', data=json.dumps({"dsl": f"bridge:{leg.leg_id}"}), headers=account)
 
             client.post("/api/pipelines",
                         data=json.dumps({
@@ -763,9 +759,7 @@ class TestHoldUnhold:
                 assert hold_rms > 50, f"Hold music too quiet: RMS={hold_rms:.0f}"
 
             # 3. Unhold: kill hold music, rebridge
-            client.delete(
-                f"/api/calls/{call_id}/stages/play:{call_id}_hold_{leg.leg_id}",
-                headers=account)
+            client.delete('/api/pipelines', data=json.dumps({"dsl": f"play:{call_id}_hold_{leg.leg_id}"}), headers=account)
 
             client.post("/api/pipelines",
                         data=json.dumps({
@@ -994,16 +988,13 @@ class TestSIPPinning:
         call_id = create_call(client, account)
 
         # Account is pinned to TestPBX (set up in conftest).
-        # Create a call, then try to originate — the originate checks
-        # PBX access based on the call's pbx_id.
-        resp = client.post("/api/legs/originate",
+        resp = client.post("/api/pipelines",
                            data=json.dumps({
-                               "call_id": call_id,
-                               "to": "+4917099999",
+                               "dsl": f'originate:+4917099999{{}} -> call:{call_id}'
                            }),
                            headers=account)
-        # Should succeed (call is on TestPBX, account pinned to TestPBX)
-        # or fail because PBX has no SIP proxy configured — but NOT 403
+        # Should succeed (call on TestPBX, account pinned to TestPBX)
+        # or fail because PBX has no SIP proxy — but NOT 403
         assert resp.status_code != 403 or "PBX" not in (resp.data or b"").decode()
 
         client.delete(f"/api/calls/{call_id}", headers=account)
@@ -1013,10 +1004,9 @@ class TestSIPPinning:
         from conftest import SUBSCRIBER2_ID
         call_id = create_call(client, account2, SUBSCRIBER2_ID)
 
-        resp = client.post("/api/legs/originate",
+        resp = client.post("/api/pipelines",
                            data=json.dumps({
-                               "call_id": call_id,
-                               "to": "+4917099999",
+                               "dsl": f'originate:+4917099999{{}} -> call:{call_id}'
                            }),
                            headers=account)
         assert resp.status_code == 403
@@ -1163,9 +1153,7 @@ class TestHoldSwap:
             time.sleep(0.5)
 
             # 2. Put B on hold: kill bridge, play hold music to B
-            client.delete(
-                f"/api/calls/{call_id}/stages/bridge:{leg_b.leg_id}",
-                headers=account)
+            client.delete('/api/pipelines', data=json.dumps({"dsl": f"bridge:{leg_b.leg_id}"}), headers=account)
 
             client.post("/api/pipelines",
                         data=json.dumps({
@@ -1210,9 +1198,7 @@ class TestHoldSwap:
             assert rms_c > 200, f"C doesn't hear A after swap (RMS={rms_c:.0f})"
 
             # 5. Unhold B: kill hold music, rebridge B
-            client.delete(
-                f"/api/calls/{call_id}/stages/play:{call_id}_hold_b",
-                headers=account)
+            client.delete('/api/pipelines', data=json.dumps({"dsl": f"play:{call_id}_hold_b"}), headers=account)
             client.post("/api/pipelines",
                         data=json.dumps({
                             "dsl": f"sip:{leg_b.leg_id} -> call:{call_id} -> sip:{leg_b.leg_id}"
@@ -1345,10 +1331,8 @@ class TestInboundFlow:
             time.sleep(0.3)
 
             # Answer (CRM sends this after the first outbound participant picks up)
-            resp = client.post(f"/api/legs/{leg.leg_id}/answer",
-                               headers=account)
-            # Should succeed (200) or indicate already answered
-            assert resp.status_code == 200
+            resp = client.post('/api/pipelines', data=json.dumps({"dsl": f"answer:{leg.leg_id}"}), headers=account)
+            assert resp.status_code == 201
 
         finally:
             client.delete(f"/api/calls/{call_id}", headers=account)

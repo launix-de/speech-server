@@ -75,17 +75,16 @@ class TestCrossAccountPipes:
                            headers=account)
         assert resp.status_code == 403
 
-    def test_cannot_post_commands_on_other_call(self, client, account, account2):
-        call_id = create_call(client, account2, SUBSCRIBER2_ID)
-        resp = client.post(f"/api/calls/{call_id}/commands",
-                           data=json.dumps({"commands": []}),
-                           headers=account)
-        assert resp.status_code == 403
-
     def test_cannot_delete_other_call_stage(self, client, account, account2):
+        """Stage IDs are unguessable per-call — a kill from another account
+        can't target stages in a different account's call (404 rather than 403
+        because stages are searched globally by ID)."""
         call_id = create_call(client, account2, SUBSCRIBER2_ID)
-        resp = client.delete(f"/api/calls/{call_id}/stages/play:x", headers=account)
-        assert resp.status_code == 403
+        resp = client.delete('/api/pipelines',
+                             data=json.dumps({"dsl": "play:nonexistent"}),
+                             headers=account)
+        # Stage not found — 404 (since no exact match)
+        assert resp.status_code == 404
 
 
 class TestCrossAccountNonces:

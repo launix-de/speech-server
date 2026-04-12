@@ -108,10 +108,9 @@ class TestWaitMusic:
             f'play:{call_id}_wait{{"url":"examples/queue.mp3","loop":true}} -> call:{call_id}'
         ])
 
-        resp = client.delete(
-            f"/api/calls/{call_id}/stages/play:{call_id}_wait",
-            headers=account,
-        )
+        resp = client.delete('/api/pipelines',
+                             data=json.dumps({"dsl": f"play:{call_id}_wait"}),
+                             headers=account)
         assert resp.status_code == 204
 
         # Stage is gone
@@ -161,8 +160,8 @@ class TestBridgeLeg:
             f'sip:{leg.leg_id} -> call:{call_id} -> sip:{leg.leg_id}'
         ])
 
-        resp = client.post(f"/api/legs/{leg.leg_id}/answer", headers=account)
-        assert resp.status_code == 200
+        resp = client.post('/api/pipelines', data=json.dumps({"dsl": f"answer:{leg.leg_id}"}), headers=account)
+        assert resp.status_code == 201
 
         client.delete(f"/api/calls/{call_id}", headers=account)
         leg_mod._legs.pop(leg.leg_id, None)
@@ -202,14 +201,13 @@ class TestFullLifecycle:
         ])
 
         # 5. Kill wait music
-        resp = client.delete(
-            f"/api/calls/{call_id}/stages/play:{call_id}_wait",
-            headers=account,
-        )
+        resp = client.delete('/api/pipelines',
+                             data=json.dumps({"dsl": f"play:{call_id}_wait"}),
+                             headers=account)
         assert resp.status_code == 204
 
         # 6. Answer inbound
-        client.post(f"/api/legs/{leg.leg_id}/answer", headers=account)
+        client.post('/api/pipelines', data=json.dumps({"dsl": f"answer:{leg.leg_id}"}), headers=account)
 
         # 7. Both legs bridged
         stages = [s["id"] for s in call.pipe_executor.list_stages()]

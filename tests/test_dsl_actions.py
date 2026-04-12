@@ -17,11 +17,11 @@ from speech_pipeline.telephony import call_state, leg as leg_mod
 # kill: action
 # ---------------------------------------------------------------------------
 
-class TestKillAction:
-    """kill:STAGE_ID — stops a running stage."""
+class TestKillViaDelete:
+    """DELETE /api/pipelines {"dsl": "STAGE_ID"} — stops a running stage."""
 
     def test_kill_existing_stage(self, client, account):
-        """kill: removes a play stage."""
+        """DELETE removes a play stage."""
         call_id = create_call(client, account)
         call = call_state.get_call(call_id)
 
@@ -38,11 +38,11 @@ class TestKillAction:
         stage_ids = [s["id"] for s in ex.list_stages()]
         assert "play:test_kill" in stage_ids
 
-        # Kill it via DSL
-        resp = client.post("/api/pipelines",
-                           data=json.dumps({"dsl": "kill:play:test_kill"}),
-                           headers=account)
-        assert resp.status_code == 201
+        # Kill via DELETE /api/pipelines
+        resp = client.delete("/api/pipelines",
+                             data=json.dumps({"dsl": "play:test_kill"}),
+                             headers=account)
+        assert resp.status_code == 204
 
         # Verify stage is gone
         stage_ids = [s["id"] for s in ex.list_stages()]
@@ -51,21 +51,16 @@ class TestKillAction:
         client.delete(f"/api/calls/{call_id}", headers=account)
 
     def test_kill_nonexistent_stage(self, client, account):
-        """kill: with unknown stage ID fails."""
-        call_id = create_call(client, account)
-
-        resp = client.post("/api/pipelines",
-                           data=json.dumps({"dsl": "kill:nonexistent_stage"}),
-                           headers=account)
-        assert resp.status_code == 400
-
-        client.delete(f"/api/calls/{call_id}", headers=account)
+        """DELETE with unknown stage ID returns 404."""
+        resp = client.delete("/api/pipelines",
+                             data=json.dumps({"dsl": "nonexistent_stage"}),
+                             headers=account)
+        assert resp.status_code == 404
 
     def test_kill_bridge_stage(self, client, account):
-        """kill:bridge:LEG_ID — detaches a leg from conference."""
+        """DELETE bridge:LEG_ID — detaches a leg from conference."""
         call_id = create_call(client, account)
 
-        # Create a fake leg and bridge it
         from test_crm_e2e import _make_rtp_leg, _cleanup_leg
         from speech_pipeline.rtp_codec import PCMU
         leg, phone_rtp, _ = _make_rtp_leg(codec=PCMU)
@@ -77,23 +72,27 @@ class TestKillAction:
                     headers=account)
         time.sleep(0.3)
 
-        # Kill the bridge via DSL
-        resp = client.post("/api/pipelines",
-                           data=json.dumps({
-                               "dsl": f"kill:bridge:{leg.leg_id}"
-                           }),
-                           headers=account)
-        assert resp.status_code == 201
+        # Kill the bridge via DELETE
+        resp = client.delete("/api/pipelines",
+                             data=json.dumps({"dsl": f"bridge:{leg.leg_id}"}),
+                             headers=account)
+        assert resp.status_code == 204
 
         client.delete(f"/api/calls/{call_id}", headers=account)
         _cleanup_leg(leg, phone_rtp)
 
-    def test_kill_missing_id_fails(self, client, account):
-        """kill without ID is a parse/validation error."""
-        resp = client.post("/api/pipelines",
-                           data=json.dumps({"dsl": "kill"}),
-                           headers=account)
+    def test_kill_missing_body(self, client, account):
+        """DELETE without body returns 400."""
+        resp = client.delete("/api/pipelines",
+                             data=json.dumps({}),
+                             headers=account)
         assert resp.status_code == 400
+
+    def test_kill_requires_auth(self, client):
+        """DELETE without auth returns 401."""
+        resp = client.delete("/api/pipelines",
+                             data=json.dumps({"dsl": "play:x"}))
+        assert resp.status_code == 401
 
 
 # ---------------------------------------------------------------------------
@@ -196,12 +195,7 @@ class TestOriginateElement:
 # ---------------------------------------------------------------------------
 
 class TestActionDSLParsing:
-    """Verify parse_dsl handles kill:, answer:, originate: correctly."""
-
-    def test_parse_kill(self):
-        from speech_pipeline.dsl_parser import parse_dsl
-        result = parse_dsl("kill:play:hold_music")
-        assert result == [("kill", "play:hold_music", {})]
+    """Verify parse_dsl handles answer:, originate: correctly."""
 
     def test_parse_answer(self):
         from speech_pipeline.dsl_parser import parse_dsl

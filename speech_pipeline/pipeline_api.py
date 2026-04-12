@@ -123,15 +123,6 @@ def create_pipeline():
                 call = c
                 break
 
-    # If kill: action, find the executor that owns the stage.
-    if not call and elements and elements[0][0] == "kill":
-        stage_id = elements[0][1]
-        from .telephony import call_state
-        for c in call_state.list_calls():
-            ex = getattr(c, "pipe_executor", None)
-            if ex and stage_id in ex._stages:
-                call = c
-                break
 
     # Reuse existing executor for the call (preserves tees/stages),
     # or create a new one for standalone pipelines.
@@ -313,6 +304,31 @@ def download_save(filename: str):
         return ("File not found\n", 404)
 
     return send_from_directory(save_dir, filename, as_attachment=True)
+
+
+@api.route("/pipelines", methods=["DELETE"])
+@_require_auth
+def kill_stage_by_dsl():
+    """Kill a stage by ID.
+
+    Body: ``{"dsl": "play:hold_music"}`` or ``{"dsl": "bridge:leg-abc"}``
+
+    Searches all active call executors for a stage matching the ID
+    and kills it. Returns 204 on success, 404 if not found.
+    """
+    body = request.get_json(force=True, silent=True) or {}
+    stage_id = body.get("dsl", "").strip()
+    if not stage_id:
+        return ("Missing 'dsl' (stage ID) in request body\n", 400)
+
+    # Search all executors for this stage
+    from .telephony import call_state
+    for call in call_state.list_calls():
+        ex = getattr(call, "pipe_executor", None)
+        if ex and ex.kill_stage(stage_id):
+            return ("", 204)
+
+    return (f"Stage '{stage_id}' not found\n", 404)
 
 
 @api.route("/pipelines/<pid>", methods=["DELETE"])

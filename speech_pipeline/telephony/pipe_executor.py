@@ -115,17 +115,10 @@ class CallPipeExecutor:
 
     # -- Action elements (single-element, no pipe) --------------------------
 
-    _ACTION_TYPES = {"kill", "answer", "webclient"}
+    _ACTION_TYPES = {"answer", "webclient"}
 
     def _execute_action(self, typ, elem_id, params) -> bool:
         """Execute a single-element action. Returns True if handled."""
-        if typ == "kill":
-            if not elem_id:
-                raise ValueError("kill requires a stage ID")
-            if not self.kill_stage(elem_id):
-                raise ValueError(f"Stage '{elem_id}' not found")
-            return True
-
         if typ == "answer":
             if not elem_id:
                 raise ValueError("answer requires a leg ID")

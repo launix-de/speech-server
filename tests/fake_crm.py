@@ -64,10 +64,13 @@ class FakeCrm:
 
     def register_as_subscriber(self, subscriber_id: str, pbx_id: str) -> None:
         """Point the existing subscriber's base_url + events at us."""
+        # Event keys must match what the server fires — see
+        # ``sip_listener.fire_event(call, 'call_ended', ...)`` and
+        # the real CRM's ``heartbeat.fop`` registration.
         events = {
             "incoming":    "/Telephone/SpeechServer/public?state=incoming",
             "device_dial": "/Telephone/SpeechServer/public?state=device-dial",
-            "ended":       "/Telephone/SpeechServer/public?state=ended",
+            "call_ended":  "POST /Telephone/SpeechServer/public?state=ended",
         }
         resp = self.client.put(
             f"/api/subscribe/{subscriber_id}",
@@ -384,21 +387,33 @@ class FakeCrm:
         if pid and pid in self.participants:
             self.participants[pid]["status"] = reason
             self.participants[pid]["end_reason"] = reason
-        # Liveliness: if no answered participants remain, end the call.
-        if call_db_id in self.calls:
-            active = any(
-                p.get("status") == "answered"
-                for p in self.participants.values()
-                if p.get("call_db_id") == call_db_id
-            )
-            if not active:
-                self.calls[call_db_id]["status"] = "completed"
-                call_sid = self.calls[call_db_id].get("sid")
-                if call_sid:
-                    self.client.delete(
-                        f"/api/calls/{call_sid}",
-                        headers=self.account_headers,
-                    )
+        if call_db_id not in self.calls:
+            return
+        call = self.calls[call_db_id]
+        remaining = [
+            (p_id, p) for p_id, p in self.participants.items()
+            if p.get("call_db_id") == call_db_id
+            and p.get("status") in ("answered", "ringing", "adding",
+                                     "bouncing", "hold")
+        ]
+        active = [p for _, p in remaining if p.get("status") == "answered"]
+        # Liveliness: if no active participants remain, end the call.
+        if not remaining:
+            call["status"] = "completed"
+            call_sid = call.get("sid")
+            if call_sid:
+                self.client.delete(f"/api/calls/{call_sid}",
+                                    headers=self.account_headers)
+            return
+        # Auto-unhold: last non-hold left while someone else is on hold
+        # → revert call status + unhold.  Mirrors
+        # ``calls.fop::checkLiveliness`` (speech-server-hold hook).
+        if (len(remaining) == 1
+                and call.get("status") in ("hold", "hold-adding")
+                and not active):
+            p_id, p = remaining[0]
+            call["status"] = "answered"
+            self.unhold_external_legs(call_db_id, p_id, p.get("sid", ""))
 
     def _ensure_outbound_conference(self, call_db_id: int, number: str) -> str:
         call = self.calls.get(call_db_id, {})

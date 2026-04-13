@@ -1,6 +1,7 @@
 """WebClient session cleanup on connection loss + TTL reaper."""
 from __future__ import annotations
 
+import json
 import time
 from unittest.mock import MagicMock
 
@@ -175,6 +176,44 @@ class TestPhoneUiNonceIsNotConsumedOnLoad:
         assert auth_mod.consume_nonce(nonce) is not None
         assert auth_mod.consume_nonce(nonce) is None
         assert auth_mod.check_nonce(nonce) is None
+
+
+class TestPhoneEventCompletedTearsDown:
+    """Browser hits red handset → ``/phone/<nonce>/event`` with
+    event=completed.  Server must close the webclient session
+    immediately so the conference leg detaches and the peer (e.g.
+    phone) doesn't keep running until the 30 s idle timeout."""
+
+    def test_phone_event_completed_closes_session(
+            self, client, account):
+        from speech_pipeline.telephony import auth as auth_mod
+        from conftest import create_call
+        call_id = create_call(client, account)
+        call = call_state.get_call(call_id)
+        try:
+            nonce_entry = auth_mod.create_nonce(
+                account_id=call.account_id,
+                subscriber_id=call.subscriber_id,
+                user="u1",
+            )
+            nonce = nonce_entry["nonce"]
+            sess = webclient.register_webclient(call, "u1", nonce)
+            sid = sess["session_id"]
+            assert webclient.get_webclient_session(sid) is not None
+
+            resp = client.post(
+                f"/phone/{nonce}/event",
+                data=json.dumps({"session": sid, "event": "completed"}),
+                headers={"Content-Type": "application/json"},
+            )
+            assert resp.status_code == 200
+            assert webclient.get_webclient_session(sid) is None, (
+                "Session still present after phone_event(completed) — "
+                "conference leg stays attached and the peer hangs for "
+                "~30 s until idle cleanup."
+            )
+        finally:
+            client.delete(f"/api/calls/{call_id}", headers=account)
 
 
 class TestBrowserReconnect:

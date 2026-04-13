@@ -581,4 +581,14 @@ def phone_event(nonce: str):
         return ("Unsupported event\n", 400)
 
     emit_leg_event(session_id, event)
+
+    # ``completed`` means the browser pressed the red handset.  Tear
+    # down the webclient session immediately — otherwise the
+    # ConferenceLeg stays attached, the mixer doesn't idle-out, and
+    # the peer (phone leg) keeps running until the idle-timeout
+    # eventually fires (~30 s later).  Users see this as "phone keeps
+    # running after I hung up in the browser".
+    if event == "completed":
+        close_webclient_session(session_id)
+
     return jsonify({"ok": True})

@@ -178,6 +178,53 @@ class TestPhoneUiNonceIsNotConsumedOnLoad:
         assert auth_mod.check_nonce(nonce) is None
 
 
+class TestWebclientHangupFiresLegCompletedWebhook:
+    """Real symptom: user clicks red handset, CRM's participant row
+    stays at 'klingelt' because no ``state=leg&event=completed``
+    webhook arrives.  Server must derive the leg-completed URL from
+    the original webclient callback and fire it."""
+
+    def test_completed_fires_state_leg_webhook(self, client, account, monkeypatch):
+        from speech_pipeline.telephony import auth as auth_mod
+        from speech_pipeline.telephony import _shared as sh
+        from conftest import create_call
+
+        call_id = create_call(client, account)
+        call = call_state.get_call(call_id)
+        try:
+            nonce_entry = auth_mod.create_nonce(
+                account_id=call.account_id,
+                subscriber_id=call.subscriber_id, user="u1",
+            )
+            nonce = nonce_entry["nonce"]
+            sess = webclient.register_webclient(call, "u1", nonce)
+            sid = sess["session_id"]
+            cb = (f"/Telephone/SpeechServer/public?call=42"
+                  f"&participant=99&state=webclient")
+            call.register_participant(
+                sid, type="webclient", user="u1",
+                nonce=nonce, callback=cb,
+            )
+
+            sent = []
+            def _capture(url, payload, token, **kw):
+                sent.append({"url": url, "payload": payload})
+            monkeypatch.setattr(sh, "post_webhook", _capture)
+
+            webclient.close_webclient_session(sid)
+
+            urls = [w["url"] for w in sent]
+            assert any("state=leg" in u and "event=completed" in u for u in urls), (
+                f"close_webclient_session did NOT fire a state=leg&"
+                f"event=completed webhook.  URLs sent: {urls}"
+            )
+            assert any("state=webclient" in u for u in urls), (
+                f"original webclient callback was not also fired: {urls}"
+            )
+        finally:
+            client.delete(f"/api/calls/{call_id}", headers=account)
+
+
 class TestPhoneEventCompletedTearsDown:
     """Browser hits red handset → ``/phone/<nonce>/event`` with
     event=completed.  Server must close the webclient session

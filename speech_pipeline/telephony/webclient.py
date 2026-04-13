@@ -209,6 +209,23 @@ def _send_callback(subscriber_id: str, callback_path: str, payload: dict) -> Non
     _shared.post_webhook(url, payload, sub["bearer_token"])
 
 
+def _flip_to_leg_completed(path: str) -> str:
+    """Rewrite ``?state=webclient&...`` to ``?state=leg&event=completed&...``
+    so the CRM's standard leg-completed handler runs for the webclient
+    participant.  Returns the input unchanged if no ``state=`` is present.
+    """
+    import re as _re
+    if "state=" not in path:
+        return path
+    out = _re.sub(r"state=[^&]+", "state=leg", path, count=1)
+    if "event=" not in out:
+        sep = "&" if "?" in out else "?"
+        out = out + f"{sep}event=completed"
+    else:
+        out = _re.sub(r"event=[^&]+", "event=completed", out, count=1)
+    return out
+
+
 def get_webclient_session(session_id: str) -> Optional[dict]:
     return _sessions.get(session_id)
 
@@ -242,10 +259,14 @@ def close_webclient_session(session_id: str) -> None:
         pass
 
     # Detach from the call: unregister participant so the mixer can idle out.
-    # Fire the participant's "completed" callback (if the CRM supplied one
-    # via the webclient slot's ``callback`` param) so the CRM can mark its
-    # own participant record as ended — otherwise findParticipant on the
-    # next call may block thinking this slot is still alive.
+    # Fire the participant's "completed" callback so the CRM marks its own
+    # participant record as ended — otherwise findParticipant on the next
+    # call may block thinking this slot is still alive.
+    #
+    # Fires TWO webhooks because the CRM has TWO handlers it might use:
+    #  * state=webclient — original slot lifecycle (carries iframe_url etc.)
+    #  * state=leg&event=completed — the same handler SIP legs use; this
+    #    is the one that flips the participant row from ringing → completed.
     call_id = entry.get("call_id")
     if call_id:
         try:
@@ -258,15 +279,31 @@ def close_webclient_session(session_id: str) -> None:
                     sub = subscriber.get(call.subscriber_id)
                     if sub:
                         from . import _shared
-                        url = _shared.subscriber_url(sub, cb_path)
-                        _shared.post_webhook(url, {
+                        webclient_url = _shared.subscriber_url(sub, cb_path)
+                        payload = {
                             "callId": call.call_id,
                             "command": "webclient",
                             "participantId": session_id,
                             "session_id": session_id,
+                            "leg_id": session_id,
                             "event": "completed",
                             "result": "completed",
-                        }, sub.get("bearer_token", ""))
+                        }
+                        _shared.post_webhook(
+                            webclient_url, payload,
+                            sub.get("bearer_token", ""),
+                        )
+                        # Switch state=webclient → state=leg&event=completed
+                        # for the same participant so the CRM's standard
+                        # leg-completed flow runs (marks participant done,
+                        # checks liveliness, etc.).
+                        leg_path = _flip_to_leg_completed(cb_path)
+                        if leg_path != cb_path:
+                            leg_url = _shared.subscriber_url(sub, leg_path)
+                            _shared.post_webhook(
+                                leg_url, payload,
+                                sub.get("bearer_token", ""),
+                            )
         except Exception:
             pass
 

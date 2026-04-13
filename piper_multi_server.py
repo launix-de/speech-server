@@ -979,9 +979,18 @@ def create_app(args: argparse.Namespace) -> Flask:
             return None  # admin
         from speech_pipeline.telephony.auth import _find_account_by_token
         acct = _find_account_by_token(token)
-        if not acct:
-            return False
-        return acct
+        if acct:
+            return acct
+        # Webclient nonces (``n-...``) are short-lived per-session
+        # tokens that the CRM-issued iframe embeds.  They authorize
+        # exactly one webclient conference pipe.  Accept them here so
+        # phone.html can open /ws/pipe without handing the browser a
+        # full account token.
+        if token.startswith("n-"):
+            from speech_pipeline.telephony.auth import check_nonce
+            if check_nonce(token):
+                return {"id": "__webclient__", "nonce": token}
+        return False
 
     # ---- WebSocket STT streaming endpoint ----
     @sock.route("/ws/stt")

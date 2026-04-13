@@ -122,6 +122,7 @@ def call_with_webclient(live_server):
             if entry.get("call_id") == call_id:
                 session_id = sid
                 dsl = entry.get("dsl")
+                nonce = entry.get("nonce")
                 break
         else:
             pytest.skip("webclient session not registered")
@@ -130,6 +131,7 @@ def call_with_webclient(live_server):
         "call_id": call_id,
         "session_id": session_id,
         "dsl": dsl,
+        "nonce": nonce,
         "admin": admin,
         "acct": acct,
         "base": base,
@@ -150,8 +152,10 @@ class TestWebclientWSHandshake:
         ctx = call_with_webclient
 
         # Step 1: open /ws/pipe + send DSL config (browser step).
+        # Browser authenticates with the nonce from the iframe URL,
+        # NOT the account token — that's exactly what phone.html does.
         pipe_ws = websocket.create_connection(
-            ctx["ws_base"] + "/ws/pipe?token=e2e-tok",
+            ctx["ws_base"] + "/ws/pipe?token=" + ctx["nonce"],
             timeout=5,
         )
         try:
@@ -192,7 +196,7 @@ class TestWebclientWSHandshake:
         ctx = call_with_webclient
 
         pipe_ws = websocket.create_connection(
-            ctx["ws_base"] + "/ws/pipe?token=e2e-tok", timeout=5,
+            ctx["ws_base"] + "/ws/pipe?token=" + ctx["nonce"] + "", timeout=5,
         )
         try:
             pipe_ws.send(json.dumps({"pipe": ctx["dsl"]}))
@@ -266,7 +270,7 @@ class TestWebclientWSHandshake:
         out_q = call.mixer.add_output()
 
         pipe_ws = websocket.create_connection(
-            ctx["ws_base"] + "/ws/pipe?token=e2e-tok", timeout=5,
+            ctx["ws_base"] + "/ws/pipe?token=" + ctx["nonce"] + "", timeout=5,
         )
         try:
             pipe_ws.send(json.dumps({"pipe": ctx["dsl"]}))

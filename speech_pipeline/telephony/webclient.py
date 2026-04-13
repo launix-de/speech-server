@@ -325,6 +325,10 @@ var sessionId = params.get('session');
 var dsl = params.get('dsl');
 var appBase = location.pathname.replace(/\/phone\/[^/?#]+$/, '');
 var wsBase = location.origin.replace(/^http/, 'ws') + appBase;
+// The nonce is the last path segment; /ws/pipe requires auth and
+// accepts nonces as short-lived tokens for the webclient session.
+var nonce = location.pathname.match(/\/phone\/([^/?#]+)/);
+nonce = nonce ? nonce[1] : '';
 
 // Load codec.js relative to the current /tts app prefix.
 var s = document.createElement('script');
@@ -388,7 +392,7 @@ function start() {
 
 // 2. Open pipe WS + codec WS (only after mic granted)
 function openPipeline(micStream) {
-  pipeWs = new WebSocket(wsBase + '/ws/pipe');
+  pipeWs = new WebSocket(wsBase + '/ws/pipe?token=' + encodeURIComponent(nonce));
   pipeWs.binaryType = 'arraybuffer';
 
   pipeWs.onopen = function () {

@@ -109,7 +109,8 @@ def register_webclient(call: call_state.Call, user: str,
         dsl = (dsl.replace("{session_id}", session_id)
                   .replace("{call_id}", call.call_id))
     else:
-        dsl = f"codec:{session_id} | conference:{call.call_id} | codec:{session_id}"
+        dsl = (f"codec:{session_id} -> call:{call.call_id} "
+               f"-> codec:{session_id}")
 
     entry = {
         "session_id": session_id,
@@ -401,9 +402,11 @@ function start() {
   navigator.mediaDevices.getUserMedia({
     audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
   }).then(function(stream) {
-    // Mic granted — now open pipeline + codec
+    // The pipeline is already running on the server (built when the
+    // CRM created the webclient slot) — we only need the codec WS
+    // for audio.  /ws/pipe is no longer used by the unified API.
     statusEl.textContent = 'Connecting…';
-    openPipeline(stream);
+    connectCodec(stream);
   }).catch(function(e) {
     statusEl.textContent = 'Microphone denied: ' + e.message;
   });

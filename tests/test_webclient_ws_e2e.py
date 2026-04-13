@@ -90,7 +90,7 @@ def call_with_webclient(live_server):
             "Content-Type": "application/json"}
     requests.put(base + "/api/subscribe/e2e-sub",
                  data=json.dumps({
-                     "base_url": "https://example.test/crm",
+                     "base_url": "https://crm.example.com/crm",
                      "bearer_token": "e2e-tok",
                  }),
                  headers=acct)
@@ -106,7 +106,7 @@ def call_with_webclient(live_server):
         base + "/api/pipelines",
         data=json.dumps({
             "dsl": 'webclient:e2e_user{"callback":"/cb",'
-                   '"base_url":"https://example.test",'
+                   '"base_url":"https://crm.example.com",'
                    f'"call_id":"{call_id}"}}',
         }),
         headers=acct,
@@ -279,7 +279,7 @@ class TestWebclientWSHandshake:
         acct = {"Authorization": "Bearer e2e-tok2",
                 "Content-Type": "application/json"}
         requests.put(base + "/api/subscribe/e2e-sub2",
-                     data=json.dumps({"base_url": "https://example.test/crm",
+                     data=json.dumps({"base_url": "https://crm.example.com/crm",
                                        "bearer_token": "e2e-tok2"}),
                      headers=acct)
         call_id = requests.post(
@@ -293,7 +293,7 @@ class TestWebclientWSHandshake:
                 base + "/api/pipelines",
                 data=json.dumps({
                     "dsl": 'webclient:stt_user{"callback":"/cb",'
-                           '"base_url":"https://example.test",'
+                           '"base_url":"https://crm.example.com",'
                            f'"call_id":"{call_id}",'
                            '"stt_callback":"/sttNote?call=42&participant=7"}',
                 }),
@@ -312,12 +312,12 @@ class TestWebclientWSHandshake:
             joined = " || ".join(obj["pipes"])
             assert "tee:" in joined and "stt:" in joined and "webhook:" in joined
             assert "sttNote" in joined
-            # The sidechain pipe MUST start with ``mix:`` (not ``tee:``)
-            # — PipelineBuilder rejects "tee at start" with
-            # "tee requires PCM upstream", which silently breaks the
-            # whole webclient pipeline build.
-            assert obj["pipes"][1].lstrip().startswith("mix:"), (
-                f"sidechain must start with mix:, got: {obj['pipes'][1]!r}"
+            # Sidechain pipe attaches to the existing tee from pipe 1.
+            # In pipe_executor (unified ``->`` DSL) ``tee:NAME`` as the
+            # first element is sidechain-attachment mode iff the named
+            # tee already exists — built before by pipe 1.
+            assert obj["pipes"][1].lstrip().startswith("tee:"), (
+                f"sidechain must start with tee:, got: {obj['pipes'][1]!r}"
             )
             # Webhook URL must be scheme-qualified — requests rejects
             # scheme-less URLs and the build appears to succeed but no
@@ -355,7 +355,7 @@ class TestWebclientWSHandshake:
         acct = {"Authorization": "Bearer stt-tok",
                 "Content-Type": "application/json"}
         requests.put(base + "/api/subscribe/stt-sub",
-                     data=json.dumps({"base_url": "https://example.test/crm",
+                     data=json.dumps({"base_url": "https://crm.example.com/crm",
                                        "bearer_token": "stt-tok"}),
                      headers=acct)
         call_id = requests.post(
@@ -369,7 +369,7 @@ class TestWebclientWSHandshake:
                 base + "/api/pipelines",
                 data=json.dumps({
                     "dsl": 'webclient:stt2{"callback":"/cb",'
-                           '"base_url":"https://example.test",'
+                           '"base_url":"https://crm.example.com",'
                            f'"call_id":"{call_id}",'
                            '"stt_callback":"/sttNote?call=99&participant=3"}',
                 }),

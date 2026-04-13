@@ -286,22 +286,42 @@ class CallPipeExecutor:
                     if "://" not in base:
                         base = "https://" + base
                     stt_url = base + "/" + stt_url.lstrip("/")
-                # PipelineBuilder doesn't dedupe ``tee:NAME`` across
-                # pipes, so a sidechain pipe with ``tee:NAME`` at the
-                # start fails ("tee requires PCM upstream").  Use the
-                # named-mixer pattern instead: pipe 1 feeds the mixer
-                # via ``tee:NAME``, pipe 2 reads from it via
-                # ``mix:NAME``.
+                # Use the unified ``->`` pipe-executor DSL.  pipe_executor
+                # keeps a single ``tee:NAME`` per executor and treats a
+                # second pipe with the same ``tee:NAME`` as the first
+                # element as a sidechain attachment (no duplicate
+                # AudioTee), so the STT branch cleanly taps the codec
+                # audio.
                 pipes = [
-                    "codec:{session_id} | tee:{session_id}_tap "
-                    "| conference:{call_id} | codec:{session_id}",
-                    "mix:{session_id}_tap:16000 | stt:de | webhook:" + stt_url,
+                    "codec:{session_id} -> tee:{session_id}_tap "
+                    "-> call:{call_id} -> codec:{session_id}",
+                    "tee:{session_id}_tap -> stt:de -> webhook:" + stt_url,
                 ]
 
             sess = wc.register_webclient(self.call, user, nonce,
                                           dsl=params.get("dsl"),
                                           pipes=pipes)
             session_id = sess["session_id"]
+
+            # Build the webclient pipes immediately via pipe_executor.
+            # Previously phone.html had to open /ws/pipe to trigger the
+            # build via PipelineBuilder; that was a race against the
+            # codec WS open and required the legacy ``|`` DSL.  The
+            # unified DSL via the same executor handles the codec
+            # element + sidechain tee → stt → webhook in one place.
+            try:
+                stored = sess.get("dsl") or ""
+                if stored.startswith("{"):
+                    inner = json.loads(stored).get("pipes", [])
+                else:
+                    inner = [stored] if stored else []
+                if inner:
+                    self.add_pipes(inner)
+            except Exception as e:
+                _LOGGER.warning(
+                    "WebClient %s: pipe build failed: %s",
+                    session_id, e,
+                )
 
             self.call.register_participant(session_id, type="webclient",
                                            user=user, nonce=nonce,
@@ -517,8 +537,8 @@ class CallPipeExecutor:
                 if call_pos == 0:
                     raise ValueError("call stage cannot be the first element")
                 if call_pos != len(elements) - 1:
-                    if call_pos != len(elements) - 2 or elements[-1][0] != "sip":
-                        raise ValueError("call may only be followed by a single terminal sip stage")
+                    if call_pos != len(elements) - 2 or elements[-1][0] not in ("sip", "codec"):
+                        raise ValueError("call may only be followed by a single terminal sip/codec stage")
                 if sip_ids and len(sip_ids) == 1 and call_pos != len(elements) - 2:
                     raise ValueError("A single sip stage is only valid as terminal sink after call")
 
@@ -674,6 +694,25 @@ class CallPipeExecutor:
             ref = FileFetcher.build_ref(elem_id, tmpl, here)
             bearer = params.get("bearer", "")
             return VCConverter(ref, bearer=bearer)
+
+        # -- codec: webclient Fourier-codec WS endpoint --
+        # Position-aware: if first → CodecSocketSource, last →
+        # CodecSocketSink, both → bidirectional handled by the
+        # CodecLeg wrapper analogue.  Same dual-position pattern as
+        # ``sip:LEG``.
+        if typ == "codec":
+            if not elem_id:
+                raise ValueError("codec requires a session id (e.g. codec:wc-abc)")
+            from speech_pipeline.CodecSocketSession import (
+                CodecSocketSession, get_session,
+            )
+            session = get_session(elem_id)
+            if session is None:
+                session = CodecSocketSession(elem_id)
+            # Stash the session in self._sessions so _wrap_codec sees
+            # it and can build Source/Sink wrappers.
+            self._sessions[f"codec:{elem_id}"] = session
+            return session
 
         # -- record/save: managed file recording with download URL --
         if typ in ("record", "save"):
@@ -979,50 +1018,67 @@ class CallPipeExecutor:
         """
         from speech_pipeline.SIPSource import SIPSource
         from speech_pipeline.SIPSink import SIPSink
+        from speech_pipeline.CodecSocketSource import CodecSocketSource
+        from speech_pipeline.CodecSocketSink import CodecSocketSink
 
-        sip_counts: dict[str, int] = {}
+        ENDPOINT_TYPES = ("sip", "originate", "codec")
+
+        ep_counts: dict[tuple[str, str], int] = {}
         for typ, elem_id, _, _ in resolved:
-            if typ in ("sip", "originate"):
-                sip_counts[elem_id] = sip_counts.get(elem_id, 0) + 1
+            if typ in ENDPOINT_TYPES:
+                kind = "codec" if typ == "codec" else "sip"
+                ep_counts[(kind, elem_id)] = ep_counts.get((kind, elem_id), 0) + 1
+
+        def _make_source(typ, stage, leg):
+            if typ == "codec":
+                return ("codec_source", CodecSocketSource(stage))
+            return ("sip_source", SIPSource(stage, leg=leg))
+
+        def _make_sink(typ, stage, leg):
+            if typ == "codec":
+                return ("codec_sink", CodecSocketSink(stage))
+            return ("sip_sink", SIPSink(stage, leg=leg))
 
         chains: list[list[tuple]] = [[]]
-        seen_source: set[str] = set()
+        seen_source: set[tuple[str, str]] = set()
         n = len(resolved)
         for i, (typ, elem_id, params, stage) in enumerate(resolved):
-            if typ not in ("sip", "originate"):
+            if typ not in ENDPOINT_TYPES:
                 chains[-1].append((typ, elem_id, params, stage))
                 continue
 
-            leg = self._sessions.get(f"_leg:{elem_id}")
+            kind = "codec" if typ == "codec" else "sip"
+            leg = self._sessions.get(f"_leg:{elem_id}") if kind == "sip" else None
             has_left = i > 0
             has_right = i < n - 1
-            count = sip_counts.get(elem_id, 0)
+            count = ep_counts.get((kind, elem_id), 0)
 
             if count >= 2:
-                if elem_id not in seen_source:
-                    chains[-1].append(("sip_source", elem_id, params,
-                                       SIPSource(stage, leg=leg)))
-                    seen_source.add(elem_id)
+                key = (kind, elem_id)
+                if key not in seen_source:
+                    role, wrapper = _make_source(typ, stage, leg)
+                    chains[-1].append((role, elem_id, params, wrapper))
+                    seen_source.add(key)
                 else:
-                    chains[-1].append(("sip_sink", elem_id, params,
-                                       SIPSink(stage, leg=leg)))
+                    role, wrapper = _make_sink(typ, stage, leg)
+                    chains[-1].append((role, elem_id, params, wrapper))
                 continue
 
             if has_left and has_right:
                 # Middle position, single occurrence → split.
-                chains[-1].append(("sip_sink", elem_id, params,
-                                   SIPSink(stage, leg=leg)))
-                chains.append([("sip_source", elem_id, params,
-                                SIPSource(stage, leg=leg))])
+                role_sink, sink = _make_sink(typ, stage, leg)
+                role_src, src = _make_source(typ, stage, leg)
+                chains[-1].append((role_sink, elem_id, params, sink))
+                chains.append([(role_src, elem_id, params, src)])
             elif has_right:
-                chains[-1].append(("sip_source", elem_id, params,
-                                   SIPSource(stage, leg=leg)))
+                role, wrapper = _make_source(typ, stage, leg)
+                chains[-1].append((role, elem_id, params, wrapper))
             elif has_left:
-                chains[-1].append(("sip_sink", elem_id, params,
-                                   SIPSink(stage, leg=leg)))
+                role, wrapper = _make_sink(typ, stage, leg)
+                chains[-1].append((role, elem_id, params, wrapper))
             else:
                 raise ValueError(
-                    f"sip:{elem_id} standalone has no neighbours to pipe into")
+                    f"{typ}:{elem_id} standalone has no neighbours to pipe into")
 
         return [c for c in chains if c]
 

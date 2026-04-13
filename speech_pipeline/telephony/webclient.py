@@ -241,12 +241,31 @@ def close_webclient_session(session_id: str) -> None:
         pass
 
     # Detach from the call: unregister participant so the mixer can idle out.
+    # Fire the participant's "completed" callback (if the CRM supplied one
+    # via the webclient slot's ``callback`` param) so the CRM can mark its
+    # own participant record as ended — otherwise findParticipant on the
+    # next call may block thinking this slot is still alive.
     call_id = entry.get("call_id")
     if call_id:
         try:
             call = call_state.get_call(call_id)
             if call:
+                participant = call.get_participant(session_id) or {}
+                cb_path = participant.get("callback") or ""
                 call.unregister_participant(session_id)
+                if cb_path:
+                    sub = subscriber.get(call.subscriber_id)
+                    if sub:
+                        from . import _shared
+                        url = _shared.subscriber_url(sub, cb_path)
+                        _shared.post_webhook(url, {
+                            "callId": call.call_id,
+                            "command": "webclient",
+                            "participantId": session_id,
+                            "session_id": session_id,
+                            "event": "completed",
+                            "result": "completed",
+                        }, sub.get("bearer_token", ""))
         except Exception:
             pass
 

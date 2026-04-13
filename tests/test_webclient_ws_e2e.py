@@ -312,6 +312,19 @@ class TestWebclientWSHandshake:
             joined = " || ".join(obj["pipes"])
             assert "tee:" in joined and "stt:" in joined and "webhook:" in joined
             assert "sttNote" in joined
+            # The sidechain pipe MUST start with ``mix:`` (not ``tee:``)
+            # — PipelineBuilder rejects "tee at start" with
+            # "tee requires PCM upstream", which silently breaks the
+            # whole webclient pipeline build.
+            assert obj["pipes"][1].lstrip().startswith("mix:"), (
+                f"sidechain must start with mix:, got: {obj['pipes'][1]!r}"
+            )
+            # Webhook URL must be scheme-qualified — requests rejects
+            # scheme-less URLs and the build appears to succeed but no
+            # transcript ever reaches the CRM.
+            assert "://" in joined, (
+                f"sidechain webhook missing scheme: {joined!r}"
+            )
         finally:
             requests.delete(base + f"/api/calls/{call_id}", headers=acct)
 

@@ -277,11 +277,25 @@ class CallPipeExecutor:
             pipes = params.get("pipes")
             stt_callback = params.get("stt_callback") or params.get("transcript")
             if not pipes and not params.get("dsl") and stt_callback:
-                stt_url = base_url.rstrip("/") + "/" + str(stt_callback).lstrip("/")
+                # Ensure the webhook URL is fully qualified — Python
+                # ``requests`` rejects scheme-less URLs and the whole
+                # WebhookSink fails silently.
+                stt_url = str(stt_callback)
+                if not stt_url.startswith("http://") and not stt_url.startswith("https://"):
+                    base = base_url.rstrip("/")
+                    if "://" not in base:
+                        base = "https://" + base
+                    stt_url = base + "/" + stt_url.lstrip("/")
+                # PipelineBuilder doesn't dedupe ``tee:NAME`` across
+                # pipes, so a sidechain pipe with ``tee:NAME`` at the
+                # start fails ("tee requires PCM upstream").  Use the
+                # named-mixer pattern instead: pipe 1 feeds the mixer
+                # via ``tee:NAME``, pipe 2 reads from it via
+                # ``mix:NAME``.
                 pipes = [
                     "codec:{session_id} | tee:{session_id}_tap "
                     "| conference:{call_id} | codec:{session_id}",
-                    "tee:{session_id}_tap | stt:de | webhook:" + stt_url,
+                    "mix:{session_id}_tap:16000 | stt:de | webhook:" + stt_url,
                 ]
 
             sess = wc.register_webclient(self.call, user, nonce,

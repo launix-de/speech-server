@@ -246,11 +246,14 @@ def create_pipeline():
     pipeline._executor = executor
     registry.register(pipeline)
 
-    # Surface side-effect IDs (e.g. originate leg_id) in the response.
+    # Surface side-effect IDs (e.g. originate leg_id, webclient
+    # session_id/nonce/iframe_url) in the response so the CRM can
+    # store them on the Participant row deterministically.
     body = pipeline.to_dict()
     for r in results:
-        if r.get("leg_id"):
-            body["leg_id"] = r["leg_id"]
+        for k in ("leg_id", "session_id", "nonce", "iframe_url"):
+            if r.get(k):
+                body[k] = r[k]
     return jsonify(body), 201
 
 

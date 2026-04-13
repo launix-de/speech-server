@@ -43,6 +43,20 @@ import time
 from typing import Any, Dict, List, Tuple
 
 from speech_pipeline.dsl_parser import parse_dsl  # noqa: F401 — re-export
+from urllib.parse import urlparse as _urlparse
+
+
+def _same_origin(url: str, base: str | None) -> bool:
+    """True iff *url* shares scheme+host+port with *base*."""
+    if not base or not url:
+        return False
+    try:
+        a, b = _urlparse(url), _urlparse(base)
+    except Exception:
+        return False
+    return (a.scheme == b.scheme
+            and (a.hostname or "").lower() == (b.hostname or "").lower()
+            and a.port == b.port)
 
 _LOGGER = logging.getLogger("telephony.pipe-executor")
 
@@ -76,8 +90,11 @@ class CallPipeExecutor:
             try:
                 elements = parse_dsl(pipe_str)
                 self._last_originated_leg_id = None
+                self._last_webclient_result = None
                 self._execute_pipe(elements)
                 result = {"pipe": pipe_str, "ok": True}
+                if self._last_webclient_result:
+                    result.update(self._last_webclient_result)
                 # Originate:NUM -> call:C returns a leg_id so callers can
                 # track the leg via callbacks.
                 if self._last_originated_leg_id:
@@ -309,6 +326,10 @@ class CallPipeExecutor:
             # codec WS open and required the legacy ``|`` DSL.  The
             # unified DSL via the same executor handles the codec
             # element + sidechain tee → stt → webhook in one place.
+            # Build pipes in a background thread.  Synchronous build can
+            # load Whisper, wire ConferenceLeg, etc., exceeding the CRM's
+            # proxy timeout (observed 504).  The browser doesn't need the
+            # pipes until it opens /ws/socket/<sid>.
             try:
                 stored = sess.get("dsl") or ""
                 if stored.startswith("{"):
@@ -316,7 +337,16 @@ class CallPipeExecutor:
                 else:
                     inner = [stored] if stored else []
                 if inner:
-                    self.add_pipes(inner)
+                    def _bg_build(pipes_to_build=inner, sid=session_id):
+                        try:
+                            self.add_pipes(pipes_to_build)
+                        except Exception as e:
+                            _LOGGER.warning(
+                                "WebClient %s: async pipe build failed: %s",
+                                sid, e)
+                    threading.Thread(
+                        target=_bg_build, daemon=True,
+                        name=f"wc-build-{session_id}").start()
             except Exception as e:
                 _LOGGER.warning(
                     "WebClient %s: pipe build failed: %s",
@@ -336,6 +366,16 @@ class CallPipeExecutor:
             iframe_url = f"{base_url}/phone/{nonce}?{query}"
             _LOGGER.info("WebClient slot for call %s: %s",
                          self.call.call_id, iframe_url)
+
+            # Surface identifiers to the HTTP response so the CRM can
+            # store session_id as the participant's sid and embed the
+            # iframe_url immediately — no need to wait for the async
+            # ``ready`` callback.
+            self._last_webclient_result = {
+                "session_id": session_id,
+                "nonce": nonce,
+                "iframe_url": iframe_url,
+            }
 
             # Fire callback with iframe_url
             if callback:
@@ -647,8 +687,16 @@ class CallPipeExecutor:
         if typ == "webhook":
             if not elem_id:
                 raise ValueError("webhook requires a target URL")
-            from speech_pipeline.url_safety import require_safe_url
-            require_safe_url(elem_id)
+            # Trust the subscriber's own origin.  ``post_webhook`` already
+            # posts to subscriber.base_url unchecked; WebhookSink URLs
+            # derived from that same origin (e.g. STT transcript tap with
+            # a relative path that got prefixed by base_url) must pass
+            # too — otherwise the callbacks that worked during the same
+            # request die here.
+            sub_base = self._subscriber.get("base_url") if self._subscriber else None
+            if not _same_origin(elem_id, sub_base):
+                from speech_pipeline.url_safety import require_safe_url
+                require_safe_url(elem_id)
             from speech_pipeline.WebhookSink import WebhookSink
             bearer = self._subscriber.get("bearer_token", "") if self._subscriber else ""
             return WebhookSink(elem_id, bearer_token=bearer)

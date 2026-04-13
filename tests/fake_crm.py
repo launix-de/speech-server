@@ -493,6 +493,71 @@ class FakeCrm:
             self.participants[pid]["sid"] = resp.get_json().get("leg_id", "")
 
     # ------------------------------------------------------------------
+    # Hold / Unhold — mirrors calls.fop::{hold,unhold}ExternalLegs
+    # ------------------------------------------------------------------
+
+    def hold_external_legs(self, call_db_id: int, pid: int,
+                           leg_id: str) -> None:
+        """CRM holdExternalLegs: drop the conference bridge, play the
+        hold jingle straight into the leg."""
+        call = self.calls.get(call_db_id)
+        if not call or not call.get("sid"):
+            return
+        call_sid = call["sid"]
+        # stopWaitMusic.
+        self.client.delete("/api/pipelines",
+                            data=json.dumps({"dsl": f"play:{call_sid}_wait"}),
+                            headers=self.account_headers)
+        # Drop bridge.
+        self.client.delete("/api/pipelines",
+                            data=json.dumps({"dsl": f"bridge:{leg_id}"}),
+                            headers=self.account_headers)
+        # Idempotent DELETE of any prior hold-music stage.
+        stage = f"play:{call_sid}_hold_{leg_id}"
+        self.client.delete("/api/pipelines",
+                            data=json.dumps({"dsl": stage}),
+                            headers=self.account_headers)
+        if self.hold_jingle:
+            self.client.post("/api/pipelines", data=json.dumps({
+                "dsl": f'{stage}'
+                       f'{{"url":"{self.hold_jingle}","loop":true,"volume":50}} '
+                       f'-> sip:{leg_id}',
+            }), headers=self.account_headers)
+        if pid and pid in self.participants:
+            self.participants[pid]["status"] = "hold"
+        call["status"] = "hold"
+
+    def unhold_external_legs(self, call_db_id: int, pid: int,
+                             leg_id: str) -> None:
+        """CRM unholdExternalLegs: stop hold music, rebuild the bridge
+        — with the ``completed`` callback correctly carrying both the
+        call DB id and the participant id, so later teardowns reach the
+        right CRM row."""
+        call = self.calls.get(call_db_id)
+        if not call or not call.get("sid"):
+            return
+        call_sid = call["sid"]
+        # Stop hold music.
+        stage = f"play:{call_sid}_hold_{leg_id}"
+        self.client.delete("/api/pipelines",
+                            data=json.dumps({"dsl": stage}),
+                            headers=self.account_headers)
+        # Rebuild bridge with completed callback — BOTH call + participant
+        # in the URL so webhook recipients don't have to guess.
+        cb_completed = (
+            f"/Telephone/SpeechServer/public?call={call_db_id}"
+            f"&participant={pid}&state=leg&event=completed"
+        )
+        dsl = (f"sip:{leg_id}{json.dumps({'completed': cb_completed})} "
+               f"-> call:{call_sid} -> sip:{leg_id}")
+        self.client.post("/api/pipelines",
+                         data=json.dumps({"dsl": dsl}),
+                         headers=self.account_headers)
+        if pid and pid in self.participants:
+            self.participants[pid]["status"] = "answered"
+        call["status"] = "answered"
+
+    # ------------------------------------------------------------------
     # Convenience
     # ------------------------------------------------------------------
 

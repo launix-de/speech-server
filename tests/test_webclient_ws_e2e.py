@@ -229,6 +229,31 @@ class TestWebclientWSHandshake:
         finally:
             pipe_ws.close()
 
+    def test_codec_ws_opens_before_pipe_ws(self, call_with_webclient):
+        """Race guard: browser opens /ws/socket/<sid> BEFORE the /ws/pipe
+        pipeline has registered the CodecSocketSession.  Server must
+        pre-create the session (webclient slot already exists) instead
+        of replying 'Unknown session ID'."""
+        ctx = call_with_webclient
+
+        # Skip /ws/pipe entirely — just hit /ws/socket directly.
+        codec_ws = websocket.create_connection(
+            ctx["ws_base"] + "/ws/socket/" + ctx["session_id"], timeout=5,
+        )
+        try:
+            codec_ws.send(json.dumps({"type": "hello", "profiles": ["low"]}))
+            codec_ws.settimeout(5)
+            resp = codec_ws.recv()
+            assert isinstance(resp, str), resp
+            obj = json.loads(resp)
+            assert "error" not in obj, (
+                f"Server returned error on pre-pipe /ws/socket connect: {obj}"
+            )
+            assert obj.get("type") == "hello", obj
+            assert obj.get("session_id") == ctx["session_id"]
+        finally:
+            codec_ws.close()
+
     def test_audio_flows_browser_to_conference(self, call_with_webclient):
         """Browser-encoded frames must end up as audio in the conference
         mixer.  This is the actual thing the user wants to test."""

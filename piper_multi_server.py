@@ -1357,20 +1357,29 @@ def create_app(args: argparse.Namespace) -> Flask:
         encode/decode and bridges to the pipeline via rx/tx queues.
         """
         from lib.CodecSocketSession import get_session
+        from speech_pipeline.CodecSocketSession import CodecSocketSession
+        from speech_pipeline.telephony.webclient import get_webclient_session
         import json as _json
-        import time as _time
 
-        # Wait up to 5s for the session to be created by the pipeline
-        session = None
-        for _ in range(50):
-            session = get_session(session_id)
-            if session:
-                break
-            _time.sleep(0.1)
-
+        # Browser may open /ws/socket/<sid> in parallel with /ws/pipe
+        # — there's no guarantee the pipeline has registered the
+        # CodecSocketSession yet when we get here.  Pre-create the
+        # session if it doesn't exist but the webclient slot is known.
+        # PipelineBuilder's _get_or_create_codec_session will reuse it.
+        session = get_session(session_id)
         if not session:
-            ws.send(_json.dumps({"error": "Unknown session ID", "session_id": session_id}))
-            return
+            if session_id.startswith("wc-") and get_webclient_session(session_id):
+                session = CodecSocketSession(session_id)
+                _LOGGER.info(
+                    "ws_codec_socket: pre-created CodecSocketSession for %s",
+                    session_id,
+                )
+            else:
+                ws.send(_json.dumps({
+                    "error": "Unknown session ID",
+                    "session_id": session_id,
+                }))
+                return
         session.handle_ws(ws)
         # NB: don't close_webclient_session here — browsers do a normal
         # disconnect-reconnect cycle on page load, and tearing down the

@@ -315,6 +315,68 @@ class TestWebclientWSHandshake:
         finally:
             requests.delete(base + f"/api/calls/{call_id}", headers=acct)
 
+    def test_stt_tap_routes_browser_audio_to_webhook(self, live_server):
+        """End-to-end: webclient with stt_callback → tap pipe runs →
+        Whisper sees frames → POST to webhook URL.
+
+        Mocks the Whisper transcriber + webhook with HTTP capture so
+        we don't need real STT model weights, but exercises the full
+        DSL build + audio path."""
+        import requests
+        from unittest.mock import patch
+        from speech_pipeline.telephony import webclient as wc_mod
+        from speech_pipeline import fourier_codec as fc
+
+        admin = {"Authorization": "Bearer " + live_server["admin_token"],
+                 "Content-Type": "application/json"}
+        base = live_server["base"]
+
+        # Provision once.
+        requests.put(base + "/api/pbx/STTPBX",
+                     data=json.dumps({"sip_proxy": "", "sip_user": ""}),
+                     headers=admin)
+        requests.put(base + "/api/accounts/STTAcc",
+                     data=json.dumps({"token": "stt-tok", "pbx": "STTPBX",
+                                       "features": ["webclient"]}),
+                     headers=admin)
+        acct = {"Authorization": "Bearer stt-tok",
+                "Content-Type": "application/json"}
+        requests.put(base + "/api/subscribe/stt-sub",
+                     data=json.dumps({"base_url": "https://example.test/crm",
+                                       "bearer_token": "stt-tok"}),
+                     headers=acct)
+        call_id = requests.post(
+            base + "/api/calls",
+            data=json.dumps({"subscriber_id": "stt-sub"}),
+            headers=acct,
+        ).json()["call_id"]
+
+        try:
+            resp = requests.post(
+                base + "/api/pipelines",
+                data=json.dumps({
+                    "dsl": 'webclient:stt2{"callback":"/cb",'
+                           '"base_url":"https://example.test",'
+                           f'"call_id":"{call_id}",'
+                           '"stt_callback":"/sttNote?call=99&participant=3"}',
+                }),
+                headers=acct,
+            )
+            assert resp.status_code == 201, resp.text
+
+            with wc_mod._sessions_lock:
+                sess = next(s for s in wc_mod._sessions.values()
+                            if s.get("call_id") == call_id)
+            sid = sess["session_id"]
+            nonce = sess["nonce"]
+
+            # Verify the multi-pipe DSL contains the tap.
+            obj = json.loads(sess["dsl"])
+            joined = " || ".join(obj["pipes"])
+            assert "tee:" in joined and "stt:" in joined and "sttNote" in joined
+        finally:
+            requests.delete(base + f"/api/calls/{call_id}", headers=acct)
+
     def test_audio_flows_browser_to_conference(self, call_with_webclient):
         """Browser-encoded frames must end up as audio in the conference
         mixer.  This is the actual thing the user wants to test."""

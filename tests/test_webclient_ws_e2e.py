@@ -258,6 +258,63 @@ class TestWebclientWSHandshake:
         finally:
             codec_ws.close()
 
+    def test_stt_callback_adds_transcript_tap(self, live_server):
+        """When the CRM passes ``stt_callback`` to ``webclient:USER``,
+        the server auto-builds a ``tee → stt → webhook`` sidechain so
+        the webclient's mic audio gets transcribed — same as a SIP leg.
+        """
+        import requests
+
+        admin = {"Authorization": "Bearer " + live_server["admin_token"],
+                 "Content-Type": "application/json"}
+        base = live_server["base"]
+
+        requests.put(base + "/api/pbx/E2EPBX2",
+                     data=json.dumps({"sip_proxy": "", "sip_user": ""}),
+                     headers=admin)
+        requests.put(base + "/api/accounts/E2EAcc2",
+                     data=json.dumps({"token": "e2e-tok2", "pbx": "E2EPBX2",
+                                       "features": ["webclient"]}),
+                     headers=admin)
+        acct = {"Authorization": "Bearer e2e-tok2",
+                "Content-Type": "application/json"}
+        requests.put(base + "/api/subscribe/e2e-sub2",
+                     data=json.dumps({"base_url": "https://example.test/crm",
+                                       "bearer_token": "e2e-tok2"}),
+                     headers=acct)
+        call_id = requests.post(
+            base + "/api/calls",
+            data=json.dumps({"subscriber_id": "e2e-sub2"}),
+            headers=acct,
+        ).json()["call_id"]
+
+        try:
+            resp = requests.post(
+                base + "/api/pipelines",
+                data=json.dumps({
+                    "dsl": 'webclient:stt_user{"callback":"/cb",'
+                           '"base_url":"https://example.test",'
+                           f'"call_id":"{call_id}",'
+                           '"stt_callback":"/sttNote?call=42&participant=7"}',
+                }),
+                headers=acct,
+            )
+            assert resp.status_code == 201, resp.text
+
+            from speech_pipeline.telephony import webclient as wc_mod
+            with wc_mod._sessions_lock:
+                sess = next(s for s in wc_mod._sessions.values()
+                            if s.get("call_id") == call_id)
+            dsl = sess["dsl"]
+            # Parsed as {"pipes": [...]} when pipes were used.
+            obj = json.loads(dsl)
+            assert "pipes" in obj, f"expected multi-pipe DSL, got {dsl!r}"
+            joined = " || ".join(obj["pipes"])
+            assert "tee:" in joined and "stt:" in joined and "webhook:" in joined
+            assert "sttNote" in joined
+        finally:
+            requests.delete(base + f"/api/calls/{call_id}", headers=acct)
+
     def test_audio_flows_browser_to_conference(self, call_with_webclient):
         """Browser-encoded frames must end up as audio in the conference
         mixer.  This is the actual thing the user wants to test."""

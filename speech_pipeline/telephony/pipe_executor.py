@@ -269,9 +269,24 @@ class CallPipeExecutor:
                 user=user)
             nonce = nonce_entry["nonce"]
 
+            # Auto-build a pipes array that mirrors the SIP-leg STT tap
+            # (tee → stt → webhook) when the CRM asks for transcript.
+            # This matches what ``transcript.fop::add-stt`` does for
+            # ``sip:LEG -> call:C -> sip:LEG`` and saves every caller
+            # from rebuilding the DSL by hand.
+            pipes = params.get("pipes")
+            stt_callback = params.get("stt_callback") or params.get("transcript")
+            if not pipes and not params.get("dsl") and stt_callback:
+                stt_url = base_url.rstrip("/") + "/" + str(stt_callback).lstrip("/")
+                pipes = [
+                    "codec:{session_id} | tee:{session_id}_tap "
+                    "| conference:{call_id} | codec:{session_id}",
+                    "tee:{session_id}_tap | stt:de | webhook:" + stt_url,
+                ]
+
             sess = wc.register_webclient(self.call, user, nonce,
                                           dsl=params.get("dsl"),
-                                          pipes=params.get("pipes"))
+                                          pipes=pipes)
             session_id = sess["session_id"]
 
             self.call.register_participant(session_id, type="webclient",

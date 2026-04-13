@@ -537,8 +537,13 @@ window.addEventListener('beforeunload', function () {
 
 @bp.route("/phone/<nonce>")
 def phone_ui(nonce: str):
-    """Serve the phone iframe UI."""
-    entry = auth.validate_nonce(nonce)
+    """Serve the phone iframe UI.
+
+    Non-consuming nonce check — the iframe may be loaded more than
+    once (browser reload, navigation) before the user actually joins
+    the call.  The nonce is burned later at the WS handshake.
+    """
+    entry = auth.check_nonce(nonce)
     if not entry:
         return ("Invalid or expired nonce\n", 403)
     # Find webclient session by nonce
@@ -553,7 +558,12 @@ def phone_ui(nonce: str):
 
 @bp.route("/phone/<nonce>/event", methods=["POST"])
 def phone_event(nonce: str):
-    entry = auth.validate_nonce(nonce)
+    """Post lifecycle event (answered/completed) for a phone nonce.
+
+    Non-consuming — a single call may fire both ``answered`` and
+    ``completed`` through this endpoint.
+    """
+    entry = auth.check_nonce(nonce)
     if not entry:
         return ("Invalid or expired nonce\n", 403)
 

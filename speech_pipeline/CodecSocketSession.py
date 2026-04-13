@@ -58,7 +58,25 @@ class CodecSocketSession:
     # ------------------------------------------------------------------
 
     def handle_ws(self, ws) -> None:
+        """Run one WS connection's lifetime against this session.
+
+        The session itself is re-entrant: when the browser does a
+        normal disconnect/reconnect cycle (very common on page load,
+        network blips), the old WS ends here, rx/tx loops exit, and
+        the next ``handle_ws`` call picks up with a new ws on the
+        same session — queues and profile state are preserved.
+
+        Full teardown only happens via :meth:`close` (pipeline ending
+        or explicit webclient close).
+        """
+        if self.closed.is_set():
+            _LOGGER.info("CodecSocket %s: already closed, rejecting ws",
+                         self.session_id)
+            return
         self._ws = ws
+        # Reset per-ws transient state; keep queues so audio doesn't get
+        # lost between reconnects.
+        self.connected.clear()
         try:
             self._handshake(ws)
             self.connected.set()
@@ -77,7 +95,11 @@ class CodecSocketSession:
         except Exception as e:
             _LOGGER.warning("CodecSocket %s error: %s", self.session_id, e)
         finally:
-            self.close()
+            # Drop the current ws reference but DON'T tear down the
+            # session — a quick browser reconnect needs to find it.
+            # ``close()`` is called by the pipeline when the conference
+            # ends or by webclient teardown.
+            self._ws = None
 
     # ------------------------------------------------------------------
     #  Handshake
@@ -170,8 +192,11 @@ class CodecSocketSession:
             _LOGGER.info("CodecSocket %s RX loop exception: %s", self.session_id, e)
         finally:
             _LOGGER.info("CodecSocket %s RX loop ended after %d frames", self.session_id, rx_count)
-            self.closed.set()
-            self.connected.set()
+            # Do NOT set ``closed`` here — this loop exits on browser
+            # WS disconnect (normal reconnect pattern) and the session
+            # must survive so the next ws_codec_socket call finds it.
+            # ``closed`` is set explicitly by :meth:`close` when the
+            # pipeline tears down.
 
     # ------------------------------------------------------------------
     #  TX loop: tx_queue → encode → send
@@ -199,7 +224,9 @@ class CodecSocketSession:
                     try:
                         ws.send(encoded)
                     except Exception:
-                        self.closed.set()
+                        # WS died (browser navigated / network blip).
+                        # Return without closing the session — the next
+                        # handle_ws call will pick up with a new ws.
                         return
             # Flush remaining (zero-pad)
             if buf:
@@ -213,9 +240,9 @@ class CodecSocketSession:
                     pass
         except Exception as e:
             _LOGGER.debug("CodecSocket %s TX loop ended: %s", self.session_id, e)
-        finally:
-            self.closed.set()
-            self.connected.set()
+        # No finally close — session must survive browser WS disconnect
+        # so the reconnect finds it.  ``close()`` is only called by
+        # the pipeline teardown or webclient.close_webclient_session.
 
     # ------------------------------------------------------------------
     #  Lifecycle

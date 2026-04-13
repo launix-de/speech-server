@@ -32,19 +32,29 @@ class CodecSocketSink(Stage):
             return
 
         _LOGGER.info("CodecSocketSink: streaming to codec socket")
+        from queue import Full as _QFull
         try:
             for pcm in self.upstream.stream_pcm24k():
                 if self.cancelled or self.session.closed.is_set():
                     break
+                # Non-blocking: if the queue is full (browser is between
+                # reconnects, TX loop paused), drop the frame instead of
+                # stalling the sink — real-time audio, better to lose a
+                # few frames than to tear down the whole session.
                 try:
-                    self.session.tx_queue.put(pcm, timeout=1.0)
-                except Exception:
-                    break
+                    self.session.tx_queue.put_nowait(pcm)
+                except _QFull:
+                    # Drain one old frame to keep the queue fresh.
+                    try:
+                        self.session.tx_queue.get_nowait()
+                        self.session.tx_queue.put_nowait(pcm)
+                    except Exception:
+                        pass
         except Exception as e:
             _LOGGER.warning("CodecSocketSink error: %s", e)
         finally:
             _LOGGER.info("CodecSocketSink: stream ended")
             try:
-                self.session.tx_queue.put(None, timeout=1.0)
+                self.session.tx_queue.put_nowait(None)
             except Exception:
                 pass

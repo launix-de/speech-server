@@ -205,8 +205,30 @@ def create_nonce(account_id: str, subscriber_id: str, user: str,
     return entry
 
 
-def validate_nonce(nonce: str) -> Optional[dict]:
-    """Atomic check-and-mark: a concurrent second caller always loses."""
+def check_nonce(nonce: str) -> Optional[dict]:
+    """Non-consuming validity check: returns entry if still valid
+    (not expired, not yet consumed), else None.  Use for HTTP
+    endpoints that may be hit more than once (page loads, status
+    polls, browser reloads).
+    """
+    with _nonce_lock:
+        entry = _nonces.get(nonce)
+        if not entry:
+            return None
+        if time.time() - entry["created"] > entry["ttl"]:
+            del _nonces[nonce]
+            return None
+        if entry.get("connected"):
+            return None
+        return entry
+
+
+def consume_nonce(nonce: str) -> Optional[dict]:
+    """Atomic check-and-mark: a concurrent second caller always loses.
+
+    Use exactly once at the commit point — e.g. when the WebSocket
+    handshake completes or the user actively joins the call.
+    """
     with _nonce_lock:
         entry = _nonces.get(nonce)
         if not entry:
@@ -218,6 +240,13 @@ def validate_nonce(nonce: str) -> Optional[dict]:
             return None
         entry["connected"] = True
         return entry
+
+
+# Backwards-compat alias — any caller that needs consumption should
+# switch to ``consume_nonce`` explicitly.  ``validate_nonce`` kept
+# as the consuming variant to avoid silently changing semantics
+# for existing callers.
+validate_nonce = consume_nonce
 
 
 def revoke_nonce(nonce: str) -> bool:

@@ -127,6 +127,56 @@ class TestReaper:
         webclient.close_webclient_session(sid)
 
 
+class TestPhoneUiNonceIsNotConsumedOnLoad:
+    """Regression: ``GET /phone/<nonce>`` used to call
+    ``validate_nonce`` (consuming).  A second load (browser reload,
+    iframe re-navigation, /event POST) then returned 403 → the
+    webclient showed 'Disconnected' immediately after the user
+    pressed the green handset."""
+
+    def test_phone_ui_can_be_loaded_twice(self, client, account):
+        from speech_pipeline.telephony import auth as auth_mod, subscriber as sub_mod
+        from conftest import SUBSCRIBER_ID, create_call
+        # We need a webclient feature-enabled account; look it up from conftest.
+        if not auth_mod.check_feature(
+            next(iter(auth_mod._accounts.keys())), "webclient"
+        ):
+            pytest.skip("webclient feature not enabled on test account")
+
+        call_id = create_call(client, account)
+        call = call_state.get_call(call_id)
+        try:
+            nonce_entry = auth_mod.create_nonce(
+                account_id=call.account_id,
+                subscriber_id=call.subscriber_id,
+                user="u1",
+            )
+            nonce = nonce_entry["nonce"]
+            webclient.register_webclient(call, "u1", nonce)
+
+            resp1 = client.get(f"/phone/{nonce}")
+            assert resp1.status_code == 200
+            resp2 = client.get(f"/phone/{nonce}")
+            assert resp2.status_code == 200, (
+                "Second phone_ui load returned "
+                f"{resp2.status_code} — nonce got consumed on first load"
+            )
+        finally:
+            client.delete(f"/api/calls/{call_id}", headers=account)
+
+    def test_check_vs_consume_nonce(self):
+        from speech_pipeline.telephony import auth as auth_mod
+        entry = auth_mod.create_nonce("acc", "sub", "u1", ttl=60)
+        nonce = entry["nonce"]
+        # check_nonce is idempotent.
+        assert auth_mod.check_nonce(nonce) is not None
+        assert auth_mod.check_nonce(nonce) is not None
+        # consume_nonce burns it exactly once.
+        assert auth_mod.consume_nonce(nonce) is not None
+        assert auth_mod.consume_nonce(nonce) is None
+        assert auth_mod.check_nonce(nonce) is None
+
+
 class TestBrowserReconnect:
     """Browsers commonly do a short disconnect-reconnect on page load
     (HTTP→WS upgrade, CORS pre-checks).  The session MUST survive —

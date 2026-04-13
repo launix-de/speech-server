@@ -125,13 +125,17 @@ class FakeCrm:
         parsed = urllib.parse.urlsplit(url)
         qs = urllib.parse.parse_qs(parsed.query)
         state = qs.get("state", [""])[0]
+        # Path-based handlers (sttNote, heartbeat, ...) have no state.
+        handler_key = state or parsed.path.rsplit("/", 1)[-1]
         self.webhooks.append({
             "state": state,
+            "path": parsed.path,
             "query": {k: v[0] for k, v in qs.items()},
             "body": payload,
             "method": method,
         })
-        handler = getattr(self, f"_on_{state.replace('-', '_')}", None)
+        handler = getattr(self, f"_on_{handler_key.replace('-', '_')}",
+                           None)
         if handler:
             handler(qs, payload)
 

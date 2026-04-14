@@ -135,21 +135,60 @@ def _account_id() -> Optional[str]:
 
 
 def _check_call_ownership(dsl: str) -> Optional[str]:
-    """If DSL references call:ID or conference:ID, verify ownership.
+    """Verify the caller owns every referenced live resource.
 
-    Returns error string on failure, None on success.
+    Covers call/conference, sip/bridge, codec, and tee sidechain
+    attachments.  Admin bypasses all checks.
     """
     aid = _account_id()
     if not aid:
         return None  # admin — no restriction
 
-    from .telephony import call_state
+    from .telephony import call_state, leg as leg_mod, subscriber as sub_mod
+    from .telephony import webclient as wc_mod
+
+    def _sub_account(subscriber_id: str) -> Optional[str]:
+        sub = sub_mod.get(subscriber_id)
+        return sub.get("account_id") if sub else None
+
+    # call/conference
     for call_id in re.findall(r'(?:call|conference):([^\s{|>]+)', dsl):
         call = call_state.get_call(call_id)
         if not call:
             return f"Call {call_id} not found"
         if call.account_id != aid:
             return f"Forbidden: call {call_id} belongs to another account"
+
+    # sip / bridge — both reference a leg by id
+    for leg_id in re.findall(r'(?:sip|bridge):([^\s{|>]+)', dsl):
+        leg = leg_mod.get_leg(leg_id)
+        if not leg:
+            continue  # bridge: against unknown id → let the endpoint 404
+        owner = _sub_account(leg.subscriber_id)
+        if owner and owner != aid:
+            return (f"Forbidden: leg {leg_id} belongs to another account")
+
+    # codec — webclient session; its call determines the account
+    for session_id in re.findall(r'codec:([^\s{|>]+)', dsl):
+        sess = wc_mod.get_webclient_session(session_id)
+        if not sess:
+            continue
+        call = call_state.get_call(sess.get("call_id", ""))
+        if call and call.account_id != aid:
+            return (f"Forbidden: codec session {session_id} belongs "
+                    f"to another account")
+
+    # tee sidechain attach — first element tee:NAME that already exists
+    # in someone else's executor ⇒ reject.
+    for m in re.finditer(r'(?:^|\|\s*|->\s*)tee:([^\s{|>]+)', dsl):
+        tee_id = m.group(1)
+        for call in call_state.list_calls():
+            ex = getattr(call, "pipe_executor", None)
+            if ex and tee_id in getattr(ex, "_tees", {}):
+                if call.account_id != aid:
+                    return (f"Forbidden: tee {tee_id} belongs to "
+                            f"another account")
+                break  # owning tee found in caller's account — fine
     return None
 
 

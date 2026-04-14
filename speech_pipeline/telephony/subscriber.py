@@ -14,6 +14,11 @@ from urllib.parse import urlparse
 
 _LOGGER = logging.getLogger("telephony.subscriber")
 
+# Events the server actually fires; a subscriber that omits one of
+# these will silently drop the corresponding webhook.  Keep in sync
+# with sip_listener, dispatcher, pipe_executor.
+_EXPECTED_EVENT_KEYS = ("incoming", "call_ended", "device_dial")
+
 STALE_SECONDS = 0   # disabled — subscribers are permanent once registered
 REMOVE_SECONDS = 0  # disabled
 
@@ -87,6 +92,18 @@ def put(subscriber_id: str, account_id: str, data: dict) -> dict:
     _subscribers[subscriber_id] = entry
     _LOGGER.info("Subscriber %s registered (account=%s, dids=%s, sip_domain=%s)",
                  subscriber_id, account_id, entry["inbound_dids"], sip_domain)
+
+    # Drift guard: server fires a known set of events; if the caller
+    # registers without some of them the corresponding webhooks
+    # silently vanish.  Warn loudly so CI / pm2 logs surface it.
+    missing = [k for k in _EXPECTED_EVENT_KEYS if k not in entry["events"]]
+    if missing:
+        _LOGGER.warning(
+            "Subscriber %s registered without expected events %s — "
+            "the server fires those but no callback URL is configured; "
+            "refresh heartbeat.fop or check the events dict.",
+            subscriber_id, missing,
+        )
     return entry
 
 

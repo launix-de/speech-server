@@ -431,9 +431,14 @@ def kill_stage_by_dsl():
     if "->" in stage_id or "|" in stage_id:
         return ("DELETE only accepts a single stage ID, not a pipeline\n", 400)
 
-    # Search all executors for this stage
+    # Search executors for this stage — scoped to the caller's
+    # account (admin sees all).  Without this scope, account B could
+    # kill account A's play/bridge stages by guessing the id.
     from .telephony import call_state
+    aid = _account_id()
     for call in call_state.list_calls():
+        if aid and call.account_id != aid:
+            continue
         ex = getattr(call, "pipe_executor", None)
         if ex and ex.kill_stage(stage_id):
             return ("", 204)

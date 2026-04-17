@@ -176,7 +176,12 @@ class CallPipeExecutor:
                 raise ValueError(f"Leg '{elem_id}' not found")
             # Send 200 OK via sip_stack or pyVoIP
             from . import sip_stack
-            sip_call_id = getattr(leg, '_sip_call_id', '')
+            # Inbound trunk legs store the deferred dialog under
+            # ``sip_call_id``. Older code also looked for
+            # ``_sip_call_id``; support both so answer:LEG actually
+            # reaches ``answer_trunk_leg()`` for real trunk calls.
+            sip_call_id = (getattr(leg, 'sip_call_id', '')
+                           or getattr(leg, '_sip_call_id', ''))
             if sip_call_id:
                 sip_stack.answer_trunk_leg(sip_call_id)
             elif leg.voip_call and hasattr(leg.voip_call, 'answer'):
@@ -366,6 +371,7 @@ class CallPipeExecutor:
             iframe_url = f"{base_url}/phone/{nonce}?{query}"
             _LOGGER.info("WebClient slot for call %s: %s",
                          self.call.call_id, iframe_url)
+            sess["iframe_url"] = iframe_url
 
             # Surface identifiers to the HTTP response so the CRM can
             # store session_id as the participant's sid and embed the
@@ -377,21 +383,10 @@ class CallPipeExecutor:
                 "iframe_url": iframe_url,
             }
 
-            # Fire callback with iframe_url
-            if callback:
-                sub = sub_mod.get(self.call.subscriber_id)
-                if sub:
-                    url = _shared.subscriber_url(sub, callback)
-                    _shared.post_webhook(url, {
-                        "callId": self.call.call_id,
-                        "command": "webclient",
-                        "participantId": session_id,
-                        "result": "ready",
-                        "iframe_url": iframe_url,
-                        "nonce": nonce,
-                        "user": user,
-                        "session_id": session_id,
-                    }, sub["bearer_token"])
+            # Do not fire the CRM callback here. The CRM treats
+            # ``state=webclient`` as "browser actually joined", so an
+            # eager webhook marks the participant answered before the
+            # popup exists or the codec socket is connected.
             return True
 
         return False
@@ -1298,23 +1293,15 @@ class CallPipeExecutor:
             return
 
         def _monitor():
+            ended = False
             while leg.status == "in-progress":
-                ended = False
-                if leg.voip_call and hasattr(leg.voip_call, 'state'):
-                    try:
-                        from pyVoIP.VoIP.VoIP import CallState
-                        if leg.voip_call.state == CallState.ENDED:
-                            ended = True
-                    except Exception:
-                        pass
-                if hasattr(leg, 'sip_call') and leg.sip_call:
-                    if leg.sip_call.state == "ended":
-                        ended = True
-                if session.hungup.is_set():
-                    ended = True
+                ended = leg_mod.remote_end_detected(leg, session)
                 if ended:
                     break
                 time.sleep(0.5)
+            if not ended:
+                _LOGGER.info("Leg %s monitor stopped without remote hangup", leg_id)
+                return
             leg.status = "completed"
             dur = time.time() - leg.answered_at if leg.answered_at else 0
             if hasattr(leg, 'conf_leg') and leg.conf_leg:

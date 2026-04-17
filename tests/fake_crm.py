@@ -22,6 +22,7 @@ Usage
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import threading
@@ -57,6 +58,9 @@ class FakeCrm:
         # Hold jingle URL (empty = no jingle).
         self.hold_jingle: str = ""
         self.wait_jingle: str = ""
+        self.login_tokens: dict[str, str] = {}
+        self.login_user_ids: dict[str, int] = {}
+        self.login_requests: list[dict] = []
 
     # ------------------------------------------------------------------
     # Setup
@@ -109,6 +113,14 @@ class FakeCrm:
                 method=method)
             return _FakeResponse(200, b'{"ok":true}')
 
+        def _fake_requests_get(url, params=None, headers=None, **kwargs):
+            if not url.startswith(self.BASE_URL):
+                return _FakeResponse(404, b'{"error":"not for fake crm"}')
+            token = (headers or {}).get("Authorization", "").removeprefix(
+                "Bearer "
+            )
+            return self._dispatch_get(url, params or {}, token)
+
         monkeypatch.setattr(sh, "post_webhook", _fake_post_webhook)
         import requests as _req
         monkeypatch.setattr(_req, "request", _fake_requests_request)
@@ -116,7 +128,23 @@ class FakeCrm:
                             lambda url, json=None, **kw:
                             _fake_requests_request("POST", url,
                                                    json=json, **kw))
+        monkeypatch.setattr(_req, "get", _fake_requests_get)
         yield
+
+    def _dispatch_get(self, url: str, params: dict[str, Any],
+                      token: str) -> "_FakeResponse":
+        parsed = urllib.parse.urlsplit(url)
+        query = {
+            key: values[0]
+            for key, values in urllib.parse.parse_qs(parsed.query).items()
+        }
+        query.update({k: str(v) for k, v in params.items()})
+
+        if parsed.path.endswith("/Telephone/SpeechServer/login"):
+            return self._on_login(query, token)
+        if parsed.path.endswith("/Telephone/SpeechServer/heartbeat"):
+            return _FakeResponse(200, b'{"ok":true}')
+        return _FakeResponse(404, b'{"error":"unknown fake crm path"}')
 
     def _route(self, url: str, payload: dict, token: str,
                method: str = "POST") -> None:
@@ -510,6 +538,29 @@ class FakeCrm:
         )
         if resp.status_code == 201:
             self.participants[pid]["sid"] = resp.get_json().get("leg_id", "")
+
+    def _on_login(self, query: dict[str, str], token: str) -> "_FakeResponse":
+        self.login_requests.append({
+            "token": token,
+            "query": dict(query),
+        })
+        if token != self.account_token:
+            return _FakeResponse(403, b'{"error":"Forbidden"}')
+
+        username = query.get("username", "")
+        realm = query.get("realm", "")
+        sip_user = query.get("sip_user", "")
+        login_token = self.login_tokens.get(username)
+        if not username or not realm or not sip_user or not login_token:
+            return _FakeResponse(404, b'{"error":"User not found"}')
+
+        payload = {
+            "ha1": hashlib.md5(
+                f"{sip_user}:{realm}:{login_token}".encode("utf-8")
+            ).hexdigest(),
+            "user_id": self.login_user_ids.get(username, 0),
+        }
+        return _FakeResponse(200, json.dumps(payload).encode("utf-8"))
 
     # ------------------------------------------------------------------
     # Hold / Unhold — mirrors calls.fop::{hold,unhold}ExternalLegs

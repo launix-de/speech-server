@@ -1005,7 +1005,15 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
     # Check nonce validity
     if nonce not in _nonces:
         _LOGGER.warning("REGISTER from %s: unknown nonce", addr)
-        resp = _build_response(403, "Forbidden", msg, to_tag=_gen_tag())
+        fresh_nonce = _rand_hex(32)
+        _nonces[fresh_nonce] = time.time()
+        challenge = (
+            f'Digest realm="{realm}", '
+            f'nonce="{fresh_nonce}", algorithm=MD5'
+        )
+        extra = f"WWW-Authenticate: {challenge}\r\n"
+        resp = _build_response(401, "Unauthorized", msg,
+                               extra_headers=extra, to_tag=_gen_tag())
         _send(resp, addr)
         return
 

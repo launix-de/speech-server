@@ -119,3 +119,39 @@ class TestHA1Cache:
         b = sip_stack._crm_login(sub, "bob",   "r", "bob@x")
         assert a["ha1"] != b["ha1"]
         assert len(calls) == 2
+
+
+
+class TestRegisterNonceRecovery:
+
+    def test_unknown_nonce_rechallenges_with_fresh_401(self, monkeypatch):
+        sip_stack._nonces.clear()
+        sent = {}
+
+        def fake_send(data, addr):
+            sent["data"] = data
+            sent["addr"] = addr
+
+        monkeypatch.setattr(sip_stack, "_send", fake_send)
+        monkeypatch.setattr(sip_stack, "_gen_tag", lambda: "tag-1")
+        monkeypatch.setattr(sip_stack, "_rand_hex", lambda n: "fresh-nonce")
+
+        msg = sip_stack._parse_sip(
+            b"REGISTER sip:srv.launix.de SIP/2.0\r\n"
+            b"Via: SIP/2.0/UDP 155.133.219.85:5060;branch=z9hG4bK-1\r\n"
+            b"From: <sip:alice@crm.launix.de>;tag=from-1\r\n"
+            b"To: <sip:alice@crm.launix.de>\r\n"
+            b"Call-ID: cid-1\r\n"
+            b"CSeq: 1 REGISTER\r\n"
+            b"Contact: <sip:alice@155.133.219.85:5060>\r\n"
+            b'Authorization: Digest username="alice@crm.launix.de", realm="crm.launix.de", nonce="stale-nonce", uri="sip:srv.launix.de", response="deadbeef"\r\n'
+            b"Content-Length: 0\r\n"
+            b"\r\n"
+        )
+
+        sip_stack._handle_inbound_register(msg, ("155.133.219.85", 5060))
+
+        assert sent["addr"] == ("155.133.219.85", 5060)
+        assert "SIP/2.0 401 Unauthorized" in sent["data"]
+        assert 'WWW-Authenticate: Digest realm="crm.launix.de", nonce="fresh-nonce", algorithm=MD5' in sent["data"]
+        assert sip_stack._nonces["fresh-nonce"] > 0

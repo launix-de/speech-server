@@ -174,7 +174,10 @@ def _handle_incoming(pbx_id: str, voip_call) -> None:
 
     _LOGGER.info("Incoming SIP on %s: %s → %s", pbx_id, caller, callee)
 
-    # Find subscriber by DID, fallback to any subscriber on this PBX
+    # Find subscriber by DID, fallback to the single wildcard subscriber for
+    # this PBX.  This is intentional multi-CRM routing: exactly one CRM owns
+    # an inbound dialog, and the speech server must never fan out the same
+    # incoming call to multiple CRMs.
     sub = sub_mod.find_by_did(callee)
     if not sub:
         sub = sub_mod.find_by_pbx(pbx_id)
@@ -198,9 +201,12 @@ def _handle_incoming(pbx_id: str, voip_call) -> None:
             pass
         return
 
-    # Do NOT answer yet — CRM controls when to answer via POST /api/legs/{id}/answer.
-    # For pyVoIP: we must answer to get RTP flowing (pyVoIP limitation).
-    # For sip_stack trunk: 183 Session Progress already sent, RTP flows as Early Media.
+    # Design intent: the CRM controls when a leg is answered by issuing the
+    # explicit ``answer:LEG`` action over the pipeline API.
+    #
+    # Legacy pyVoIP limitation: this fallback path cannot provide Early Media,
+    # so it answers immediately to get RTP flowing at all.  The production
+    # built-in SIP stack avoids that compromise by using 183 + deferred 200 OK.
     try:
         voip_call.answer()  # TODO: replace with 183 when pyVoIP supports it
     except Exception as e:
@@ -217,7 +223,8 @@ def _handle_incoming(pbx_id: str, voip_call) -> None:
     )
     leg.status = "ringing"
 
-    # Fire incoming event asynchronously — CRM handles everything via REST API.
+    # Fire incoming event asynchronously.  The CRM owns the actual call graph
+    # and will assemble it via REST/DSL callbacks back into this server.
     # Must be async because the CRM makes API calls back to us during handling.
     threading.Thread(
         target=dispatcher.fire_event,

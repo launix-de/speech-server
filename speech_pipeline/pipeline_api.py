@@ -450,12 +450,14 @@ def download_save(filename: str):
 @api.route("/pipelines", methods=["DELETE"])
 @_require_auth
 def kill_stage_by_dsl():
-    """Kill a stage by ID.
+    """Delete a single live DSL item.
 
-    Body: ``{"dsl": "play:hold_music"}`` or ``{"dsl": "bridge:leg-abc"}``
+    Body: ``{"dsl": "play:hold_music"}``, ``{"dsl": "bridge:leg-abc"}``
+    or ``{"dsl": "call:call-abc"}``.
 
-    Searches all active call executors for a stage matching the ID
-    and kills it. Returns 204 on success, 404 if not found.
+    ``call:...`` / ``conference:...`` performs full call teardown.
+    Stage IDs such as ``play:...`` or ``bridge:...`` kill only that
+    live stage. Returns 204 on success, 404 if not found.
     """
     # Accept the stage ID from EITHER the JSON body or a ``?dsl=`` query
     # parameter.  Some HTTP clients (PHP curl with CURLOPT_CUSTOMREQUEST
@@ -466,9 +468,23 @@ def kill_stage_by_dsl():
     if not stage_id:
         return ("Missing 'dsl' (stage ID) in request body or ?dsl= query\n", 400)
 
-    # DELETE accepts only a single stage ID, not a pipeline expression
+    # DELETE accepts only a single live DSL item, not a pipeline expression
     if "->" in stage_id or "|" in stage_id:
-        return ("DELETE only accepts a single stage ID, not a pipeline\n", 400)
+        return ("DELETE only accepts a single DSL item, not a pipeline\n", 400)
+
+    if stage_id.startswith(("call:", "conference:")):
+        from .dsl_parser import parse_dsl
+        try:
+            elements = parse_dsl(stage_id)
+        except ValueError as e:
+            return (f"DSL parse error: {e}\n", 400)
+        if len(elements) != 1:
+            return ("DELETE accepts only a single DSL item\n", 400)
+        typ, elem_id, _ = elements[0]
+        if typ not in ("call", "conference") or not elem_id:
+            return ("DELETE call requires call:<id> or conference:<id>\n", 400)
+        from .telephony.api import terminate_call
+        return terminate_call(elem_id, _account_id())
 
     # Search executors for this stage — scoped to the caller's
     # account (admin sees all).  Without this scope, account B could

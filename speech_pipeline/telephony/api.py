@@ -245,20 +245,22 @@ def list_calls():
 # use GET /api/pipelines?dsl=call:ID instead (returns participants too).
 
 
-@api.route("/calls/<call_id>", methods=["DELETE"])
-@auth.require_account
-def delete_call(call_id: str):
+def terminate_call(call_id: str, account_id: Optional[str]) -> tuple[str, int]:
+    """End a call after enforcing account ownership.
+
+    Shared by the legacy ``DELETE /api/calls/<id>`` route and the
+    canonical DSL delete ``DELETE /api/pipelines?dsl=call:<id>``.
+    """
     call = call_state.get_call(call_id)
     if not call:
         return ("Call not found\n", 404)
-    aid = _account_id()
-    if aid and call.account_id != aid:
+    if account_id and call.account_id != account_id:
         return ("Forbidden\n", 403)
 
     # Hangup ALL legs for this call (BYE/CANCEL, Twilio semantics)
     from . import leg as leg_mod
     all_legs = list(leg_mod.list_legs())
-    _LOGGER.info("delete_call %s: found %d legs, checking call_id match",
+    _LOGGER.info("terminate_call %s: found %d legs, checking call_id match",
                  call_id, len(all_legs))
     for leg in all_legs:
         _LOGGER.info("  leg %s: call_id=%s status=%s has_sip_call=%s",
@@ -272,6 +274,12 @@ def delete_call(call_id: str):
     call.status = "completed"
     call_state.delete_call(call_id)
     return ("", 204)
+
+
+@api.route("/calls/<call_id>", methods=["DELETE"])
+@auth.require_account
+def delete_call(call_id: str):
+    return terminate_call(call_id, _account_id())
 
 
 # ---------------------------------------------------------------------------

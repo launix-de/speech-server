@@ -160,7 +160,11 @@ def create_app(args: argparse.Namespace) -> Flask:
         app.register_blueprint(webclient_bp)
         _LOGGER.info("WebClient phone UI enabled")
 
-        # Startup callback: notify provisioning service that we are ready
+        # Startup callback: notify the external provisioner that the speech
+        # server is ready.  In production this is LDS, but from the server's
+        # perspective it is intentionally generic: the callback target is the
+        # admin-side orchestrator that will provision PBXs/accounts via the
+        # API.  The speech server itself does not know LDS-specific logic.
         startup_cb = getattr(args, 'startup_callback', None) or ''
         if startup_cb:
             startup_cb_token = getattr(args, 'startup_callback_token', None) or admin_token

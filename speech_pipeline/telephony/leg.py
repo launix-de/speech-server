@@ -146,6 +146,28 @@ def delete_leg(leg_id: str) -> bool:
     return False
 
 
+def remote_end_detected(leg: Leg, session) -> bool:
+    """Return True only when the remote SIP side actually ended the leg.
+
+    Local teardown paths such as ``DELETE /api/calls/<id>`` or
+    ``DELETE bridge:LEG`` also transition the leg to ``completed``, but
+    must not synthesize a second ``completed`` webhook back to the CRM.
+    """
+    if leg.voip_call and hasattr(leg.voip_call, "state"):
+        try:
+            from pyVoIP.VoIP.VoIP import CallState
+            if leg.voip_call.state == CallState.ENDED:
+                return True
+        except Exception:
+            pass
+    if hasattr(leg, "sip_call") and leg.sip_call:
+        if leg.sip_call.state == "ended":
+            return True
+    if session.hungup.is_set():
+        return True
+    return False
+
+
 def list_legs(subscriber_id: Optional[str] = None) -> List[Leg]:
     if subscriber_id:
         return [l for l in _legs.values() if l.subscriber_id == subscriber_id]
@@ -181,25 +203,17 @@ def originate_only(leg: Leg, pbx_entry: dict) -> None:
     # This monitor runs for legs that are NOT wired via pipe_executor
     # (pipe_executor has its own monitor in _start_sip_monitors).
     def _monitor():
+        ended = False
         while leg.status == "answered" or leg.status == "in-progress":
-            ended = False
-            if leg.voip_call and hasattr(leg.voip_call, 'state'):
-                try:
-                    from pyVoIP.VoIP.VoIP import CallState
-                    if leg.voip_call.state == CallState.ENDED:
-                        ended = True
-                except Exception:
-                    pass
-            if hasattr(leg, 'sip_call') and leg.sip_call:
-                if leg.sip_call.state == "ended":
-                    ended = True
-            if session.hungup.is_set():
-                ended = True
+            ended = remote_end_detected(leg, session)
             if ended:
                 break
             time.sleep(0.5)
 
-        # CONTRACT: always fire "completed" — _fire_callback deduplicates
+        if not ended:
+            _LOGGER.info("Leg %s monitor stopped without remote hangup", leg.leg_id)
+            return
+
         leg.status = "completed"
         duration = time.time() - leg.answered_at if leg.answered_at else 0
         fire_callback(leg, "completed", duration=duration)

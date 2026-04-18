@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import urllib.parse
 from pathlib import Path
 
@@ -79,6 +80,9 @@ def _route_exists(app, verb: str, path: str) -> bool:
 def app():
     """Build the full Flask app (not just blueprints) for route checks."""
     import argparse
+    root = str(Path(__file__).resolve().parents[1])
+    if root not in sys.path:
+        sys.path.insert(0, root)
     import piper_multi_server as pms
     args = argparse.Namespace(
         host="127.0.0.1", port=0, model=None, voices_path="voices-piper",
@@ -120,5 +124,15 @@ class TestCrmCallsHitRealRoutes:
         bad = [c for c in calls if "/commands" in c[1]]
         assert not bad, (
             "CRM still calls removed /commands endpoint:\n  "
+            + "\n  ".join(f"{origin}: {v} {p}" for v, p, origin in bad)
+        )
+
+    def test_no_legacy_call_delete_in_crm(self):
+        """Full call teardown must use DSL, not ``DELETE /api/calls/<id>``."""
+        calls = _collect_crm_calls()
+        bad = [c for c in calls if c[0] == "DELETE" and c[1] == "/api/calls/"]
+        assert not bad, (
+            "CRM still calls legacy DELETE /api/calls/<id> instead of "
+            "DELETE /api/pipelines?dsl=call:<id>:\n  "
             + "\n  ".join(f"{origin}: {v} {p}" for v, p, origin in bad)
         )

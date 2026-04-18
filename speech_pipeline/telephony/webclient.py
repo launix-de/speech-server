@@ -209,6 +209,33 @@ def _send_callback(subscriber_id: str, callback_path: str, payload: dict) -> Non
     _shared.post_webhook(url, payload, sub["bearer_token"])
 
 
+def _notify_participant_answered(session_id: str, sess: dict) -> None:
+    """Fire the CRM-style webclient callback once the browser actually joins."""
+    call_id = sess.get("call_id") or ""
+    call = call_state.get_call(call_id)
+    if not call:
+        return
+    participant = call.get_participant(session_id) or {}
+    callback_path = participant.get("callback") or ""
+    if not callback_path:
+        return
+    _send_callback(
+        call.subscriber_id,
+        callback_path,
+        {
+            "callId": call.call_id,
+            "command": "webclient",
+            "participantId": session_id,
+            "result": "answered",
+            "iframe_url": sess.get("iframe_url", ""),
+            "nonce": sess.get("nonce", ""),
+            "user": sess.get("user", ""),
+            "session_id": session_id,
+            "leg_id": session_id,
+        },
+    )
+
+
 def _flip_to_leg_completed(path: str) -> str:
     """Rewrite ``?state=webclient&...`` to ``?state=leg&event=completed&...``
     so the CRM's standard leg-completed handler runs for the webclient
@@ -639,7 +666,17 @@ def phone_event(nonce: str):
     if event not in ("answered", "completed"):
         return ("Unsupported event\n", 400)
 
+    if event == "answered":
+        with _sessions_lock:
+            if sess.get("answered_callback_sent"):
+                return jsonify({"ok": True})
+            sess["answered_callback_sent"] = True
+
     emit_leg_event(session_id, event)
+
+    if (event == "answered"
+            and not (sess.get("leg_callbacks") or {}).get("answered")):
+        _notify_participant_answered(session_id, sess)
 
     # ``completed`` means the browser pressed the red handset.  Tear
     # down the webclient session immediately — otherwise the

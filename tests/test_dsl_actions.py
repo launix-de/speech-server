@@ -20,6 +20,17 @@ from speech_pipeline.telephony import call_state, leg as leg_mod
 class TestKillViaDelete:
     """DELETE /api/pipelines {"dsl": "STAGE_ID"} — stops a running stage."""
 
+    def test_delete_call_by_dsl(self, client, account):
+        """DELETE /api/pipelines?dsl=call:CALL_ID tears down the call."""
+        call_id = create_call(client, account)
+        resp = client.delete(f"/api/pipelines?dsl=call:{call_id}",
+                             headers=account)
+        assert resp.status_code == 204
+
+        resp = client.get(f"/api/pipelines?dsl=call:{call_id}",
+                          headers=account)
+        assert resp.status_code == 404
+
     def test_kill_existing_stage(self, client, account):
         """DELETE removes a play stage."""
         call_id = create_call(client, account)

@@ -56,12 +56,12 @@ def crm(client, admin):
 class TestHoldWebhookContract:
     """Hold/unhold via the real Pipe-API + verify webhook lands in CRM."""
 
-    def test_unhold_rebuilt_bridge_still_fires_completed_webhook(
+    def test_unhold_rebuilt_bridge_still_fires_call_level_completed_webhook(
             self, client, account, crm, monkeypatch):
         """Rebuilt pipe after unhold must carry the ``completed`` cb so
-        the CRM learns the leg hung up.  Earlier regression: the cb got
-        dropped by ``buildAndMergePipes`` so the phone BYE silently
-        stranded the participant in 'answered' forever."""
+        the CRM learns the *external leg* hung up. Earlier regression:
+        the cb got dropped by ``buildAndMergePipes`` so the phone BYE
+        silently stranded the main call forever."""
         # 1. Bootstrap: inbound call via FakeCrm state=incoming.
         leg, phone, server_rtp = _make_rtp_leg(codec=PCMU, number="+49170")
 
@@ -95,9 +95,9 @@ class TestHoldWebhookContract:
             crm.hold_external_legs(call_db_id, pid, leg.leg_id)
             time.sleep(0.3)
 
-            # 3. Unhold flow (mirrors unholdExternalLegs).  The rebuilt
-            #    bridge pipe MUST carry &participant=pid in the
-            #    completed-callback URL.
+            # 3. Unhold flow (mirrors unholdExternalLegs). The rebuilt
+            #    external-leg bridge must still carry a call-level
+            #    completed callback.
             crm.unhold_external_legs(call_db_id, pid, leg.leg_id)
             time.sleep(0.3)
 
@@ -124,10 +124,9 @@ class TestHoldWebhookContract:
             assert int(w["query"].get("call", 0)) == call_db_id, (
                 f"completed webhook carries wrong call id: {w['query']}"
             )
-            assert int(w["query"].get("participant", 0)) == pid, (
-                f"completed webhook carries wrong participant id "
-                f"(expected {pid}): {w['query']} — unhold lost the id "
-                f"when it rebuilt the bridge pipe"
+            assert "participant" not in w["query"], (
+                f"external-leg completed webhook unexpectedly carries a "
+                f"participant id: {w['query']}"
             )
 
         _cleanup_leg(leg, phone)

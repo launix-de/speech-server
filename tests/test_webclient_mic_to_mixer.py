@@ -21,6 +21,7 @@ import argparse
 import json
 import socket
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -59,6 +60,9 @@ def _rms_f32(samples) -> float:
 
 @pytest.fixture(scope="module")
 def live_server():
+    root = str(Path(__file__).resolve().parents[1])
+    if root not in sys.path:
+        sys.path.insert(0, root)
     import piper_multi_server as pms
 
     port = _free_port()

@@ -107,8 +107,19 @@ class FakeCrm:
         def _fake_post_webhook(url, payload, bearer_token, **kw):
             self._route(url, payload, bearer_token, method="POST")
 
-        def _fake_requests_request(method, url, json=None, **kwargs):
-            self._route(url, json or {}, kwargs.get("headers", {}).get(
+        def _fake_requests_request(method, url, json=None, data=None, **kwargs):
+            payload = json
+            if payload is None and data is not None:
+                if isinstance(data, bytes):
+                    data = data.decode("utf-8", errors="replace")
+                if isinstance(data, str):
+                    try:
+                        payload = __import__("json").loads(data)
+                    except Exception:
+                        payload = {}
+                else:
+                    payload = data
+            self._route(url, payload or {}, kwargs.get("headers", {}).get(
                 "Authorization", "").removeprefix("Bearer "),
                 method=method)
             return _FakeResponse(200, b'{"ok":true}')
@@ -124,10 +135,12 @@ class FakeCrm:
         monkeypatch.setattr(sh, "post_webhook", _fake_post_webhook)
         import requests as _req
         monkeypatch.setattr(_req, "request", _fake_requests_request)
-        monkeypatch.setattr(_req, "post",
-                            lambda url, json=None, **kw:
-                            _fake_requests_request("POST", url,
-                                                   json=json, **kw))
+        monkeypatch.setattr(
+            _req,
+            "post",
+            lambda url, json=None, data=None, **kw:
+            _fake_requests_request("POST", url, json=json, data=data, **kw),
+        )
         monkeypatch.setattr(_req, "get", _fake_requests_get)
         yield
 
@@ -263,6 +276,49 @@ class FakeCrm:
         if pid and sess:
             self.participants.setdefault(pid, {})["sid"] = sess
             self.participants[pid]["number"] = "webclient"
+
+    def _on_sttNote(self, qs, body):
+        """Mirror transcript.fop::sttNoteAction closely enough for tests."""
+        call_db_id = int(qs.get("call", [0])[0])
+        participant_id = int(qs.get("participant", [0])[0])
+        text = ((body or {}).get("text") or "").strip()
+        if not call_db_id or not text:
+            return
+
+        call_entry = self.calls.setdefault(call_db_id, {})
+        speaker_raw = "Unknown"
+        speaker_display = "Unknown"
+
+        if participant_id:
+            participant = self.participants.get(participant_id, {})
+            if participant.get("answerer_name"):
+                speaker_raw = participant["answerer_name"]
+                speaker_display = participant["answerer_name"]
+            else:
+                speaker_raw = str(
+                    participant.get("number", f"Participant {participant_id}")
+                )
+                speaker_display = speaker_raw
+        else:
+            speaker_raw = str(call_entry.get("caller", "External"))
+            speaker_display = speaker_raw
+
+        speaker_raw = urllib.parse.unquote(str(speaker_raw)).strip()
+        speaker_display = urllib.parse.unquote(str(speaker_display)).strip()
+        speaker_display = re.sub(r"^sip:", "", speaker_display, flags=re.I)
+        speaker_display = speaker_display.split("/", 1)[0]
+        if participant_id == 0:
+            speaker_display = speaker_display.split("@", 1)[0]
+        if not speaker_display:
+            speaker_display = "Unknown"
+
+        line = (
+            '<div class="call-transcript-line"><strong '
+            'style="color: #000000; font-weight: 700;">'
+            f"{speaker_display}:</strong> <span>{text}</span></div>"
+        )
+        existing = call_entry.get("transcript", "")
+        call_entry["transcript"] = existing + ("\n" if existing else "") + line
 
     def _on_ended(self, qs, body):
         sid = body.get("callId", "")
@@ -434,8 +490,10 @@ class FakeCrm:
             call["status"] = "completed"
             call_sid = call.get("sid")
             if call_sid:
-                self.client.delete(f"/api/calls/{call_sid}",
-                                    headers=self.account_headers)
+                self.client.delete(
+                    f"/api/pipelines?dsl=call:{call_sid}",
+                    headers=self.account_headers,
+                )
             return
         # Auto-unhold: last non-hold left while someone else is on hold
         # → revert call status + unhold.  Mirrors
@@ -508,15 +566,6 @@ class FakeCrm:
         if not call or not call.get("sid"):
             return
         call_sid = call["sid"]
-        with self._lock:
-            pid = self._next_pid
-            self._next_pid += 1
-        self.participants[pid] = {
-            "call_db_id": call_db_id,
-            "number": number,
-            "status": "adding",
-            "sid": "",
-        }
         cb_base = f"/Telephone/SpeechServer/public?state=leg&call={call_db_id}"
         cb = {
             "caller_id": "",
@@ -536,8 +585,6 @@ class FakeCrm:
             data=json.dumps({"dsl": dsl}),
             headers=self.account_headers,
         )
-        if resp.status_code == 201:
-            self.participants[pid]["sid"] = resp.get_json().get("leg_id", "")
 
     def _on_login(self, query: dict[str, str], token: str) -> "_FakeResponse":
         self.login_requests.append({
@@ -600,9 +647,9 @@ class FakeCrm:
     def unhold_external_legs(self, call_db_id: int, pid: int,
                              leg_id: str) -> None:
         """CRM unholdExternalLegs: stop hold music, rebuild the bridge
-        — with the ``completed`` callback correctly carrying both the
-        call DB id and the participant id, so later teardowns reach the
-        right CRM row."""
+        for the external leg. The real FOP code rebuilds a call-level
+        ``completed`` callback here because this leg is *not* a CRM
+        participant row."""
         call = self.calls.get(call_db_id)
         if not call or not call.get("sid"):
             return
@@ -612,11 +659,10 @@ class FakeCrm:
         self.client.delete("/api/pipelines",
                             data=json.dumps({"dsl": stage}),
                             headers=self.account_headers)
-        # Rebuild bridge with completed callback — BOTH call + participant
-        # in the URL so webhook recipients don't have to guess.
+        # Rebuild bridge for the external leg — call-level callback only.
         cb_completed = (
-            f"/Telephone/SpeechServer/public?call={call_db_id}"
-            f"&participant={pid}&state=leg&event=completed"
+            f"/Telephone/SpeechServer/public?state=leg&event=completed"
+            f"&call={call_db_id}"
         )
         dsl = (f"sip:{leg_id}{json.dumps({'completed': cb_completed})} "
                f"-> call:{call_sid} -> sip:{leg_id}")

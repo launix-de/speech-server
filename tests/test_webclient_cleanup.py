@@ -262,6 +262,55 @@ class TestPhoneEventCompletedTearsDown:
         finally:
             client.delete(f"/api/calls/{call_id}", headers=account)
 
+    def test_phone_event_answered_fires_callback_once(
+            self, client, account, monkeypatch):
+        from speech_pipeline.telephony import _shared as sh
+        from speech_pipeline.telephony import auth as auth_mod
+        from conftest import create_call
+
+        call_id = create_call(client, account)
+        call = call_state.get_call(call_id)
+        try:
+            nonce_entry = auth_mod.create_nonce(
+                account_id=call.account_id,
+                subscriber_id=call.subscriber_id,
+                user="u1",
+            )
+            nonce = nonce_entry["nonce"]
+            sess = webclient.register_webclient(call, "u1", nonce)
+            sid = sess["session_id"]
+            sess["iframe_url"] = f"https://crm.example.com/phone/{nonce}"
+            call.register_participant(
+                sid,
+                type="webclient",
+                user="u1",
+                nonce=nonce,
+                callback="/Telephone/SpeechServer/public?call=42&participant=9&state=webclient",
+            )
+
+            sent = []
+
+            def _capture(url, payload, token, **kw):
+                sent.append({"url": url, "payload": payload})
+
+            monkeypatch.setattr(sh, "post_webhook", _capture)
+
+            for _ in range(2):
+                resp = client.post(
+                    f"/phone/{nonce}/event",
+                    data=json.dumps({"session": sid, "event": "answered"}),
+                    headers={"Content-Type": "application/json"},
+                )
+                assert resp.status_code == 200
+
+            assert len(sent) == 1, (
+                f"answered callback fired {len(sent)} times: {sent}"
+            )
+            assert sent[0]["payload"]["result"] == "answered"
+            assert sent[0]["payload"]["iframe_url"].endswith(f"/phone/{nonce}")
+        finally:
+            client.delete(f"/api/calls/{call_id}", headers=account)
+
 
 class TestBrowserReconnect:
     """Browsers commonly do a short disconnect-reconnect on page load

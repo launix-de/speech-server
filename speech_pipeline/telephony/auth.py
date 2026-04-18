@@ -111,7 +111,16 @@ def put_account(account_id: str, data: dict) -> dict:
     _accounts[account_id] = acct
     _LOGGER.info("Account registered: %s (pbx=%s)", account_id, acct["pbx"])
 
-    # Ping CRM to register as subscriber immediately
+    # Intentional boot handshake: once an account is provisioned the speech
+    # server asks that CRM to deploy its webhook/subscriber configuration back
+    # to us.  The startup order is:
+    #   1. startup_callback notifies the admin-side provisioner (LDS in prod)
+    #   2. the provisioner PUTs PBX + account state into the speech server
+    #   3. account provisioning triggers this CRM heartbeat
+    #   4. the CRM answers by PUT /api/subscribe and by exposing loginAction
+    #
+    # This side effect is therefore deliberate orchestration, not accidental
+    # coupling hidden in the API handler.
     base_url = acct.get("base_url")
     if base_url:
         import threading

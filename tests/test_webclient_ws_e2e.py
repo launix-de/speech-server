@@ -19,6 +19,7 @@ import argparse
 import json
 import socket
 import struct
+import sys
 import threading
 import time
 
@@ -36,6 +37,9 @@ def _free_port() -> int:
 @pytest.fixture(scope="module")
 def live_server():
     """Start piper_multi_server in a background thread on a free port."""
+    root = str(__import__("pathlib").Path(__file__).resolve().parents[1])
+    if root not in sys.path:
+        sys.path.insert(0, root)
     import piper_multi_server as pms
 
     port = _free_port()

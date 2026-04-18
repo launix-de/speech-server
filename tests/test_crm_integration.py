@@ -166,7 +166,9 @@ class TestCrmFindExternalLegs:
 class TestCrmWebclientJoin:
     """``joinWebclientAction`` posts
     ``POST /api/pipelines {dsl: "webclient:USER{callback,base_url,call_id}"}``.
-    The call_id param binds the executor so the action can run."""
+    The call_id param binds the executor so the action can run, but the
+    CRM callback itself must wait for the browser's real ``answered``
+    event instead of firing during slot creation."""
 
     def test_webclient_with_call_id_creates_session(self, client, account):
         """The DSL action must resolve the call context via ``call_id``
@@ -188,12 +190,32 @@ class TestCrmWebclientJoin:
                     headers=account,
                 )
 
-            if resp.status_code == 400 and b"webclient feature" in resp.data:
-                pytest.skip(
-                    "Account lacks webclient feature — CRM integration "
-                    "needs this enabled in production."
+                if resp.status_code == 400 and b"webclient feature" in resp.data:
+                    pytest.skip(
+                        "Account lacks webclient feature — CRM integration "
+                        "needs this enabled in production."
+                    )
+                assert resp.status_code == 201
+                body = resp.get_json()
+                assert body.get("session_id", "").startswith("wc-")
+                assert body.get("nonce", "").startswith("n-")
+                assert body.get("iframe_url", "").startswith(
+                    "https://crm.example.com/phone/"
                 )
-            assert resp.status_code == 201
+
+                # Slot creation alone must NOT tell the CRM the browser
+                # joined yet.
+                assert not mock_post.called
+
+                resp2 = client.post(
+                    f"/phone/{body['nonce']}/event",
+                    data=json.dumps({
+                        "session": body["session_id"],
+                        "event": "answered",
+                    }),
+                    headers={"Content-Type": "application/json"},
+                )
+                assert resp2.status_code == 200
 
             # Participant registered as webclient on the call.
             lookup = client.get(
@@ -202,8 +224,7 @@ class TestCrmWebclientJoin:
             wc_parts = [p for p in lookup["participants"]
                         if p.get("type") == "webclient"]
             assert len(wc_parts) == 1
-            # The callback webhook was fired with the iframe URL the
-            # CRM reads from the DB column.
+            # The callback webhook now fires on real browser join.
             assert mock_post.called
             _args, _kwargs = mock_post.call_args
             payload = _args[1] if len(_args) > 1 else _kwargs.get("payload", {})

@@ -23,6 +23,7 @@ import argparse
 import json
 import socket
 import subprocess
+import sys
 import threading
 import time
 from pathlib import Path
@@ -31,7 +32,7 @@ import pytest
 
 websocket = pytest.importorskip("websocket", reason="websocket-client not installed")
 
-QUEUE_MP3 = Path(__file__).parent.parent / "examples" / "queue.mp3"
+STT_TEST_MP3 = Path(__file__).parent / "fixtures" / "stt-test.mp3"
 
 
 def _free_port() -> int:
@@ -42,7 +43,7 @@ def _free_port() -> int:
 
 def _decode_mp3_to_s16le(sample_rate: int, duration_s: float = 4.0) -> bytes:
     result = subprocess.run(
-        ["ffmpeg", "-i", str(QUEUE_MP3), "-f", "s16le", "-ac", "1",
+        ["ffmpeg", "-i", str(STT_TEST_MP3), "-f", "s16le", "-ac", "1",
          "-ar", str(sample_rate), "-t", str(duration_s), "-"],
         capture_output=True,
     )
@@ -96,6 +97,9 @@ def _transcribe_stream(self):
 
 @pytest.fixture(scope="module")
 def live_server():
+    root = str(Path(__file__).resolve().parents[1])
+    if root not in sys.path:
+        sys.path.insert(0, root)
     import piper_multi_server as pms
 
     port = _free_port()

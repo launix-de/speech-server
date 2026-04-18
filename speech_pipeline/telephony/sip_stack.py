@@ -944,6 +944,15 @@ def _handle_request(msg: dict, addr: Tuple[str, int]) -> None:
 def _resolve_sip_identity(to_uri: str) -> Tuple[str, str, Optional[dict]]:
     """Resolve SIP identity from a To URI.
 
+    Design contract:
+    - SIP clients identify CRM-owned users by encoding the CRM location into
+      the SIP identity.
+    - The speech server uses that identity only to find the owning subscriber
+      and then asks that CRM's loginAction for HA1.
+    - Old/new username mangling exists because many SIP clients reject raw
+      ``@`` or ``/`` in usernames, so both canonical and mangled forms are
+      accepted here on purpose.
+
     Supports two formats:
       New: sip:milan.hradecky@crm.launix.de  (plain user, SIP domain)
       Old: sip:user%40launix.de/crm@srv...   (encoded CRM info in username)
@@ -1227,7 +1236,10 @@ def _handle_inbound_invite(msg: dict, addr: Tuple[str, int]) -> None:
         return
 
     # Otherwise: either route to a registered device, or treat a registered
-    # SIP client dialing an external number as a CRM-orchestrated outbound call.
+    # SIP client dialing an external number as a CRM-orchestrated outbound
+    # call.  The speech server stays "dumb" here: it only allocates the RTP
+    # leg and fires ``device_dial``.  The CRM decides whether a conference is
+    # created, which pipes are attached, and when the leg is answered.
     to_h = _get_header(msg, "to")
     to_uri = _extract_uri(to_h)
     target_user = _extract_user(to_uri)
@@ -1445,12 +1457,29 @@ def _find_source_registration(msg: dict, addr: Tuple[str, int]) -> Tuple[str, Op
     from_h = _get_header(msg, "from")
     from_uri = _extract_uri(from_h)
     from_user = _extract_user(from_uri)
-    regs = _get_registrations(from_user)
-    if regs:
-        for reg in regs:
-            if reg.source_addr == addr:
-                return from_user, reg
-        return from_user, regs[0]
+    from_host = _extract_host(from_uri)
+
+    # Try the full AOR first (user@domain), then the bare username.  The full
+    # AOR is the authoritative identity for CRM-owned SIP users; falling back
+    # to the bare user only preserves older/mangled clients.
+    lookup_keys: List[str] = []
+    if from_user and from_host:
+        lookup_keys.append(f"{from_user}@{from_host}")
+    if from_user:
+        lookup_keys.append(from_user)
+
+    seen_keys: set[str] = set()
+    for lookup in lookup_keys:
+        normalized = _normalize_sip_user(lookup)
+        if not normalized or normalized in seen_keys:
+            continue
+        seen_keys.add(normalized)
+        regs = _get_registrations(lookup)
+        if regs:
+            for reg in regs:
+                if reg.source_addr == addr:
+                    return reg.sip_user, reg
+            return regs[0].sip_user, regs[0]
 
     now = time.time()
     stale: List[Tuple[str, str]] = []
@@ -1497,7 +1526,16 @@ def _handle_registered_client_invite(
     source_reg: _Registration,
     target_user: str,
 ) -> None:
-    """Forward a registered SIP client's external dial attempt to the CRM."""
+    """Forward a registered SIP client's external dial attempt to the CRM.
+
+    This path is intentionally minimal:
+    - allocate provisional RTP/183 so the SIP dialog stays alive
+    - create one inbound leg representing the calling device
+    - fire the CRM's ``device_dial`` webhook
+    - wait for the CRM to assemble the actual call graph via the API
+
+    The speech server does not decide the call topology itself.
+    """
     from . import auth as auth_mod, dispatcher, leg as leg_mod, sip_listener
     from speech_pipeline.RTPSession import RTPSession, RTPCallSession
     from speech_pipeline.rtp_codec import PCMU, codec_for_pt, negotiate_payload_type

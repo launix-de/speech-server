@@ -89,32 +89,14 @@ def _on_tts_done(self, qs, body):
         self.calls[call_db_id]["status"] = "denied"
         call_sid = self.calls[call_db_id].get("sid")
         if call_sid:
-            self.client.delete(f"/api/calls/{call_sid}",
-                                headers=self.account_headers)
-
-
-def _on_sttNote(self, qs, body):
-    """sttNote handler: append transcript line."""
-    call_db_id = int(qs.get("call", [0])[0])
-    pid = int(qs.get("participant", [0])[0])
-    text = (body or {}).get("text", "").strip()
-    if not call_db_id or not text:
-        return
-    speaker = "Unknown"
-    if pid and pid in self.participants:
-        p = self.participants[pid]
-        speaker = (p.get("answerer_name")
-                   or p.get("number", f"Participant {pid}"))
-    line = f"{speaker}: {text}"
-    entry = self.calls.setdefault(call_db_id, {})
-    entry["transcript"] = (entry.get("transcript", "") + "\n" + line).strip()
+            self.client.delete(f"/api/pipelines?dsl=call:{call_sid}",
+                               headers=self.account_headers)
 
 
 # Attach these extras to FakeCrm at test time (keep core FakeCrm minimal).
 def _extend_fake_crm(crm):
     import types
     crm._on_tts_done = types.MethodType(_on_tts_done, crm)
-    crm._on_sttNote = types.MethodType(_on_sttNote, crm)
 
 
 class TestTtsDoneEndsCall:
@@ -178,13 +160,13 @@ class TestSttNoteTranscriptAppend:
                     {"text": segment}, crm.account_token, method="POST",
                 )
         transcript = crm.calls[call_db_id].get("transcript", "")
-        assert "Alice: Hallo Welt." in transcript, (
+        assert "Alice:</strong> <span>Hallo Welt." in transcript, (
             f"first segment missing: {transcript!r}"
         )
-        assert "Alice: Wie geht es?" in transcript, (
+        assert "Alice:</strong> <span>Wie geht es?" in transcript, (
             f"second segment missing: {transcript!r}"
         )
-        assert transcript.count("Alice:") == 2
+        assert transcript.count("Alice:</strong>") == 2
 
     def test_participant_zero_uses_caller_fallback(
             self, client, account, crm, monkeypatch):
@@ -201,9 +183,35 @@ class TestSttNoteTranscriptAppend:
                 {"text": "Fremder Text."},
                 crm.account_token, method="POST",
             )
-        assert "Unknown:" in crm.calls[call_db_id]["transcript"], (
-            f"fallback speaker missing when participant=0: "
+        assert "+49171:</strong>" in crm.calls[call_db_id]["transcript"], (
+            f"caller fallback missing when participant=0: "
             f"{crm.calls[call_db_id]['transcript']!r}"
+        )
+
+    def test_participant_sip_uri_is_normalized_like_crm(
+            self, client, account, crm, monkeypatch):
+        _extend_fake_crm(crm)
+        with crm.active(monkeypatch):
+            call_db_id = 15
+            crm.calls[call_db_id] = {
+                "caller": "+49172", "direction": "inbound",
+                "status": "answered", "sid": "",
+            }
+            crm.participants[43] = {
+                "call_db_id": call_db_id,
+                "number": "sip:carli@launix.de/crm",
+                "status": "answered", "sid": "leg-b",
+            }
+            crm._route(
+                crm.BASE_URL + "/Telephone/SpeechServer/sttNote"
+                f"?call={call_db_id}&participant=43",
+                {"text": "Guten Tag."},
+                crm.account_token, method="POST",
+            )
+        transcript = crm.calls[call_db_id]["transcript"]
+        assert "carli@launix.de:</strong>" in transcript, (
+            f"SIP participant speaker normalization diverged from transcript.fop: "
+            f"{transcript!r}"
         )
 
 

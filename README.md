@@ -137,6 +137,29 @@ Source --> Processor --> Processor --> Sink
 
 Format conversion between stages is automatic: `.pipe()` inserts `SampleRateConverter` and `EncodingConverter` stages when the output format of one stage does not match the input format of the next.
 
+### Telephony Boundaries
+
+The telephony server is intentionally a runtime executor, not the business
+orchestration brain.
+
+- The server owns runtime primitives: PBXs, SIP dialogs, calls, legs, webclient
+  sessions, mixers, and the pipeline DSL.
+- The CRM owns business logic: when to create calls, which legs/pipes to attach,
+  when to answer, which webhooks to deploy, and how SIP users map to CRM users.
+- The startup callback is a generic admin-side provisioner hook. In production
+  LDS uses it to provision PBXs/accounts; once an account is provisioned, the
+  server pings that CRM's heartbeat so the CRM can register its webhooks.
+- SIP identities intentionally encode CRM ownership (`user@crm-domain` or the
+  mangled legacy variants) so the server can route auth and device-dial events
+  to exactly one CRM tenant without broadcasting across tenants.
+- Incoming calls are also routed to exactly one CRM: first by explicit DID,
+  otherwise by the wildcard subscriber for that PBX.
+
+This means the speech server may perform SIP-mechanical steps such as `183
+Session Progress`, deferred `200 OK`, RTP allocation, and `BYE`/`CANCEL`, but
+the decision which audio flows where is made by the CRM through the REST/DSL
+API.
+
 ### All Stages
 
 #### Sources (produce PCM, no upstream)

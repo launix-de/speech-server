@@ -32,8 +32,20 @@ class TestCallCRUD:
         resp = client.get(f"/api/pipelines?dsl=call:{call_id}", headers=account)
         assert resp.status_code == 404
 
+    def test_delete_call_via_dsl(self, client, account):
+        call_id = create_call(client, account)
+        resp = client.delete(f"/api/pipelines?dsl=call:{call_id}", headers=account)
+        assert resp.status_code == 204
+        resp = client.get(f"/api/pipelines?dsl=call:{call_id}", headers=account)
+        assert resp.status_code == 404
+
     def test_delete_nonexistent_call(self, client, account):
         resp = client.delete("/api/calls/no-such-call", headers=account)
+        assert resp.status_code == 404
+
+    def test_delete_nonexistent_call_via_dsl(self, client, account):
+        resp = client.delete("/api/pipelines?dsl=call:no-such-call",
+                             headers=account)
         assert resp.status_code == 404
 
     def test_get_nonexistent_call(self, client, account):

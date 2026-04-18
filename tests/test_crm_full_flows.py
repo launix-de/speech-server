@@ -231,17 +231,20 @@ class TestOutboundDeviceDial:
         assert call_db["callee"] == "+4935863"
         assert call_db["sid"].startswith("call-")
 
-        # CRM issued the originate for the external participant.
-        external = [p for p in crm.participants.values()
-                    if p.get("number") == "+4935863"]
-        assert len(external) == 1
-        assert external[0]["sid"].startswith("leg-")
+        # CRM issued the originate for the external callee, but unlike
+        # internal SIP participants the real FOP code does not create a
+        # participant DB row for that PSTN leg. The contract here is
+        # therefore the live server-side leg, not a CRM participant row.
+        external_legs = [l for l in leg_mod.list_legs()
+                         if l.number == "+4935863"]
+        assert len(external_legs) == 1
+        assert external_legs[0].leg_id.startswith("leg-")
 
         # Cleanup
         client.delete(f"/api/calls/{call_db['sid']}", headers=account)
         leg_mod._legs.pop(internal_leg.leg_id, None)
-        for p in external:
-            leg_mod._legs.pop(p["sid"], None)
+        for leg in external_legs:
+            leg_mod._legs.pop(leg.leg_id, None)
 
 
 # ---------------------------------------------------------------------------

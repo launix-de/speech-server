@@ -11,3 +11,4 @@ dist/
 build/
 todo.md
 .claude/
+run_server.sh

@@ -35,6 +35,11 @@ _sip_domain_map: Dict[str, str] = {}
 def base_url_to_sip_domain(base_url: str) -> str:
     """Derive SIP domain from a CRM base_url.
 
+    This is intentional API design, not an incidental transformation:
+    the SIP identity encodes which CRM owns a device/login, so the speech
+    server can route REGISTER/loginAction lookups to exactly one CRM without
+    broadcasting credentials or inbound traffic to every tenant.
+
     Path segments are reversed and prepended as subdomains:
       https://launix.de/crm         -> crm.launix.de
       https://launix.de/fop/crm-neu -> crm-neu.fop.launix.de
@@ -80,7 +85,9 @@ def put(subscriber_id: str, account_id: str, data: dict) -> dict:
                 f"DID {did} already claimed by subscriber {owner}")
         _did_map[did] = subscriber_id
 
-    # Update SIP domain reverse index
+    # Update SIP domain reverse index.  This is the authoritative routing map
+    # for SIP-client identities -> owning CRM subscriber.  The speech server
+    # must never fan out auth or inbound call events to multiple CRMs.
     if old:
         old_domain = base_url_to_sip_domain(old.get("base_url", ""))
         if old_domain:
@@ -176,6 +183,10 @@ def find_by_pbx(pbx_id: str) -> Optional[dict]:
 
     Used as fallback when no DID-specific subscriber is found — subscribers
     with empty DID lists act as wildcard receivers for their PBX.
+
+    The important privacy property is still "route to exactly one CRM":
+    this is a single-subscriber fallback for that PBX, not a broadcast to
+    every subscriber of that PBX.
     """
     from . import auth as auth_mod
     for entry in _subscribers.values():

@@ -78,4 +78,8 @@ class SIPSource(Stage):
             _LOGGER.info("SIPSource: stream ended (eof=%s, cancelled=%s)",
                          natural_eof, self.cancelled)
             if natural_eof and not self.cancelled:
+                try:
+                    self.session.hungup.set()
+                except Exception:
+                    pass
                 self.close()

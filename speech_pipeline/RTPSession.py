@@ -286,3 +286,8 @@ class RTPCallSession:
     @property
     def call(self):
         return self._rtp
+
+    def hangup(self) -> None:
+        """Signal end-of-call for monitor threads and stop RTP."""
+        self.hungup.set()
+        self._rtp.stop()

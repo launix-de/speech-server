@@ -147,9 +147,10 @@ class WhisperTranscriber(Stage):
         model = _get_model(self.model_size)
 
         bps = self.sample_rate * 2  # bytes per second (s16le)
-        min_chunk_bytes = int(bps * 1.0)     # at least 1s before transcribing
-        max_chunk_bytes = int(bps * 15.0)    # safety net: transcribe after 15s
-        silence_trigger = int(bps * 0.3)     # 300ms silence = pause detected
+        chunk_seconds = max(1.0, float(self.chunk_seconds))
+        min_chunk_bytes = int(bps * chunk_seconds)
+        max_chunk_bytes = int(bps * max(chunk_seconds * 5.0, 15.0))
+        silence_trigger = int(bps * min(max(chunk_seconds * 0.25, 0.3), 0.8))
         rms_floor = _SILENCE_RMS_FLOOR        # int16 RMS below this = silence
 
         buf = b""
@@ -157,7 +158,10 @@ class WhisperTranscriber(Stage):
         silence_run = 0
 
         _LOGGER.info(
-            "WhisperTranscriber: pause-based chunking (silence=300ms, min=1s, max=15s, queue=%d)",
+            "WhisperTranscriber: pause-based chunking (silence=%dms, min=%.1fs, max=%.1fs, queue=%d)",
+            silence_trigger * 1000 // bps,
+            min_chunk_bytes / bps,
+            max_chunk_bytes / bps,
             _INGEST_QUEUE_MAXSIZE,
         )
         try:

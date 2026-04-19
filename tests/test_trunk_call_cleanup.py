@@ -18,7 +18,24 @@ import time
 
 from conftest import create_call
 from speech_pipeline.telephony import call_state, leg as leg_mod, sip_stack
-from test_crm_e2e import _cleanup_leg, _make_rtp_leg
+from test_crm_e2e import SUBSCRIBER_ID, _cleanup_leg, _make_rtp_leg
+
+
+ACCOUNT_SCOPE = "test-account"
+
+
+def _scope_leg_for_account(leg) -> str:
+    local_leg_id = leg.leg_id
+    scoped_leg_id = f"{ACCOUNT_SCOPE}:{local_leg_id}"
+    leg_mod._legs.pop(local_leg_id, None)
+    leg.leg_id = scoped_leg_id
+    leg.subscriber_id = SUBSCRIBER_ID
+    leg_mod._legs[scoped_leg_id] = leg
+    return local_leg_id
+
+
+def _scoped_call_id(local_call_id: str) -> str:
+    return f"{ACCOUNT_SCOPE}:{local_call_id}"
 
 
 def _install_trunk_dialog(leg, *, answered: bool = False) -> str:
@@ -54,13 +71,14 @@ class TestInboundTrunkCleanup:
             self, client, account):
         call_id = create_call(client, account)
         leg, phone_rtp, _session = _make_rtp_leg(number="+491747712705")
+        local_leg_id = _scope_leg_for_account(leg)
         sip_call_id = _install_trunk_dialog(leg)
 
         try:
             resp = client.post(
                 "/api/pipelines",
                 data=json.dumps({
-                    "dsl": f"sip:{leg.leg_id} -> call:{call_id} -> sip:{leg.leg_id}"
+                    "dsl": f"sip:{local_leg_id} -> call:{call_id} -> sip:{local_leg_id}"
                 }),
                 headers=account,
             )
@@ -82,20 +100,21 @@ class TestInboundTrunkCleanup:
             self, client, account):
         call_id = create_call(client, account)
         leg, phone_rtp, _session = _make_rtp_leg(number="+491747712705")
+        local_leg_id = _scope_leg_for_account(leg)
         sip_call_id = _install_trunk_dialog(leg)
 
         try:
             resp = client.post(
                 "/api/pipelines",
                 data=json.dumps({
-                    "dsl": f"sip:{leg.leg_id} -> call:{call_id} -> sip:{leg.leg_id}"
+                    "dsl": f"sip:{local_leg_id} -> call:{call_id} -> sip:{local_leg_id}"
                 }),
                 headers=account,
             )
             assert resp.status_code == 201, resp.data
 
-            call = call_state.get_call(call_id)
-            conf_leg = call.pipe_executor._stages[f"bridge:{leg.leg_id}"]._stage
+            call = call_state.get_call(_scoped_call_id(call_id))
+            conf_leg = call.pipe_executor._stages[f"bridge:{local_leg_id}"]._stage
             deadline = time.time() + 1.0
             while ((getattr(conf_leg, "_src_id", None) is None
                     or getattr(conf_leg, "_sink_id", None) is None)
@@ -127,6 +146,7 @@ class TestInboundTrunkCleanup:
             self, client, account, monkeypatch):
         call_id = create_call(client, account)
         leg, phone_rtp, _session = _make_rtp_leg(number="+491747712705")
+        local_leg_id = _scope_leg_for_account(leg)
         sip_call_id = _install_trunk_dialog(leg, answered=False)
         sent_messages: list[str] = []
 
@@ -139,7 +159,7 @@ class TestInboundTrunkCleanup:
             resp = client.post(
                 "/api/pipelines",
                 data=json.dumps({
-                    "dsl": f"sip:{leg.leg_id} -> call:{call_id} -> sip:{leg.leg_id}"
+                    "dsl": f"sip:{local_leg_id} -> call:{call_id} -> sip:{local_leg_id}"
                 }),
                 headers=account,
             )
@@ -147,7 +167,7 @@ class TestInboundTrunkCleanup:
 
             resp = client.post(
                 "/api/pipelines",
-                data=json.dumps({"dsl": f"answer:{leg.leg_id}"}),
+                data=json.dumps({"dsl": f"answer:{local_leg_id}"}),
                 headers=account,
             )
             assert resp.status_code == 201
@@ -167,6 +187,57 @@ class TestInboundTrunkCleanup:
             assert not any(msg.startswith("CANCEL ") for msg in sent_messages), (
                 "answered trunk-leg cleanup must send BYE, not CANCEL"
             )
+        finally:
+            sip_stack._trunk_dialogs.pop(sip_call_id, None)
+            _cleanup_leg(leg, phone_rtp)
+
+    def test_remote_end_of_inbound_rtp_leg_fires_completed_callback(
+            self, client, account, monkeypatch):
+        call_id = create_call(client, account)
+        leg, phone_rtp, session = _make_rtp_leg(number="+491747712705")
+        local_leg_id = _scope_leg_for_account(leg)
+        sip_call_id = _install_trunk_dialog(leg, answered=True)
+        callbacks: list[tuple[str, dict]] = []
+
+        def _capture_callback(_url, payload, _token, **_kw):
+            callbacks.append((_url, dict(payload or {})))
+
+        monkeypatch.setattr("speech_pipeline.telephony._shared.post_webhook", _capture_callback)
+
+        try:
+            leg.callbacks["completed"] = "/cb?call=1&participant=0&state=leg&event=completed"
+
+            resp = client.post(
+                "/api/pipelines",
+                data=json.dumps({
+                    "dsl": f"sip:{local_leg_id} -> call:{call_id} -> sip:{local_leg_id}"
+                }),
+                headers=account,
+            )
+            assert resp.status_code == 201, resp.data
+            deadline = time.time() + 1.0
+            while time.time() < deadline and not getattr(leg, "completion_monitor_started", False):
+                time.sleep(0.02)
+            assert getattr(leg, "completion_monitor_started", False), (
+                "bridged inbound leg did not start its completion monitor"
+            )
+
+            # Simulate the production failure mode: RTP input dries up and the
+            # source reaches natural EOF without an explicit local delete_call.
+            session.rx_queue.put(b"\x00\x00" * 160)
+            session.rx_queue.put(None)
+
+            deadline = time.time() + 3.0
+            while time.time() < deadline and not callbacks:
+                time.sleep(0.05)
+
+            assert callbacks, (
+                "natural EOF of an inbound RTP/trunk leg did not fire the "
+                "completed webhook; CRM never learns that the external caller "
+                "hung up"
+            )
+            assert callbacks[0][1]["event"] == "completed"
+            assert callbacks[0][1]["leg_id"] == local_leg_id
         finally:
             sip_stack._trunk_dialogs.pop(sip_call_id, None)
             _cleanup_leg(leg, phone_rtp)

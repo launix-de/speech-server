@@ -86,6 +86,24 @@ class CallPipeExecutor:
         self._text_input_queue = None        # set by text_input element
         self._call_couplings: Dict[str, Any] = {}  # call_id -> _Coupling
 
+    def _session_leg(self, elem_id: str):
+        leg = self._sessions.get(f"_leg:{elem_id}")
+        if leg is not None:
+            return leg
+        scoped = expand_for_account(elem_id, self._account_id)
+        if scoped != elem_id:
+            return self._sessions.get(f"_leg:{scoped}")
+        return None
+
+    def _session_call(self, elem_id: str):
+        session = self._sessions.get(f"sip:{elem_id}")
+        if session is not None:
+            return session
+        scoped = expand_for_account(elem_id, self._account_id)
+        if scoped != elem_id:
+            return self._sessions.get(f"sip:{scoped}")
+        return None
+
     # -- Public API --------------------------------------------------------
 
     def add_pipes(self, pipes: List[str]) -> List[dict]:
@@ -1034,7 +1052,7 @@ class CallPipeExecutor:
                 continue
 
             kind = "codec" if typ == "codec" else "sip"
-            leg = self._sessions.get(f"_leg:{elem_id}") if kind == "sip" else None
+            leg = self._session_leg(elem_id) if kind == "sip" else None
             has_left = i > 0
             has_right = i < n - 1
             count = ep_counts.get((kind, elem_id), 0)
@@ -1087,7 +1105,7 @@ class CallPipeExecutor:
         if not bridge_leg_id or conf_leg is None:
             return
 
-        leg = self._sessions.get(f"_leg:{bridge_leg_id}")
+        leg = self._session_leg(bridge_leg_id)
         if not leg:
             return
 
@@ -1165,8 +1183,8 @@ class CallPipeExecutor:
         # Start SIP monitors for all sip legs
         for typ, elem_id, params, stage in resolved:
             if typ == "sip_source":
-                leg = self._sessions.get(f"_leg:{elem_id}")
-                session = self._sessions.get(f"sip:{elem_id}")
+                leg = self._session_leg(elem_id)
+                session = self._session_call(elem_id)
                 if leg and session:
                     self._start_sip_monitors(leg, session)
 

@@ -703,6 +703,14 @@ def _recv_loop() -> None:
             if msg["type"] == "response":
                 _handle_response(msg, addr)
             else:
+                _LOGGER.debug(
+                    "SIP dispatch ← %s: method=%s call_id=%s from=%s to=%s",
+                    addr,
+                    msg.get("method", ""),
+                    _get_header(msg, "call-id"),
+                    _extract_uri(_get_header(msg, "from")),
+                    _extract_uri(_get_header(msg, "to")),
+                )
                 _handle_request(msg, addr)
         except Exception:
             _LOGGER.error("Error handling SIP from %s", addr, exc_info=True)
@@ -917,6 +925,13 @@ def _find_trunk_for_call(call_obj: SIPCall) -> Optional[_Trunk]:
 
 def _handle_request(msg: dict, addr: Tuple[str, int]) -> None:
     method = msg["method"]
+    _LOGGER.debug(
+        "SIP request ← %s: method=%s call_id=%s cseq=%s",
+        addr,
+        method,
+        _get_header(msg, "call-id"),
+        _get_header(msg, "cseq"),
+    )
 
     if method == "REGISTER":
         _handle_inbound_register(msg, addr)
@@ -954,9 +969,9 @@ def _resolve_sip_identity(to_uri: str) -> Tuple[str, str, Optional[dict]]:
       accepted here on purpose.
 
     Supports two formats:
-      New: sip:milan.hradecky@crm.launix.de  (plain user, SIP domain)
-      Old: sip:user%40launix.de/crm@srv...   (encoded CRM info in username)
-      Old: sip:user:launix.de~crm@srv...     (: separator, ~ for /)
+      New: sip:alice@crm.example.test        (plain user, SIP domain)
+      Old: sip:user%40crm.example/app@sip... (encoded CRM info in username)
+      Old: sip:user:crm.example~app@sip...   (: separator, ~ for /)
 
     Returns (username, realm, subscriber) or (username, realm, None) on failure.
     """
@@ -968,15 +983,15 @@ def _resolve_sip_identity(to_uri: str) -> Tuple[str, str, Optional[dict]]:
     if "@" in decoded_user or ":" in decoded_user:
         crm_user, base_url = _split_sip_user(decoded_user)
         realm = _realm_from_sip_user(decoded_user)
-        subscriber = _find_subscriber_by_base_url(base_url) if base_url else None
+        subscriber = sub_mod.find_by_base_url(base_url) if base_url else None
         return (crm_user, realm, subscriber)
 
     # New format: plain username, SIP domain identifies subscriber
     sip_domain = _extract_host(to_uri)
     subscriber = sub_mod.find_by_sip_domain(sip_domain)
-    # Fallback: domain is raw base_url path (e.g. launix.de/crm)
+    # Old direct syntax puts the CRM server into the URI host/path directly.
     if not subscriber and "/" in sip_domain:
-        subscriber = _find_subscriber_by_base_url(f"https://{sip_domain}")
+        subscriber = sub_mod.find_by_base_url(sip_domain)
     return (decoded_user, sip_domain, subscriber)
 
 
@@ -1136,20 +1151,51 @@ def _split_sip_user(sip_user: str) -> Tuple[str, str]:
     Input:  user@example.com/app  (or user%40example.com/app or user:example.com~app)
     Output: ("user", "https://example.com/app")
     """
-    username, rest, _ = _split_sip_user_sep(sip_user)
-    if not username or not rest:
+    from urllib.parse import unquote
+
+    raw = sip_user.strip()
+    if not raw:
         return ("", "")
-    base_url = f"https://{rest}"
-    return (username, base_url)
 
+    # Old power-client format:
+    #   user%40example.com/app@proxy.host
+    # "%40" is the logical separator between username and CRM base URL.
+    # Any trailing "@proxy.host" belongs to the registrar, not the CRM URL.
+    if "%40" in raw:
+        username_raw, rest_raw = raw.split("%40", 1)
+        username = unquote(username_raw)
+        rest = unquote(rest_raw).replace("~", "/")
+        if "@" in rest:
+            rest = rest.rsplit("@", 1)[0]
+        if username and rest:
+            return (username, f"https://{rest}")
+        return ("", "")
 
-def _find_subscriber_by_base_url(base_url: str) -> Optional[dict]:
-    """Find a subscriber whose base_url matches (ignoring trailing slash)."""
-    base_url = base_url.rstrip("/")
-    for sub in sub_mod.list_all():
-        if sub.get("base_url", "").rstrip("/") == base_url:
-            return sub
-    return None
+    decoded = unquote(raw)
+
+    # Old restricted-client format:
+    #   user:example.com~app@proxy.host
+    if ":" in decoded:
+        username, rest = decoded.split(":", 1)
+        rest = rest.replace("~", "/")
+        if ("@" in rest) and ("/" in rest):
+            rest = rest.rsplit("@", 1)[0]
+        if username and rest:
+            return (username, f"https://{rest}")
+        return ("", "")
+
+    # Decoded old format, with or without explicit proxy suffix:
+    #   user@example.com/app
+    #   user@example.com/app@proxy.host
+    if "@" in decoded:
+        username, rest = decoded.split("@", 1)
+        if "/" in rest:
+            if "@" in rest:
+                rest = rest.rsplit("@", 1)[0]
+            if username and rest:
+                return (username, f"https://{rest}")
+
+    return ("", "")
 
 
 # Cache successful HA1 lookups so SIP re-REGISTERs (every ~60 s per
@@ -1243,6 +1289,20 @@ def _handle_inbound_invite(msg: dict, addr: Tuple[str, int]) -> None:
     to_h = _get_header(msg, "to")
     to_uri = _extract_uri(to_h)
     target_user = _extract_user(to_uri)
+    from_h = _get_header(msg, "from")
+    from_uri = _extract_uri(from_h)
+    from_user = _extract_user(from_uri)
+    from_host = _extract_host(from_uri)
+    _LOGGER.debug(
+        "INVITE analysis ← %s: from_uri=%s from_user=%s from_host=%s to_uri=%s target_user=%s call_id=%s",
+        addr,
+        from_uri,
+        from_user,
+        from_host,
+        to_uri,
+        target_user,
+        _get_header(msg, "call-id"),
+    )
 
     # Send 100 Trying immediately
     resp = _build_response(100, "Trying", msg)
@@ -1250,16 +1310,34 @@ def _handle_inbound_invite(msg: dict, addr: Tuple[str, int]) -> None:
 
     reg = _get_registration(target_user)
     if reg:
+        _LOGGER.debug(
+            "INVITE branch: direct local routing target_user=%s contact=%s",
+            target_user,
+            reg.contact_uri,
+        )
         _LOGGER.info("Routing INVITE for %s to %s", target_user, reg.contact_uri)
         _proxy_invite(msg, addr, reg)
         return
 
     source_user, source_reg = _find_source_registration(msg, addr)
     if source_reg:
+        _LOGGER.debug(
+            "INVITE branch: registered source source_user=%s reg_contact=%s reg_addr=%s target_user=%s user_id=%s",
+            source_user,
+            source_reg.contact_uri,
+            source_reg.source_addr,
+            target_user,
+            source_reg.user_id,
+        )
         _handle_registered_client_invite(msg, addr, source_user, source_reg, target_user)
         return
 
-    _LOGGER.warning("INVITE for unregistered user %s", target_user)
+    _LOGGER.warning(
+        "INVITE rejected: no local target and no source registration target_user=%s from_uri=%s addr=%s",
+        target_user,
+        from_uri,
+        addr,
+    )
     resp = _build_response(404, "Not Found", msg, to_tag=_gen_tag())
     _send(resp, addr)
 
@@ -1458,6 +1536,13 @@ def _find_source_registration(msg: dict, addr: Tuple[str, int]) -> Tuple[str, Op
     from_uri = _extract_uri(from_h)
     from_user = _extract_user(from_uri)
     from_host = _extract_host(from_uri)
+    _LOGGER.debug(
+        "Source registration lookup ← %s: from_uri=%s from_user=%s from_host=%s",
+        addr,
+        from_uri,
+        from_user,
+        from_host,
+    )
 
     # Try the full AOR first (user@domain), then the bare username.  The full
     # AOR is the authoritative identity for CRM-owned SIP users; falling back
@@ -1467,6 +1552,7 @@ def _find_source_registration(msg: dict, addr: Tuple[str, int]) -> Tuple[str, Op
         lookup_keys.append(f"{from_user}@{from_host}")
     if from_user:
         lookup_keys.append(from_user)
+    _LOGGER.debug("Source registration lookup keys: %s", lookup_keys)
 
     seen_keys: set[str] = set()
     for lookup in lookup_keys:
@@ -1475,10 +1561,28 @@ def _find_source_registration(msg: dict, addr: Tuple[str, int]) -> Tuple[str, Op
             continue
         seen_keys.add(normalized)
         regs = _get_registrations(lookup)
+        _LOGGER.debug(
+            "Source registration candidate: lookup=%s normalized=%s matches=%d",
+            lookup,
+            normalized,
+            len(regs),
+        )
         if regs:
             for reg in regs:
                 if reg.source_addr == addr:
+                    _LOGGER.debug(
+                        "Source registration exact match: sip_user=%s contact=%s source_addr=%s",
+                        reg.sip_user,
+                        reg.contact_uri,
+                        reg.source_addr,
+                    )
                     return reg.sip_user, reg
+            _LOGGER.debug(
+                "Source registration fallback match: sip_user=%s contact=%s source_addr=%s",
+                regs[0].sip_user,
+                regs[0].contact_uri,
+                regs[0].source_addr,
+            )
             return regs[0].sip_user, regs[0]
 
     now = time.time()
@@ -1490,6 +1594,12 @@ def _find_source_registration(msg: dict, addr: Tuple[str, int]) -> Tuple[str, Op
                     stale.append((sip_user, reg_key))
                     continue
                 if candidate.source_addr == addr:
+                    _LOGGER.debug(
+                        "Source registration exact addr scan hit: sip_user=%s contact=%s source_addr=%s",
+                        sip_user,
+                        candidate.contact_uri,
+                        candidate.source_addr,
+                    )
                     for stale_user, stale_key in stale:
                         reg_bucket = _registrations.get(stale_user)
                         if reg_bucket:
@@ -1503,6 +1613,12 @@ def _find_source_registration(msg: dict, addr: Tuple[str, int]) -> Tuple[str, Op
                 host = m.group(2)
                 port = int(m.group(3)) if m.group(3) else 5060
                 if host == addr[0] and port == addr[1]:
+                    _LOGGER.debug(
+                        "Source registration contact scan hit: sip_user=%s contact=%s addr=%s",
+                        sip_user,
+                        candidate.contact_uri,
+                        addr,
+                    )
                     for stale_user, stale_key in stale:
                         reg_bucket = _registrations.get(stale_user)
                         if reg_bucket:
@@ -1516,6 +1632,12 @@ def _find_source_registration(msg: dict, addr: Tuple[str, int]) -> Tuple[str, Op
                 reg_bucket.pop(stale_key, None)
                 if not reg_bucket:
                     _registrations.pop(stale_user, None)
+    _LOGGER.warning(
+        "Source registration lookup failed for addr=%s from_uri=%s available_keys=%s",
+        addr,
+        from_uri,
+        list(_registrations.keys()),
+    )
     return "", None
 
 
@@ -2132,8 +2254,8 @@ def call_registered_user(sip_user: str) -> SIPCall:
 def _normalize_sip_user(sip_user: str) -> str:
     """Normalize old-format SIP user to new user@sip_domain format.
 
-    milan.hradecky@launix.de/crm -> milan.hradecky@crm.launix.de
-    milan.hradecky@crm.launix.de -> milan.hradecky@crm.launix.de (unchanged)
+    alice@crm.example/app -> alice@app.crm.example
+    alice@app.crm.example -> alice@app.crm.example (unchanged)
     """
     from urllib.parse import unquote
     decoded = unquote(sip_user)

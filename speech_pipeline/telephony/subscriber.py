@@ -31,6 +31,31 @@ _did_map: Dict[str, str] = {}
 # sip_domain -> subscriber_id  (reverse index for SIP registration)
 _sip_domain_map: Dict[str, str] = {}
 
+# normalize(base_url) -> subscriber_id
+_base_url_map: Dict[str, str] = {}
+
+
+def normalize_base_url(base_url: str) -> str:
+    """Normalize CRM base URLs for SIP identity lookups.
+
+    The subscriber keeps ``base_url`` exactly as provisioned.  For SIP
+    REGISTER/INVITE routing we index by a normalized ``host/path`` key so
+    these all resolve to the same subscriber:
+
+      https://crm.example.test/app
+      http://crm.example.test/app/
+      crm.example.test/app
+    """
+    raw = (base_url or "").strip()
+    if not raw:
+        return ""
+    parsed = urlparse(raw if "://" in raw else f"https://{raw}")
+    host = (parsed.hostname or "").lower()
+    path = parsed.path.rstrip("/")
+    if not host:
+        return ""
+    return f"{host}{path}"
+
 
 def base_url_to_sip_domain(base_url: str) -> str:
     """Derive SIP domain from a CRM base_url.
@@ -65,6 +90,9 @@ def put(subscriber_id: str, account_id: str, data: dict) -> dict:
     if old:
         for did in old.get("inbound_dids", []):
             _did_map.pop(did, None)
+        old_base = normalize_base_url(old.get("base_url", ""))
+        if old_base:
+            _base_url_map.pop(old_base, None)
 
     entry = {
         "id": subscriber_id,
@@ -95,6 +123,9 @@ def put(subscriber_id: str, account_id: str, data: dict) -> dict:
     sip_domain = base_url_to_sip_domain(entry["base_url"])
     if sip_domain:
         _sip_domain_map[sip_domain] = subscriber_id
+    normalized_base = normalize_base_url(entry["base_url"])
+    if normalized_base:
+        _base_url_map[normalized_base] = subscriber_id
 
     _subscribers[subscriber_id] = entry
     _LOGGER.info("Subscriber %s registered (account=%s, dids=%s, sip_domain=%s)",
@@ -126,6 +157,9 @@ def delete(subscriber_id: str, account_id: Optional[str] = None) -> bool:
     sip_domain = base_url_to_sip_domain(entry.get("base_url", ""))
     if sip_domain:
         _sip_domain_map.pop(sip_domain, None)
+    normalized_base = normalize_base_url(entry.get("base_url", ""))
+    if normalized_base:
+        _base_url_map.pop(normalized_base, None)
     del _subscribers[subscriber_id]
     _LOGGER.info("Subscriber %s removed", subscriber_id)
     return True
@@ -157,6 +191,14 @@ def list_all(account_id: Optional[str] = None) -> List[dict]:
 def find_by_sip_domain(sip_domain: str) -> Optional[dict]:
     """Look up subscriber by SIP domain (derived from base_url)."""
     sid = _sip_domain_map.get(sip_domain)
+    if not sid:
+        return None
+    return _subscribers.get(sid)
+
+
+def find_by_base_url(base_url: str) -> Optional[dict]:
+    """Look up subscriber by normalized CRM base URL."""
+    sid = _base_url_map.get(normalize_base_url(base_url))
     if not sid:
         return None
     return _subscribers.get(sid)

@@ -2,20 +2,21 @@
 
 Pure black-box flow:
 1. CRM creates account + subscriber.
-2. CRM POSTs ``webclient:USER{stt_callback=...}`` → receives session_id.
-3. "Browser" opens ``/ws/socket/<sid>`` and pushes queue.mp3 frames.
-4. Server's STT sidechain transcribes → WebhookSink POSTs to the
-   stt_callback URL.
+2. CRM POSTs ``webclient:USER{...}`` → receives session_id.
+3. CRM explicitly attaches
+   ``codec:<sid> -> tee:<sid>_tap -> call:<call> -> codec:<sid>``
+   and ``tee:<sid>_tap -> stt:de -> webhook:...``.
+4. "Browser" opens ``/ws/socket/<sid>`` and pushes queue.mp3 frames.
+5. Server's STT sidechain transcribes → WebhookSink POSTs to the
+   webhook URL.
 5. Test captures the HTTP POST (real Whisper is swapped for a fake
    transcriber so the test doesn't load a 100MB model) and asserts:
    - The webhook lands at the stt_callback URL.
    - The query carries the correct ``call`` and ``participant`` ids.
    - The body contains transcript JSON.
 
-Rationale: individual ingredients (async build, mic→mixer, url_safety
-bypass, DSL shape) already have green tests — but nobody proves the
-full STT → webhook round trip.  This is the test that would have
-failed earlier and forced us to find the url_safety regression.
+Rationale: this is the production contract. The slot action itself must
+not smuggle audio routing or transcript wiring.
 """
 from __future__ import annotations
 
@@ -217,11 +218,8 @@ class TestWebclientSttEndToEnd:
                 "callback":
                     f"/Telephone/SpeechServer/public?call=77"
                     f"&participant={participant_id}&state=webclient",
-                "base_url": "https://crm.example.com",
+                "base_url": "https://speech.example.com/tts",
                 "call_id": call_id,
-                "stt_callback":
-                    f"/Telephone/SpeechServer/sttNote?call=77"
-                    f"&participant={participant_id}",
             }
             resp = real_requests.post(
                 base + "/api/pipelines",
@@ -233,6 +231,21 @@ class TestWebclientSttEndToEnd:
             assert resp.status_code == 201, resp.text
             body = resp.json()
             session_id = body["session_id"]
+
+            tap = f"{session_id}_tap"
+            for dsl in (
+                f"codec:{session_id} -> tee:{tap} -> call:{call_id} -> codec:{session_id}",
+                "tee:{tap} -> stt:de -> webhook:"
+                "https://crm.example.com/Telephone/SpeechServer/sttNote"
+                f"?call=77&participant={participant_id}",
+            ):
+                dsl = dsl.format(tap=tap)
+                attach = real_requests.post(
+                    base + "/api/pipelines",
+                    data=json.dumps({"dsl": dsl}),
+                    headers=acct,
+                )
+                assert attach.status_code == 201, attach.text
 
             # Connect the "browser" and push real speech.
             ws = websocket.create_connection(
@@ -300,6 +313,195 @@ class TestWebclientSttEndToEnd:
                 assert auth.startswith("Bearer "), (
                     f"sttNote POST missing Bearer auth: {auth!r}"
                 )
+            finally:
+                ws.close()
+        finally:
+            real_requests.delete(base + f"/api/calls/{call_id}", headers=acct)
+
+    def test_browser_answer_callback_drives_explicit_codec_and_stt_attach(
+            self, live_server, patched_stt, monkeypatch):
+        """The browser join callback is the only place where media gets wired.
+
+        Contract:
+        1. ``webclient:USER`` only creates a slot.
+        2. Browser hits ``/phone/<nonce>/event`` with ``event=answered``.
+        3. CRM receives ``state=webclient`` with ``leg_id/session_id``.
+        4. CRM explicitly POSTs ``codec:...`` and ``tee:... -> stt:...``.
+        """
+        import requests as real_requests
+
+        captured_stt: list[dict] = []
+        callback_hits: list[dict] = []
+        capture_lock = threading.Lock()
+
+        from speech_pipeline import WebhookSink as ws_mod
+        orig_post = ws_mod.http_requests.post
+
+        def _capture_stt_post(url, data=None, json=None, headers=None, **kw):
+            if "/sttNote" in (url or ""):
+                with capture_lock:
+                    captured_stt.append({
+                        "url": url,
+                        "data": data,
+                        "json": json,
+                        "headers": headers or {},
+                    })
+
+                class _R:
+                    status_code = 200
+                    text = ""
+                    content = b""
+
+                    def json(self_inner):
+                        return {"ok": True}
+
+                return _R()
+            return orig_post(url, data=data, json=json, headers=headers, **kw)
+
+        monkeypatch.setattr(ws_mod.http_requests, "post", _capture_stt_post)
+
+        from speech_pipeline.telephony import _shared as sh
+
+        def _fake_post_webhook(url, payload, bearer_token, **kw):
+            callback_hits.append({
+                "url": url,
+                "payload": dict(payload or {}),
+                "bearer_token": bearer_token,
+            })
+            if "state=webclient" not in (url or ""):
+                return
+            if (payload or {}).get("result") != "answered":
+                return
+
+            session_id = str((payload or {}).get("leg_id")
+                             or (payload or {}).get("session_id") or "")
+            assert session_id, f"answered callback missing leg/session id: {payload!r}"
+
+            participant_id = 8123
+            tap = f"{session_id}_tap"
+            for dsl in (
+                f"codec:{session_id} -> tee:{tap} -> call:{call_id} -> codec:{session_id}",
+                "tee:{tap} -> stt:de -> webhook:"
+                "https://crm.example.com/Telephone/SpeechServer/sttNote"
+                f"?call=77&participant={participant_id}",
+            ):
+                dsl = dsl.format(tap=tap)
+                attach = real_requests.post(
+                    base + "/api/pipelines",
+                    data=json.dumps({"dsl": dsl}),
+                    headers=acct,
+                )
+                assert attach.status_code == 201, attach.text
+
+        monkeypatch.setattr(sh, "post_webhook", _fake_post_webhook)
+
+        admin = {"Authorization": "Bearer " + live_server["admin_token"],
+                 "Content-Type": "application/json"}
+        base = live_server["base"]
+        real_requests.put(base + "/api/pbx/SttPBX2",
+                          data=json.dumps({"sip_proxy": "", "sip_user": ""}),
+                          headers=admin)
+        real_requests.put(base + "/api/accounts/SttAcc2",
+                          data=json.dumps({"token": "stt-tok2", "pbx": "SttPBX2",
+                                           "features": ["webclient"]}),
+                          headers=admin)
+        acct = {"Authorization": "Bearer stt-tok2",
+                "Content-Type": "application/json"}
+        real_requests.put(base + "/api/subscribe/stt-sub2",
+                          data=json.dumps({
+                              "base_url": "https://crm.example.com/crm",
+                              "bearer_token": "stt-tok2",
+                          }), headers=acct)
+
+        call_id = real_requests.post(
+            base + "/api/calls",
+            data=json.dumps({"subscriber_id": "stt-sub2"}),
+            headers=acct,
+        ).json()["call_id"]
+
+        try:
+            payload = {
+                "callback":
+                    "/Telephone/SpeechServer/public?call=77"
+                    "&participant=8123&state=webclient",
+                "base_url": "https://speech.example.com/tts",
+                "call_id": call_id,
+            }
+            resp = real_requests.post(
+                base + "/api/pipelines",
+                data=json.dumps({
+                    "dsl": 'webclient:stt_user_cb' + json.dumps(payload),
+                }),
+                headers=acct,
+            )
+            assert resp.status_code == 201, resp.text
+            body = resp.json()
+            session_id = body["session_id"]
+
+            # Slot creation alone must not leak any media/STT webhook.
+            time.sleep(0.1)
+            assert callback_hits == [], (
+                "slot creation already fired CRM callback before the browser joined"
+            )
+
+            answered = real_requests.post(
+                base + f"/phone/{body['nonce']}/event",
+                data=json.dumps({
+                    "session": session_id,
+                    "event": "answered",
+                }),
+                headers={"Content-Type": "application/json"},
+            )
+            assert answered.status_code == 200, answered.text
+
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline:
+                if callback_hits:
+                    break
+                time.sleep(0.05)
+            assert callback_hits, "browser answered event never triggered CRM callback"
+            answered_hit = callback_hits[0]
+            assert answered_hit["payload"].get("result") == "answered"
+            assert answered_hit["payload"].get("leg_id") == session_id
+
+            ws = websocket.create_connection(
+                live_server["ws_base"] + "/ws/socket/" + session_id,
+                timeout=5,
+            )
+            try:
+                ws.send(json.dumps({"type": "hello", "profiles": ["low"]}))
+                ws.settimeout(5)
+                hello = json.loads(ws.recv())
+                assert hello["type"] == "hello", hello
+                profile = hello["profile"]
+
+                from speech_pipeline import fourier_codec as fc
+                import numpy as np
+
+                pcm = _decode_mp3_to_s16le(fc.SAMPLE_RATE, duration_s=3.0)
+                samples = (np.frombuffer(pcm, dtype=np.int16)
+                           .astype(np.float32) / 32768.0)
+                n_frames = len(samples) // fc.FRAME_SAMPLES
+                for i in range(n_frames):
+                    frame = samples[i * fc.FRAME_SAMPLES
+                                    : (i + 1) * fc.FRAME_SAMPLES]
+                    ws.send_binary(fc.encode_frame(frame, profile))
+                    time.sleep(0.005)
+
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    with capture_lock:
+                        if captured_stt:
+                            break
+                    time.sleep(0.1)
+
+                assert captured_stt, (
+                    "STT webhook never reached the CRM after callback-driven "
+                    "codec attach"
+                )
+                hit = captured_stt[0]
+                assert "participant=8123" in hit["url"], hit["url"]
+                assert "call=77" in hit["url"], hit["url"]
             finally:
                 ws.close()
         finally:

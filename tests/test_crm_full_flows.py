@@ -22,7 +22,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from conftest import SUBSCRIBER_ID
+from conftest import ACCOUNT_ID, SUBSCRIBER_ID
 
 PBX_ID = "TestPBX"
 from speech_pipeline.telephony import call_state, leg as leg_mod
@@ -83,7 +83,7 @@ class TestInboundFullFlow:
         assert call_db["sid"].startswith("call-")
         assert call_db["direction"] == "inbound"
         # … and the server bridged the leg into that call.
-        call = call_state.get_call(call_db["sid"])
+        call = call_state.get_call(f"{ACCOUNT_ID}:{call_db['sid']}")
         assert call is not None
         sip_parts = [p for p in call.list_participants()
                      if p.get("type") == "sip"]
@@ -161,7 +161,7 @@ class TestInboundFullFlow:
             time.sleep(0.1)
 
             call_sid = next(iter(crm.calls.values()))["sid"]
-            call = call_state.get_call(call_sid)
+            call = call_state.get_call(f"{ACCOUNT_ID}:{call_sid}")
             assert call is not None
             # Verify wait music was started.
             wait_stage = f"play:{call_sid}_wait"
@@ -238,7 +238,7 @@ class TestOutboundDeviceDial:
         external_legs = [l for l in leg_mod.list_legs()
                          if l.number == "+4935863"]
         assert len(external_legs) == 1
-        assert external_legs[0].leg_id.startswith("leg-")
+        assert external_legs[0].leg_id.startswith("test-account:leg-")
 
         # Cleanup
         client.delete(f"/api/calls/{call_db['sid']}", headers=account)

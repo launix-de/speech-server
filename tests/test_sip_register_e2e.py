@@ -20,7 +20,7 @@ from speech_pipeline.telephony import sip_stack, subscriber as sub_mod
 
 def _register_message(sip_user: str, *, auth_header: str | None = None) -> dict:
     lines = [
-        "REGISTER sip:srv.launix.de:5061 SIP/2.0",
+        "REGISTER sip:sip-proxy.example.test:5061 SIP/2.0",
         "Via: SIP/2.0/UDP 155.133.219.85:5060;branch=z9hG4bK-test",
         f"From: <sip:{sip_user}>;tag=from-1",
         f"To: <sip:{sip_user}>",
@@ -48,11 +48,11 @@ def _invite_message(from_sip_user: str, target_number: str) -> dict:
         "",
     ])
     lines = [
-        f"INVITE sip:{target_number}@srv.launix.de SIP/2.0",
+        f"INVITE sip:{target_number}@sip-proxy.example.test SIP/2.0",
         "Via: SIP/2.0/UDP 10.0.0.99:5070;branch=z9hG4bK-invite",
         "Max-Forwards: 70",
         f"From: <sip:{from_sip_user}>;tag=from-2",
-        f"To: <sip:{target_number}@srv.launix.de>",
+        f"To: <sip:{target_number}@sip-proxy.example.test>",
         "Call-ID: invite-test",
         "CSeq: 1 INVITE",
         "Contact: <sip:alice@10.0.0.99:5070>",
@@ -96,6 +96,33 @@ def deployed_crm(client, admin, account):
 
 
 class TestSipRegisterWithFakeCrm:
+
+    def test_resolve_direct_old_style_base_url_syntax_via_normalized_key(
+            self, deployed_crm):
+        direct_uri = f"sip:alice@{deployed_crm.BASE_URL.removeprefix('https://')}"
+        username, realm, subscriber = sip_stack._resolve_sip_identity(
+            direct_uri
+        )
+        assert username == "alice"
+        assert realm == deployed_crm.BASE_URL.removeprefix("https://")
+        assert subscriber is not None
+        assert subscriber["id"] == SUBSCRIBER_ID
+
+    def test_normalize_old_proxy_style_sip_user_to_canonical_aor(
+            self, deployed_crm):
+        base = deployed_crm.BASE_URL.removeprefix("https://")
+        old_encoded = f"alice%40{base}@sip-proxy.example.test"
+        old_mangled = f"alice:{base.replace('/', '~')}@sip-proxy.example.test"
+        canonical = f"alice@{deployed_crm.sip_domain}"
+
+        assert sip_stack._split_sip_user(old_encoded) == (
+            "alice", deployed_crm.BASE_URL
+        )
+        assert sip_stack._split_sip_user(old_mangled) == (
+            "alice", deployed_crm.BASE_URL
+        )
+        assert sip_stack._normalize_sip_user(old_encoded) == canonical
+        assert sip_stack._normalize_sip_user(old_mangled) == canonical
 
     def test_unauthenticated_register_is_rejected(self, deployed_crm, monkeypatch):
         sent: list[tuple[str, tuple[str, int]]] = []
@@ -144,14 +171,14 @@ class TestSipRegisterWithFakeCrm:
                 )
             ).hexdigest()
             digest = sip_stack._compute_digest_response_ha1(
-                ha1, nonce, "REGISTER", "sip:srv.launix.de:5061"
+                ha1, nonce, "REGISTER", "sip:sip-proxy.example.test:5061"
             )
             auth = (
                 "Digest "
                 f'username="{sip_user}", '
                 f'realm="{realm}", '
                 f'nonce="{nonce}", '
-                'uri="sip:srv.launix.de:5061", '
+                'uri="sip:sip-proxy.example.test:5061", '
                 f'response="{digest}", '
                 "algorithm=MD5"
             )
@@ -220,14 +247,14 @@ class TestSipRegisterWithFakeCrm:
                 )
             ).hexdigest()
             digest = sip_stack._compute_digest_response_ha1(
-                ha1, nonce, "REGISTER", "sip:srv.launix.de:5061"
+                ha1, nonce, "REGISTER", "sip:sip-proxy.example.test:5061"
             )
             auth = (
                 "Digest "
                 f'username="{sip_user}", '
                 f'realm="{realm}", '
                 f'nonce="{nonce}", '
-                'uri="sip:srv.launix.de:5061", '
+                'uri="sip:sip-proxy.example.test:5061", '
                 f'response="{digest}", '
                 "algorithm=MD5"
             )
@@ -260,3 +287,72 @@ class TestSipRegisterWithFakeCrm:
         assert login["query"]["username"] == "alice"
         assert login["query"]["realm"] == deployed_crm.sip_domain
         assert login["query"]["sip_user"] == sip_user
+
+    @pytest.mark.parametrize(
+        "registered_user, from_user",
+        [
+            ("alice%40crm.example.test/app", "alice%40crm.example.test/app@sip-proxy.example.test"),
+            ("alice:crm.example.test~app", "alice:crm.example.test~app@sip-proxy.example.test"),
+        ],
+    )
+    def test_registered_client_invite_supports_old_proxy_login_syntax(
+            self, deployed_crm, monkeypatch, registered_user, from_user):
+        import speech_pipeline.RTPSession as rtp_mod
+        from speech_pipeline.telephony import dispatcher, sip_listener
+
+        sent: list[tuple[str, tuple[str, int]]] = []
+        events: list[tuple[dict, str, dict]] = []
+
+        class _DummyRtpSession:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def start(self):
+                pass
+
+            def stop(self):
+                pass
+
+        class _DummyCallSession:
+            def __init__(self, _rtp):
+                self.hungup = threading.Event()
+
+        monkeypatch.setattr(sip_stack, "_send",
+                            lambda data, addr: sent.append((data, addr)))
+        monkeypatch.setattr(sip_stack, "_find_free_port", lambda: 16000)
+        monkeypatch.setattr(rtp_mod, "RTPSession", _DummyRtpSession)
+        monkeypatch.setattr(rtp_mod, "RTPCallSession", _DummyCallSession)
+        monkeypatch.setattr(dispatcher, "fire_subscriber_event",
+                            lambda sub, key, payload: events.append(
+                                (sub, key, payload)
+                            ) or [])
+        monkeypatch.setattr(sip_listener, "_wait_for_bridge",
+                            lambda *args, **kwargs: None)
+
+        reg = sip_stack._Registration(
+            sip_user=registered_user,
+            contact_uri="sip:alice@10.0.0.5:5060",
+            expires=10**12,
+            user_id=42,
+            subscriber_id=SUBSCRIBER_ID,
+            base_url=deployed_crm.BASE_URL,
+            source_addr=("10.0.0.5", 5060),
+        )
+        sip_stack._registrations[registered_user] = {
+            "10.0.0.5:5060|sip:alice@10.0.0.5:5060": reg
+        }
+
+        invite = _invite_message(from_user, "+4930123456")
+        sip_stack._handle_inbound_invite(invite, ("10.0.0.5", 5060))
+
+        assert events, (
+            "old proxy-style SIP identity did not resolve to the registered "
+            "subscriber; source registration lookup regressed"
+        )
+        sub, key, payload = events[0]
+        assert sub["id"] == SUBSCRIBER_ID
+        assert key == "device_dial"
+        assert payload["number"] == "+4930123456"
+        assert payload["sip_user"] == registered_user
+        assert any("SIP/2.0 183 Session Progress" in data for data, _ in sent)
+        assert not any("SIP/2.0 404 Not Found" in data for data, _ in sent)

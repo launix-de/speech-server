@@ -23,12 +23,12 @@ Rules:
 from __future__ import annotations
 
 import logging
-import secrets
 import threading
 import time
 from typing import Dict, List, Optional
 
 import requests as http_requests
+from .id_scope import localize_fields, scoped_id
 
 _LOGGER = logging.getLogger("telephony.leg")
 
@@ -124,7 +124,15 @@ class Leg:
 
 def create_leg(direction: str, number: str, pbx_id: str,
                subscriber_id: str, voip_call=None) -> Leg:
-    leg_id = "leg-" + secrets.token_urlsafe(12)
+    owner = subscriber_id
+    try:
+        from . import subscriber as sub_mod
+        sub = sub_mod.get(subscriber_id)
+        if sub and sub.get("account_id"):
+            owner = sub["account_id"]
+    except Exception:
+        pass
+    leg_id = scoped_id(owner, "leg", entropy_bytes=12)
     leg = Leg(leg_id, direction, number, pbx_id, subscriber_id,
               voip_call=voip_call)
     _legs[leg_id] = leg
@@ -428,6 +436,7 @@ def fire_callback(leg: Leg, event: str, **extra) -> list:
         "caller_id": leg.caller_id,
         **extra,
     }
+    payload = localize_fields(payload, sub.get("account_id"), "leg_id", "call_id")
 
     _LOGGER.info("Leg callback %s → %s", event, url)
     _shared.post_webhook(url, payload, sub["bearer_token"])

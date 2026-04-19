@@ -10,8 +10,13 @@ from conftest import SUBSCRIBER_ID, create_call
 
 class TestCallCRUD:
     def test_create_call(self, client, account):
-        call_id = create_call(client, account)
-        assert call_id.startswith("call-")
+        resp = client.post(
+            "/api/calls",
+            data=json.dumps({"subscriber_id": SUBSCRIBER_ID}),
+            headers=account,
+        )
+        assert resp.status_code == 201
+        assert resp.get_json()["call_id"].startswith("call-")
 
     def test_list_calls(self, client, account):
         create_call(client, account)

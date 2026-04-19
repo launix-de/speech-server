@@ -16,7 +16,7 @@ from typing import Optional
 import requests as http_requests
 
 from . import call_state, subscriber
-
+from .id_scope import localize_fields
 _LOGGER = logging.getLogger("telephony.dispatcher")
 
 
@@ -43,7 +43,16 @@ def fire_subscriber_event(sub: dict, event_key: str, payload: dict) -> list:
 
     from . import _shared
     url = _shared.subscriber_url(sub, path)
-    event_payload = {"event": event_key, **payload}
+    event_payload = localize_fields(
+        {"event": event_key, **payload},
+        sub.get("account_id"),
+        "callId",
+        "call_id",
+        "leg_id",
+        "session_id",
+        "participantId",
+        "nonce",
+    )
 
     def _send() -> None:
         try:
@@ -77,5 +86,3 @@ def fire_event(call: call_state.Call, event_key: str,
         "callId": call.call_id,
         **payload,
     })
-
-

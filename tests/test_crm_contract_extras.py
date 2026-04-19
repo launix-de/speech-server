@@ -127,7 +127,7 @@ class TestTtsDoneEndsCall:
         assert crm.calls[call_db_id]["status"] == "denied", (
             f"tts-done did not flip status: {crm.calls[call_db_id]}"
         )
-        assert call_state.get_call(call_sid) is None, (
+        assert call_state.get_call(f"{ACCOUNT_ID}:{call_sid}") is None, (
             "server-side call was not torn down after CRM saw tts-done"
         )
 

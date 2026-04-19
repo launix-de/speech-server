@@ -77,6 +77,18 @@ class TestSubscriberSIPDomain:
                    headers=account)
         assert find_by_sip_domain("crm.launix.de") is not None
 
+    def test_base_url_lookup_is_normalized(self, client, account):
+        from speech_pipeline.telephony.subscriber import find_by_base_url
+        client.put("/api/subscribe/sub-baseurl",
+                   data=json.dumps({
+                       "base_url": "https://crm.example.com/app/",
+                       "bearer_token": "t",
+                   }),
+                   headers=account)
+        assert find_by_base_url("https://crm.example.com/app") is not None
+        assert find_by_base_url("crm.example.com/app/") is not None
+        assert find_by_base_url("http://crm.example.com/app") is not None
+
 
 class TestSubscriberDIDs:
     def test_did_conflict_rejected(self, client, account):

@@ -112,18 +112,16 @@ def _provision(base, admin, token, pbx, account, subscriber):
     return acct
 
 
-def _create_webclient_slot(base, acct, call_id, user, stt_callback=None):
+def _create_webclient_slot(base, acct, call_id, user):
     """POST the webclient: DSL action exactly like joinWebclientAction.
     Returns session_id by correlating the call + user on a follow-up
     GET of the pipelines endpoint."""
     import requests
     params = {
         "callback": "/cb",
-        "base_url": "https://crm.example.com",
+        "base_url": "https://speech.example.com/tts",
         "call_id": call_id,
     }
-    if stt_callback:
-        params["stt_callback"] = stt_callback
     payload = {"dsl": f'webclient:{user}{json.dumps(params)}'}
     resp = requests.post(f"{base}/api/pipelines",
                          data=json.dumps(payload), headers=acct)
@@ -142,6 +140,14 @@ def _create_webclient_slot(base, acct, call_id, user, stt_callback=None):
                 return p["id"]
         time.sleep(0.05)
     raise AssertionError("webclient participant never appeared in call")
+
+
+def _attach_webclient(base, acct, call_id, session_id):
+    import requests
+    dsl = f"codec:{session_id} -> call:{call_id} -> codec:{session_id}"
+    resp = requests.post(f"{base}/api/pipelines",
+                         data=json.dumps({"dsl": dsl}), headers=acct)
+    assert resp.status_code == 201, resp.text
 
 
 class TestBrowserMicReachesOtherParticipant:
@@ -164,15 +170,10 @@ class TestBrowserMicReachesOtherParticipant:
         ).json()["call_id"]
 
         try:
-            # Prod reality: CRM joinWebclientAction passes stt_callback.
-            # In prod logs the STT pipe is rejected by url_safety
-            # ("targets a private or internal network") — we reproduce
-            # that here by pointing stt_callback at a URL which will
-            # also fail url_safety (host resolves to loopback).
-            sid_a = _create_webclient_slot(
-                base, acct, call_id, "userA",
-                stt_callback="/sttNote?call=1&participant=10")
+            sid_a = _create_webclient_slot(base, acct, call_id, "userA")
             sid_b = _create_webclient_slot(base, acct, call_id, "userB")
+            _attach_webclient(base, acct, call_id, sid_a)
+            _attach_webclient(base, acct, call_id, sid_b)
 
             ws_a = websocket.create_connection(
                 f"{ws_base}/ws/socket/{sid_a}", timeout=5)

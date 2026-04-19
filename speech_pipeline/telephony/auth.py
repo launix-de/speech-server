@@ -14,12 +14,12 @@ from __future__ import annotations
 
 import functools
 import logging
-import secrets
 import threading
 import time
 from typing import Dict, Optional
 
 from flask import g, request
+from .id_scope import scoped_id
 
 _LOGGER = logging.getLogger("telephony.auth")
 
@@ -200,7 +200,7 @@ def check_feature(account_id: str, feature: str) -> bool:
 
 def create_nonce(account_id: str, subscriber_id: str, user: str,
                  ttl: int = 3600) -> dict:
-    nonce_val = "n-" + secrets.token_urlsafe(24)
+    nonce_val = scoped_id(account_id, "n", entropy_bytes=24)
     entry = {
         "nonce": nonce_val,
         "account_id": account_id,

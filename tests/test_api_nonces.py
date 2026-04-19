@@ -98,7 +98,7 @@ class TestNonceTTL:
                            headers=account)
         nonce = resp.get_json()["nonce"]
         from speech_pipeline.telephony.auth import validate_nonce
-        entry = validate_nonce(nonce)
+        entry = validate_nonce(f"test-account:{nonce}")
         assert entry is not None
         assert entry["user"] == "u"
 

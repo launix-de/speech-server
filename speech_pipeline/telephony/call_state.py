@@ -10,12 +10,12 @@ All format conversion is automatic via ``pipe()``.
 from __future__ import annotations
 
 import logging
-import secrets
 import threading
 import time
 from typing import Any, Dict, List, Optional
 
 from speech_pipeline.ConferenceMixer import ConferenceMixer
+from .id_scope import scoped_id
 
 _LOGGER = logging.getLogger("telephony.call")
 
@@ -31,7 +31,7 @@ class Call:
                  caller: str = "", callee: str = "",
                  direction: str = "inbound",
                  events: Optional[Dict[str, str]] = None):
-        self.call_id = "call-" + secrets.token_urlsafe(12)
+        self.call_id = scoped_id(account_id, "call", entropy_bytes=12)
         self.subscriber_id = subscriber_id
         self.account_id = account_id
         self.pbx_id = pbx_id
@@ -42,7 +42,6 @@ class Call:
         self.created_at = time.time()
         self.events = events or {}
         self.stt_pipeline_id: Optional[str] = None
-        self.stt_callback: Optional[str] = None
 
         self.mixer = ConferenceMixer(name=self.call_id,
                                      sample_rate=MIXER_SAMPLE_RATE,

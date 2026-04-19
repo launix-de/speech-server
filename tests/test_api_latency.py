@@ -65,7 +65,8 @@ class TestPipelinePostLatency:
         )
         try:
             call_id = create_call(client, account)
-            dsl = f"sip:{leg.leg_id} -> call:{call_id} -> sip:{leg.leg_id}"
+            local_leg_id = leg.leg_id.split(":", 1)[1]
+            dsl = f"sip:{local_leg_id} -> call:{call_id} -> sip:{local_leg_id}"
             (resp, elapsed) = _elapsed_ms(lambda: client.post(
                 "/api/pipelines",
                 data=json.dumps({"dsl": dsl}),

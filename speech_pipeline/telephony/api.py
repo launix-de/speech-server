@@ -36,6 +36,7 @@ from typing import Optional
 from flask import Blueprint, g, jsonify, request
 
 from . import auth, call_state, pbx, subscriber
+from .id_scope import expand_for_account, localize_fields
 
 _LOGGER = logging.getLogger("telephony.api")
 
@@ -231,14 +232,15 @@ def create_call():
         direction=body.get("direction", "inbound"),
         events=sub.get("events", {}),
     )
-    return jsonify(call.to_dict()), 201
+    return jsonify(localize_fields(call.to_dict(), aid, "call_id")), 201
 
 
 @api.route("/calls", methods=["GET"])
 @auth.require_account
 def list_calls():
     calls = call_state.list_calls(account_id=_account_id())
-    return jsonify([c.to_dict() for c in calls])
+    aid = _account_id()
+    return jsonify([localize_fields(c.to_dict(), aid, "call_id") for c in calls])
 
 
 # Legacy GET /api/calls/<id> and /participants endpoints removed —
@@ -251,6 +253,11 @@ def terminate_call(call_id: str, account_id: Optional[str]) -> tuple[str, int]:
     Shared by the legacy ``DELETE /api/calls/<id>`` route and the
     canonical DSL delete ``DELETE /api/pipelines?dsl=call:<id>``.
     """
+    try:
+        call_id = expand_for_account(call_id, account_id)
+    except PermissionError as e:
+        return (str(e) + "\n", 403)
+
     call = call_state.get_call(call_id)
     if not call:
         return ("Call not found\n", 404)
@@ -314,19 +321,23 @@ def create_nonce():
     if aid and sub["account_id"] != aid:
         return ("Forbidden\n", 403)
     entry = auth.create_nonce(sub["account_id"], sub_id, user, ttl=ttl)
-    return jsonify(entry), 201
+    return jsonify(localize_fields(entry, aid, "nonce")), 201
 
 
 @api.route("/nonces", methods=["GET"])
 @auth.require_account
 def list_nonces():
     aid = _account_id()
-    return jsonify(auth.list_nonces(account_id=aid))
+    return jsonify([localize_fields(n, aid, "nonce") for n in auth.list_nonces(account_id=aid)])
 
 
 @api.route("/nonce/<nonce>", methods=["DELETE"])
 @auth.require_account
 def delete_nonce(nonce: str):
+    try:
+        nonce = expand_for_account(nonce, _account_id())
+    except PermissionError as e:
+        return (str(e) + "\n", 403)
     if not auth.revoke_nonce(nonce):
         return ("Nonce not found\n", 404)
     return ("", 204)

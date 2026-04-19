@@ -224,7 +224,7 @@ class FakeCrm:
         )
         cb = {"completed": cb_completed}
         # buildLegPipes hook (transcript.fop adds STT tap).
-        tap = f"{leg_id}_tap"
+        tap = self._tap_id(leg_id, 0)
         sip_pipe = (
             f"sip:{leg_id}{json.dumps(cb)} -> tee:{tap} "
             f"-> call:{call_sid} -> sip:{leg_id}"
@@ -271,11 +271,14 @@ class FakeCrm:
         pid = int(qs.get("participant", [0])[0])
         iframe = body.get("iframe_url", "")
         sess = body.get("session_id") or body.get("leg_id", "")
+        result = body.get("result", "")
         if call_db_id and iframe:
             self.calls.setdefault(call_db_id, {})["webclient_url"] = iframe
         if pid and sess:
             self.participants.setdefault(pid, {})["sid"] = sess
             self.participants[pid]["number"] = "webclient"
+        if call_db_id and pid and sess and result == "answered":
+            self._on_webclient_answered(call_db_id, pid, sess)
 
     def _on_sttNote(self, qs, body):
         """Mirror transcript.fop::sttNoteAction closely enough for tests."""
@@ -377,6 +380,11 @@ class FakeCrm:
                 return _sid
         raise RuntimeError("no subscriber registered")
 
+    @staticmethod
+    def _tap_id(leg_id: str, participant_id: int) -> str:
+        local_leg_id = leg_id.split(":", 1)[1] if ":" in leg_id else leg_id
+        return f"{local_leg_id}_p{int(participant_id)}_tap"
+
     def _find_participant(self, call_db_id: int) -> None:
         """calls.fop::findParticipant — dial each internal phone."""
         call_sid = self.calls[call_db_id]["sid"]
@@ -433,7 +441,7 @@ class FakeCrm:
             f"/Telephone/SpeechServer/public?call={call_db_id}"
             f"&participant={pid}&state=leg&event=completed"
         )
-        tap = f"{leg_sid}_tap"
+        tap = self._tap_id(leg_sid, pid)
         sip_pipe = (
             f"sip:{leg_sid}{json.dumps({'completed': cb_completed})} "
             f"-> tee:{tap} -> call:{call_sid} -> sip:{leg_sid}"
@@ -450,6 +458,55 @@ class FakeCrm:
 
         # Outbound: keep wait music until internal answers; inbound:
         # stop wait music, auto-answer inbound SIP participants.
+        keep_wait = bool(pid) and call_data.get("direction") == "outbound"
+        if not keep_wait:
+            self.client.delete(
+                "/api/pipelines",
+                data=json.dumps({"dsl": f"play:{call_sid}_wait"}),
+                headers=self.account_headers,
+            )
+        if call_data.get("direction") == "inbound":
+            info = self.client.get(
+                f"/api/pipelines?dsl=call:{call_sid}",
+                headers=self.account_headers,
+            )
+            if info.status_code == 200:
+                for p in info.get_json().get("participants", []):
+                    if p.get("type") == "sip" and p.get("direction") == "inbound":
+                        self.client.post(
+                            "/api/pipelines",
+                            data=json.dumps({"dsl": f"answer:{p['id']}"}),
+                            headers=self.account_headers,
+                        )
+
+    def _on_webclient_answered(self, call_db_id: int, pid: int, session_id: str) -> None:
+        """Mirror CRM state=webclient callback: attach codec leg explicitly."""
+        call_data = self.calls.get(call_db_id)
+        if not call_data or not call_data.get("sid") or not session_id:
+            return
+        call_sid = call_data["sid"]
+
+        if pid and pid in self.participants:
+            self.participants[pid]["status"] = "answered"
+        if call_data["status"] in ("ringing", "adding", "bouncing", "hold-adding"):
+            call_data["status"] = "hold" if call_data["status"] == "hold-adding" else "answered"
+
+        tap = self._tap_id(session_id, pid)
+        codec_pipe = (
+            f"codec:{session_id} -> tee:{tap} -> call:{call_sid} -> codec:{session_id}"
+        )
+        stt_pipe = (
+            f"tee:{tap} -> stt:de -> webhook:"
+            f"{self.BASE_URL}/Telephone/SpeechServer/sttNote"
+            f"?call={call_db_id}&participant={pid}"
+        )
+        for pipe in (codec_pipe, stt_pipe):
+            self.client.post(
+                "/api/pipelines",
+                data=json.dumps({"dsl": pipe}),
+                headers=self.account_headers,
+            )
+
         keep_wait = bool(pid) and call_data.get("direction") == "outbound"
         if not keep_wait:
             self.client.delete(
@@ -541,7 +598,7 @@ class FakeCrm:
             f"/Telephone/SpeechServer/public?call={call_db_id}"
             f"&participant={pid}&state=leg&event=completed"
         )
-        tap = f"{leg_id}_tap"
+        tap = self._tap_id(leg_id, pid)
         sip_pipe = (
             f"sip:{leg_id}{json.dumps({'completed': cb_completed})} "
             f"-> tee:{tap} -> call:{call_sid} -> sip:{leg_id}"

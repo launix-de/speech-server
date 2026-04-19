@@ -1432,10 +1432,23 @@ def main() -> None:
     parser.add_argument("--startup-callback", default="", help="URL to GET on startup. The called service provisions PBX/accounts via the API.")
     parser.add_argument("--startup-callback-token", default="", help="Bearer token for the startup callback (if different from --admin-token).")
     parser.add_argument("--sip-port", type=int, default=0, help="Enable built-in SIP stack on this UDP port (e.g. 5061). Disables pyVoIP.")
+    parser.add_argument(
+        "--telephony-log-level",
+        type=int,
+        default=2,
+        choices=range(0, 5),
+        help="Telephony verbosity: 0=off, 1=register/provision/init, 2=calls, 3=webhooks, 4=all SIP/debug.",
+    )
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.DEBUG if args.debug else logging.INFO)
+    try:
+        from speech_pipeline.telephony import logcontrol as _tel_logcontrol
+        effective_tel_level = _tel_logcontrol.configure(args.telephony_log_level, debug=args.debug)
+        _LOGGER.info("Telephony log level set to %d", effective_tel_level)
+    except Exception:
+        _LOGGER.warning("Failed to configure telephony log level", exc_info=True)
 
     # Fix pyVoIP trans() timing (must be set before any calls)
     try:

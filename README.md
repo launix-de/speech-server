@@ -4,8 +4,11 @@ A composable, real-time speech processing toolkit for Python. Build text-to-spee
 
 Stages snap together like UNIX pipes. Format conversion (sample rate, encoding) is automatic. Streaming is the default: audio plays as it is synthesized, transcriptions arrive as words are spoken.
 
-```
-echo "Hallo Welt" | speech-pipeline run 'cli:text | tts{"voice":"de_DE-thorsten-medium"} | cli:raw' > out.raw
+```bash
+curl -X POST -H "Authorization: Bearer TOKEN" \
+  -d '{"dsl": "tts{\"text\":\"Hallo Welt\"}", "render": true}' \
+  -o out.wav \
+  http://localhost:5000/api/pipelines
 ```
 
 ## Key Features
@@ -51,8 +54,11 @@ speech-pipeline serve --admin-token SECRET --voices-path voices-piper
 # List available voices
 speech-pipeline voices --voices-path voices-piper
 
-# Synthesize from the command line
-echo "Hallo Welt" | speech-pipeline run 'cli:text | tts{"voice":"de_DE-thorsten-medium"} | cli:raw' > out.raw
+# Render TTS over the canonical REST API
+curl -X POST -H "Authorization: Bearer SECRET" \
+  -d '{"dsl": "tts{\"text\":\"Hallo Welt\"}", "render": true}' \
+  -o out.wav \
+  http://localhost:5000/api/pipelines
 ```
 
 ## Library Usage

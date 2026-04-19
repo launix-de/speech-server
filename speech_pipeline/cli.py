@@ -1,7 +1,7 @@
 """CLI entry point for speech-pipeline.
 
 Usage:
-    speech-pipeline run  "cli:text | tts{\"voice\":\"de_DE-thorsten-medium\"} | cli:raw"
+    speech-pipeline run  "cli:text -> tts{\"voice\":\"de_DE-thorsten-medium\"} -> cli:raw"
     speech-pipeline serve [--host HOST] [--port PORT] [--voices-path DIR]
     speech-pipeline sip-bridge [--extension EXT] [--voice VOICE] [--lang LANG]
     speech-pipeline voices [--voices-path DIR]
@@ -108,7 +108,7 @@ def main() -> None:
 
     # --- run ---
     p_run = sub.add_parser("run", help="Run a pipeline from DSL string")
-    p_run.add_argument("pipeline", help='Pipeline DSL, e.g. "cli:text | tts{\\"voice\\":\\"de_DE-thorsten-medium\\"} | cli:raw"')
+    p_run.add_argument("pipeline", help='Pipeline DSL, e.g. "cli:text -> tts{\\"voice\\":\\"de_DE-thorsten-medium\\"} -> cli:raw"')
     p_run.add_argument("--voices-path", default="voices-piper")
     p_run.add_argument("--cuda", action="store_true")
     p_run.add_argument("--whisper-model", default="small")

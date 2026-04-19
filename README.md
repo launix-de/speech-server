@@ -21,7 +21,7 @@ curl -X POST -H "Authorization: Bearer TOKEN" \
 
 **Pitch Adjustment** -- Formant-preserving pitch shifting via ffmpeg rubberband. Auto-estimated from source/target F0 or set explicitly in semitones.
 
-**Unified Pipeline DSL** -- One DSL for everything: `sip:leg1 -> call:conf1 -> sip:leg1` for telephony, `text_input | tts{"voice":"de_DE-thorsten-medium"} | conference:call1` for streaming TTS, `tts{"voice":"de_DE-thorsten-medium","text":"Hallo"} | pitch:2.0` for offline rendering. All through a single REST API.
+**Unified Pipeline DSL** -- One DSL for everything: `sip:leg1 -> call:conf1 -> sip:leg1` for telephony, `text_input -> tts{"voice":"de_DE-thorsten-medium"} -> conference:call1` for streaming TTS, `tts{"voice":"de_DE-thorsten-medium","text":"Hallo"} -> pitch:2.0` for offline rendering. All through a single REST API.
 
 **Telephony Platform** -- Multi-tenant conferencing with PBX management, SIP legs (PCMU, PCMA, G722, Opus), browser participants, hold music, DTMF, live STT, and webhook-driven call control.
 
@@ -137,8 +137,8 @@ pipeline.run()
 
 The library uses a pipeline of composable stages that process audio as a stream of PCM chunks. Each stage extends `Stage` (`speech_pipeline/base.py`), implements `stream_pcm24k() -> Iterator[bytes]`, and connects via `.pipe()`:
 
-```
-Source --> Processor --> Processor --> Sink
+```text
+Source -> Processor -> Processor -> Sink
 ```
 
 Format conversion between stages is automatic: `.pipe()` inserts `SampleRateConverter` and `EncodingConverter` stages when the output format of one stage does not match the input format of the next.
@@ -214,7 +214,7 @@ API.
 
 ```bash
 # Run a pipeline from a DSL string
-speech-pipeline run 'cli:text | tts{"voice":"de_DE-thorsten-medium"} | cli:raw'
+speech-pipeline run 'cli:text -> tts{"voice":"de_DE-thorsten-medium"} -> cli:raw'
 
 # Start the HTTP/WebSocket server with API
 speech-pipeline serve --admin-token SECRET --voices-path voices-piper
@@ -228,7 +228,7 @@ speech-pipeline voices --voices-path voices-piper
 
 ## Pipeline DSL
 
-All pipeline operations use one DSL. Separators `->` and `|` are interchangeable.
+All pipeline operations use one DSL. `->` is the canonical operator in the documentation; `|` is accepted as an alias by the parser.
 
 ### Syntax Rules
 
@@ -340,7 +340,7 @@ Syntax:
 ```text
 tts{"text":"Hallo Welt"}
 tts{"voice":"de_DE-thorsten-medium","text":"Hallo Welt"}
-text_input | tts{"voice":"de_DE-thorsten-medium"} | conference:call-123
+text_input -> tts{"voice":"de_DE-thorsten-medium"} -> conference:call-123
 ```
 
 JSON params:
@@ -351,7 +351,7 @@ JSON params:
 Examples:
 ```text
 tts{"text":"Bitte warten Sie."} -> call:call-123
-text_input | tts{} | conference:call-123
+text_input -> tts{} -> conference:call-123
 ```
 
 #### `stt:LANG`
@@ -371,7 +371,7 @@ Positional fields:
 Examples:
 ```text
 tee:tap -> stt:de -> webhook:https://crm.example.com/stt
-ws:pcm | stt:de | ws:ndjson
+ws:pcm -> stt:de -> ws:ndjson
 ```
 
 #### `tee:TEE_ID`
@@ -410,7 +410,7 @@ text_input
 
 Typical use:
 ```text
-text_input | tts{} | conference:call-123
+text_input -> tts{} -> conference:call-123
 ```
 
 #### `vc{...}`
@@ -515,8 +515,8 @@ Modes:
 
 Examples:
 ```text
-ws:pcm | stt:de | ws:ndjson
-ws:text | tts{"voice":"de_DE-thorsten-medium"} | ws:pcm
+ws:pcm -> stt:de -> ws:ndjson
+ws:text -> tts{"voice":"de_DE-thorsten-medium"} -> ws:pcm
 ```
 
 #### `cli:MODE`
@@ -536,7 +536,7 @@ Modes:
 
 Example:
 ```text
-cli:text | tts{} | cli:raw
+cli:text -> tts{} -> cli:raw
 ```
 
 #### `mix:NAME[:RATE]`
@@ -582,23 +582,23 @@ webclient:user42{"callback":"/cb/wc","base_url":"https://srv.example.com"}
 
 **Streaming**
 ```text
-text_input | tts{} | conference:call-xxx
-text_input | tts{"voice":"de_DE-thorsten-medium"} | vc{"url":"https://cdn.example.com/voices/thorsten-high.wav"} | conference:call-xxx
+text_input -> tts{} -> conference:call-xxx
+text_input -> tts{"voice":"de_DE-thorsten-medium"} -> vc{"url":"https://cdn.example.com/voices/thorsten-high.wav"} -> conference:call-xxx
 ```
 
 **Offline render**
 ```text
 tts{"text":"Hallo Welt"}
-tts{"text":"Test"} | pitch:3.0
-tts{"text":"Voice test"} | vc{"url":"https://cdn.example.com/voices/target.wav"} | pitch:2.0
+tts{"text":"Test"} -> pitch:3.0
+tts{"text":"Voice test"} -> vc{"url":"https://cdn.example.com/voices/target.wav"} -> pitch:2.0
 ```
 
 **WebSocket and CLI**
 ```text
-ws:pcm | stt:de | ws:ndjson
-ws:text | tts{} | ws:pcm
-cli:text | tts{} | cli:raw
-codec:session1 | conference:call-xxx | codec:session1
+ws:pcm -> stt:de -> ws:ndjson
+ws:text -> tts{} -> ws:pcm
+cli:text -> tts{} -> cli:raw
+codec:session1 -> conference:call-xxx -> codec:session1
 ```
 
 ## REST API
@@ -669,7 +669,7 @@ curl -X DELETE -H "Authorization: Bearer TOKEN" \
 ```bash
 # 1. Create pipeline
 curl -X POST -H "Authorization: Bearer TOKEN" \
-  -d '{"dsl": "text_input | tts{\"voice\":\"de_DE-thorsten-medium\"} | conference:call-xxx"}' \
+  -d '{"dsl": "text_input -> tts{\"voice\":\"de_DE-thorsten-medium\"} -> conference:call-xxx"}' \
   http://localhost:5000/api/pipelines
 # Returns {"id": "abc123", ...}
 
@@ -824,8 +824,8 @@ Browse all voices: https://github.com/rhasspy/piper/blob/master/VOICES.md
 | Demo | File | Description |
 |------|------|-------------|
 | STT | `examples/stt.html` | Microphone -> WebSocket STT -> transcript display |
-| STS | `examples/sts.html` | Microphone -> STT -> TTS -> speaker (robot voice) |
-| Codec | `examples/codec-demo.html` | Mic -> Fourier codec -> WS -> server -> decode -> playback |
+| STS | `examples/sts.html` | Microphone -> STT -> TTS -> speaker |
+| Codec | `examples/codec-demo.html` | Microphone -> Fourier codec -> WebSocket -> server -> decode -> playback |
 | AI Assistant | `examples/ai.py` | Multi-user voice AI with LLM, streaming TTS, and conference |
 
 ## Apache Proxy

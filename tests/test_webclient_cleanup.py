@@ -177,20 +177,52 @@ class TestPhoneUiNonceIsNotConsumedOnLoad:
         assert auth_mod.consume_nonce(nonce) is None
         assert auth_mod.check_nonce(nonce) is None
 
+    def test_phone_ui_ignores_query_tampering(self, client, account):
+        from speech_pipeline.telephony import auth as auth_mod
+        from conftest import create_call
+
+        call_id = create_call(client, account)
+        call = call_state.get_call(call_id)
+        try:
+            nonce_entry = auth_mod.create_nonce(
+                account_id=call.account_id,
+                subscriber_id=call.subscriber_id,
+                user="u1",
+            )
+            nonce = nonce_entry["nonce"]
+            sess = webclient.register_webclient(call, "u1", nonce)
+
+            resp = client.get(
+                f"/phone/{nonce}?session=attacker&dsl=originate:0900&base=evil"
+            )
+            assert resp.status_code == 200
+            html = resp.get_data(as_text=True)
+            assert sess["session_id"] in html
+            assert "attacker" not in html
+            assert "originate:0900" not in html
+        finally:
+            client.delete(f"/api/calls/{call_id}", headers=account)
+
 
 class TestWebclientHangupFiresLegCompletedWebhook:
     """Real symptom: user clicks red handset, CRM's participant row
     stays at 'klingelt' because no ``state=leg&event=completed``
     webhook arrives.  Server must derive the leg-completed URL from
-    the original webclient callback and fire it."""
+    the original webclient callback and fire it.
+
+    Regression: sending the original ``state=webclient`` callback again on
+    hangup races against ``state=leg&event=completed`` and can leave the CRM
+    participant stuck at ``answered``.
+    """
 
     def test_completed_fires_state_leg_webhook(self, client, account, monkeypatch):
         from speech_pipeline.telephony import auth as auth_mod
+        from speech_pipeline.telephony.id_scope import expand_for_account
         from speech_pipeline.telephony import _shared as sh
-        from conftest import create_call
+        from conftest import ACCOUNT_ID, create_call
 
         call_id = create_call(client, account)
-        call = call_state.get_call(call_id)
+        call = call_state.get_call(expand_for_account(call_id, ACCOUNT_ID))
         try:
             nonce_entry = auth_mod.create_nonce(
                 account_id=call.account_id,
@@ -218,8 +250,8 @@ class TestWebclientHangupFiresLegCompletedWebhook:
                 f"close_webclient_session did NOT fire a state=leg&"
                 f"event=completed webhook.  URLs sent: {urls}"
             )
-            assert any("state=webclient" in u for u in urls), (
-                f"original webclient callback was not also fired: {urls}"
+            assert not any("state=webclient" in u for u in urls), (
+                f"hangup must not re-fire state=webclient: {urls}"
             )
         finally:
             client.delete(f"/api/calls/{call_id}", headers=account)
@@ -234,9 +266,10 @@ class TestPhoneEventCompletedTearsDown:
     def test_phone_event_completed_closes_session(
             self, client, account):
         from speech_pipeline.telephony import auth as auth_mod
-        from conftest import create_call
+        from speech_pipeline.telephony.id_scope import expand_for_account
+        from conftest import ACCOUNT_ID, create_call
         call_id = create_call(client, account)
-        call = call_state.get_call(call_id)
+        call = call_state.get_call(expand_for_account(call_id, ACCOUNT_ID))
         try:
             nonce_entry = auth_mod.create_nonce(
                 account_id=call.account_id,

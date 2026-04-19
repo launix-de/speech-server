@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import json
 import logging
-import secrets
 import threading
 import time
 from typing import Optional
@@ -25,6 +24,7 @@ import requests as http_requests
 from flask import Blueprint, Response, jsonify, request
 
 from . import auth, call_state, subscriber
+from .id_scope import localize_fields, scoped_id
 
 _LOGGER = logging.getLogger("telephony.webclient")
 
@@ -43,6 +43,14 @@ _REAPER_INTERVAL_SECONDS = 30.0
 
 _reaper_started = False
 _reaper_lock = threading.Lock()
+
+
+def normalize_base_url(base_url: str) -> str:
+    """Return a canonical absolute base URL for browser-facing links."""
+    base = (base_url or "").strip().rstrip("/")
+    if base and "://" not in base:
+        raise ValueError("webclient base_url must be absolute")
+    return base
 
 
 def _ensure_reaper_started() -> None:
@@ -95,11 +103,12 @@ def register_webclient(call: call_state.Call, user: str,
     """Register a webclient session. Returns session info with DSL.
 
     If *dsl* or *pipes* is given, ``{session_id}`` and ``{call_id}``
-    placeholders are substituted.  Otherwise the default bidirectional
-    codec-conference pipeline is used.
+    placeholders are substituted. Otherwise the session is slot-only:
+    the CRM must wire ``codec:<session_id>`` into the call explicitly
+    after the browser joins.
     """
     # 16 bytes = 128 bit random — not guessable within the reap window.
-    session_id = session_id or ("wc-" + secrets.token_urlsafe(16))
+    session_id = session_id or scoped_id(call.account_id, "wc", entropy_bytes=16)
 
     if pipes:
         resolved = [p.replace("{session_id}", session_id)
@@ -109,8 +118,7 @@ def register_webclient(call: call_state.Call, user: str,
         dsl = (dsl.replace("{session_id}", session_id)
                   .replace("{call_id}", call.call_id))
     else:
-        dsl = (f"codec:{session_id} -> call:{call.call_id} "
-               f"-> codec:{session_id}")
+        dsl = ""
 
     entry = {
         "session_id": session_id,
@@ -147,13 +155,7 @@ def create_webclient_leg(call: call_state.Call, user: str,
     sess["ready_callback"] = ready_callback
     sess["leg_callbacks"] = dict(leg_callbacks or {})
 
-    from urllib.parse import urlencode
-    query = urlencode({
-        "base": base_url,
-        "session": sess["session_id"],
-        "dsl": sess["dsl"],
-    })
-    iframe_url = f"{base_url}/phone/{nonce}?{query}"
+    iframe_url = f"{normalize_base_url(base_url)}/phone/{nonce}"
 
     _send_callback(
         sess["subscriber_id"],
@@ -205,7 +207,16 @@ def _send_callback(subscriber_id: str, callback_path: str, payload: dict) -> Non
         return
     from . import _shared
     url = _shared.subscriber_url(sub, callback_path)
-
+    payload = localize_fields(
+        payload,
+        sub.get("account_id"),
+        "callId",
+        "call_id",
+        "leg_id",
+        "session_id",
+        "participantId",
+        "nonce",
+    )
     _shared.post_webhook(url, payload, sub["bearer_token"])
 
 
@@ -286,14 +297,11 @@ def close_webclient_session(session_id: str) -> None:
         pass
 
     # Detach from the call: unregister participant so the mixer can idle out.
-    # Fire the participant's "completed" callback so the CRM marks its own
-    # participant record as ended — otherwise findParticipant on the next
-    # call may block thinking this slot is still alive.
+    # Fire ONLY the derived ``state=leg&event=completed`` callback.
     #
-    # Fires TWO webhooks because the CRM has TWO handlers it might use:
-    #  * state=webclient — original slot lifecycle (carries iframe_url etc.)
-    #  * state=leg&event=completed — the same handler SIP legs use; this
-    #    is the one that flips the participant row from ringing → completed.
+    # The CRM's ``state=webclient`` branch means "browser joined" and marks
+    # the participant answered. Sending it again on hangup races against the
+    # leg-completed callback and can leave the participant stuck at "running".
     call_id = entry.get("call_id")
     if call_id:
         try:
@@ -306,7 +314,6 @@ def close_webclient_session(session_id: str) -> None:
                     sub = subscriber.get(call.subscriber_id)
                     if sub:
                         from . import _shared
-                        webclient_url = _shared.subscriber_url(sub, cb_path)
                         payload = {
                             "callId": call.call_id,
                             "command": "webclient",
@@ -316,21 +323,12 @@ def close_webclient_session(session_id: str) -> None:
                             "event": "completed",
                             "result": "completed",
                         }
+                        leg_path = _flip_to_leg_completed(cb_path)
+                        leg_url = _shared.subscriber_url(sub, leg_path)
                         _shared.post_webhook(
-                            webclient_url, payload,
+                            leg_url, payload,
                             sub.get("bearer_token", ""),
                         )
-                        # Switch state=webclient → state=leg&event=completed
-                        # for the same participant so the CRM's standard
-                        # leg-completed flow runs (marks participant done,
-                        # checks liveliness, etc.).
-                        leg_path = _flip_to_leg_completed(cb_path)
-                        if leg_path != cb_path:
-                            leg_url = _shared.subscriber_url(sub, leg_path)
-                            _shared.post_webhook(
-                                leg_url, payload,
-                                sub.get("bearer_token", ""),
-                            )
         except Exception:
             pass
 
@@ -403,14 +401,11 @@ body { font-family: system-ui, sans-serif; display: flex;
 </div>
 <!-- codec.js loaded from tts-piper server, same way as sts.html -->
 <script>
-// Read params
-var params = new URLSearchParams(location.search);
-var sessionId = params.get('session');
-var dsl = params.get('dsl');
+// Session is bound server-side to the nonce; the browser must not
+// receive or choose arbitrary pipeline DSL.
+var sessionId = __SESSION_ID__;
 var appBase = location.pathname.replace(/\/phone\/[^/?#]+$/, '');
 var wsBase = location.origin.replace(/^http/, 'ws') + appBase;
-// The nonce is the last path segment; /ws/pipe requires auth and
-// accepts nonces as short-lived tokens for the webclient session.
 var nonce = location.pathname.match(/\/phone\/([^/?#]+)/);
 nonce = nonce ? nonce[1] : '';
 
@@ -466,9 +461,9 @@ function start() {
   navigator.mediaDevices.getUserMedia({
     audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true }
   }).then(function(stream) {
-    // The pipeline is already running on the server (built when the
-    // CRM created the webclient slot) — we only need the codec WS
-    // for audio.  /ws/pipe is no longer used by the unified API.
+    // The pipeline is already fixed server-side when the CRM creates the
+    // webclient slot. The browser only gets a session ID + nonce and may
+    // not submit arbitrary DSL back to the server.
     statusEl.textContent = 'Connecting…';
     connectCodec(stream);
   }).catch(function(e) {
@@ -476,26 +471,7 @@ function start() {
   });
 }
 
-// 2. Open pipe WS + codec WS (only after mic granted)
-function openPipeline(micStream) {
-  pipeWs = new WebSocket(wsBase + '/ws/pipe?token=' + encodeURIComponent(nonce));
-  pipeWs.binaryType = 'arraybuffer';
-
-  pipeWs.onopen = function () {
-    var config = (dsl.charAt(0) === '{') ? JSON.parse(dsl) : { pipe: dsl };
-    pipeWs.send(JSON.stringify(config));
-    statusEl.textContent = 'Pipeline started…';
-    connectCodec(micStream);
-  };
-
-  pipeWs.onerror = function () { statusEl.textContent = 'Pipeline WS error'; };
-  pipeWs.onclose = function () {
-    if (recording) stop();
-    statusEl.textContent = 'Disconnected';
-  };
-}
-
-// 3. Open codec WS
+// 2. Open codec WS
 function connectCodec(micStream) {
   var profile = getProfile();
 
@@ -524,7 +500,7 @@ function connectCodec(micStream) {
   };
 }
 
-// 4. Start mic encoder + speaker decoder (mic already granted)
+// 3. Start mic encoder + speaker decoder (mic already granted)
 function openChannels(micStream) {
   speaker = Codec.openSpeaker(codecWs);
 
@@ -625,6 +601,10 @@ window.addEventListener('beforeunload', function () {
 """
 
 
+def _render_phone_html(session_id: str) -> str:
+    return _PHONE_HTML.replace("__SESSION_ID__", json.dumps(session_id))
+
+
 @bp.route("/phone/<nonce>")
 def phone_ui(nonce: str):
     """Serve the phone iframe UI.
@@ -636,10 +616,12 @@ def phone_ui(nonce: str):
     entry = auth.check_nonce(nonce)
     if not entry:
         return ("Invalid or expired nonce\n", 403)
-    # Find webclient session by nonce
+    # Find webclient session by nonce. The phone UI must be bound only to the
+    # server-side session for this nonce; query params may not inject DSL or a
+    # different session identifier.
     for sid, sess in _sessions.items():
         if sess.get("nonce") == nonce:
-            resp = Response(_PHONE_HTML, mimetype="text/html")
+            resp = Response(_render_phone_html(sid), mimetype="text/html")
             resp.headers["Access-Control-Allow-Origin"] = "*"
             resp.headers["Permissions-Policy"] = "microphone=(*)"
             return resp

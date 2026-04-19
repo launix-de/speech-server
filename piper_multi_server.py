@@ -1357,7 +1357,10 @@ def create_app(args: argparse.Namespace) -> Flask:
         # PipelineBuilder's _get_or_create_codec_session will reuse it.
         session = get_session(session_id)
         if not session:
-            if session_id.startswith("wc-") and get_webclient_session(session_id):
+            # Webclient session IDs are now account-scoped ("account:wc-...").
+            # Pre-create a codec session for every known webclient slot,
+            # regardless of whether the ID is scoped or legacy-local.
+            if get_webclient_session(session_id):
                 session = CodecSocketSession(session_id)
                 _LOGGER.info(
                     "ws_codec_socket: pre-created CodecSocketSession for %s",

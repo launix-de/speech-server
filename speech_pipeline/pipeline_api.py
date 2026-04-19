@@ -14,6 +14,7 @@ from flask import Blueprint, g, jsonify, request
 
 from . import live_pipeline as registry
 from .telephony import auth
+from .telephony.id_scope import expand_for_account, localize_fields, localize_for_account
 
 _LOGGER = logging.getLogger("pipeline-api")
 
@@ -69,6 +70,10 @@ def list_pipelines():
     if typ in ("call", "conference"):
         if not elem_id:
             return ("Missing ID\n", 400)
+        try:
+            elem_id = expand_for_account(elem_id, _account_id())
+        except PermissionError as e:
+            return (str(e) + "\n", 403)
         call = call_state.get_call(elem_id)
         if not call:
             return (f"Call '{elem_id}' not found\n", 404)
@@ -76,15 +81,19 @@ def list_pipelines():
         aid = _account_id()
         if aid and call.account_id != aid:
             return ("Forbidden\n", 403)
-        return jsonify(call.to_dict())
+        return jsonify(_present_call(call))
 
     if typ == "sip":
         if not elem_id:
             return ("Missing ID\n", 400)
+        try:
+            elem_id = expand_for_account(elem_id, _account_id())
+        except PermissionError as e:
+            return (str(e) + "\n", 403)
         leg = leg_mod.get_leg(elem_id)
         if not leg:
             return (f"Leg '{elem_id}' not found\n", 404)
-        return jsonify(leg.to_dict())
+        return jsonify(_present_leg(leg))
 
     # Stage lookup (play:, bridge:, tee:, etc.) — search across executors
     for call in call_state.list_calls():
@@ -98,8 +107,8 @@ def list_pipelines():
                 return ("Forbidden\n", 403)
             return jsonify({
                 "type": "tee",
-                "id": elem_id,
-                "call_id": call.call_id,
+                "id": localize_for_account(elem_id, aid),
+                "call_id": localize_for_account(call.call_id, aid),
                 "cancelled": getattr(tee, "cancelled", False),
                 "sidechain_count": sum(1 for s in ex._sidechain_specs if s[0] == elem_id),
             })
@@ -113,7 +122,7 @@ def list_pipelines():
             stage = getattr(handle, "_stage", None)
             return jsonify({
                 "id": full_id,
-                "call_id": call.call_id,
+                "call_id": localize_for_account(call.call_id, aid),
                 "cancelled": getattr(stage, "cancelled", False) if stage else False,
             })
 
@@ -132,6 +141,20 @@ def get_pipeline(pid: str):
 def _account_id() -> Optional[str]:
     acct = getattr(g, "account", None)
     return acct["id"] if acct else None
+
+
+def _present_call(call) -> dict:
+    aid = _account_id()
+    body = localize_fields(call.to_dict(), aid, "call_id")
+    body["participants"] = [
+        localize_fields(p, aid, "id")
+        for p in body.get("participants", [])
+    ]
+    return body
+
+
+def _present_leg(leg) -> dict:
+    return localize_fields(leg.to_dict(), _account_id(), "leg_id", "call_id")
 
 
 def _check_call_ownership(dsl: str) -> Optional[str]:
@@ -153,14 +176,22 @@ def _check_call_ownership(dsl: str) -> Optional[str]:
 
     # call/conference
     for call_id in re.findall(r'(?:call|conference):([^\s{|>]+)', dsl):
+        try:
+            call_id = expand_for_account(call_id, aid)
+        except PermissionError as e:
+            return str(e)
         call = call_state.get_call(call_id)
         if not call:
             return f"Call {call_id} not found"
         if call.account_id != aid:
             return f"Forbidden: call {call_id} belongs to another account"
 
-    # sip / bridge — both reference a leg by id
-    for leg_id in re.findall(r'(?:sip|bridge):([^\s{|>]+)', dsl):
+    # sip / bridge / answer — all reference a leg by id
+    for leg_id in re.findall(r'(?:sip|bridge|answer):([^\s{|>]+)', dsl):
+        try:
+            leg_id = expand_for_account(leg_id, aid)
+        except PermissionError as e:
+            return str(e)
         leg = leg_mod.get_leg(leg_id)
         if not leg:
             continue  # bridge: against unknown id → let the endpoint 404
@@ -170,6 +201,10 @@ def _check_call_ownership(dsl: str) -> Optional[str]:
 
     # codec — webclient session; its call determines the account
     for session_id in re.findall(r'codec:([^\s{|>]+)', dsl):
+        try:
+            session_id = expand_for_account(session_id, aid)
+        except PermissionError as e:
+            return str(e)
         sess = wc_mod.get_webclient_session(session_id)
         if not sess:
             continue
@@ -233,12 +268,20 @@ def create_pipeline():
     for typ, elem_id, params in elements:
         if typ in ("call", "conference") and elem_id:
             from .telephony import call_state
+            try:
+                elem_id = expand_for_account(elem_id, _account_id())
+            except PermissionError as e:
+                return (str(e) + "\n", 403)
             call = call_state.get_call(elem_id)
             break
         if typ == "webclient":
             cid = (params or {}).get("call_id")
             if cid:
                 from .telephony import call_state
+                try:
+                    cid = expand_for_account(cid, _account_id())
+                except PermissionError as e:
+                    return (str(e) + "\n", 403)
                 call = call_state.get_call(cid)
                 break
 
@@ -260,7 +303,9 @@ def create_pipeline():
     if call:
         executor = _shared.ensure_pipe_executor(call)
     else:
-        executor = CallPipeExecutor(call=None, tts_registry=tts_registry)
+        executor = CallPipeExecutor(
+            call=None, tts_registry=tts_registry, account_id=_account_id()
+        )
 
     pipeline = registry.LivePipeline(dsl=dsl)
 
@@ -293,6 +338,10 @@ def create_pipeline():
         for k in ("leg_id", "session_id", "nonce", "iframe_url"):
             if r.get(k):
                 body[k] = r[k]
+    aid = _account_id()
+    for key in ("call_id", "leg_id", "session_id", "nonce"):
+        if isinstance(body.get(key), str):
+            body[key] = localize_for_account(body[key], aid)
     return jsonify(body), 201
 
 
@@ -661,6 +710,7 @@ def replace_stage(pid: str, sid: str):
         cuda=body.get("cuda", False),
         voices_path=body.get("voices_path", "voices-piper"),
         soundpath=body.get("soundpath", "../voices/%s.wav"),
+        media_folder=body.get("media_folder"),
         bearer=body.get("bearer", ""),
     )
     from .registry import TTSRegistry
@@ -671,8 +721,8 @@ def replace_stage(pid: str, sid: str):
     if len(parsed) != 1:
         return ("Element must be a single stage (e.g. 'gain:2.0')\n", 400)
 
-    typ, params = parsed[0]
-    new_stage = _build_single_stage(builder, typ, params)
+    typ, params, json_params = parsed[0]
+    new_stage = _build_single_stage(builder, typ, params, json_params)
     if new_stage is None:
         return (f"Cannot build stage from '{element}'\n", 400)
 
@@ -688,7 +738,7 @@ def replace_stage(pid: str, sid: str):
     del p.stages[sid]
     p.stages[new_stage.id] = new_stage
     p.stage_types[new_stage.id] = typ
-    p.stage_configs[new_stage.id] = {"params": params}
+    p.stage_configs[new_stage.id] = {"params": params, "json_params": json_params}
     p.stage_types.pop(sid, None)
     p.stage_configs.pop(sid, None)
 
@@ -709,7 +759,7 @@ def replace_stage(pid: str, sid: str):
     })
 
 
-def _build_single_stage(builder, typ: str, params: list):
+def _build_single_stage(builder, typ: str, params: list, json_params: dict):
     """Build a single stage from parsed DSL element. Returns Stage or None."""
     try:
         if typ == "resample":
@@ -733,23 +783,20 @@ def _build_single_stage(builder, typ: str, params: list):
             return WhisperTranscriber(model_size, chunk_seconds=chunk_seconds, language=lang)
         elif typ == "tts":
             from .StreamingTTSProducer import StreamingTTSProducer
-            voice_id = params[0] if params else None
-            if not voice_id or not builder.registry:
+            if params or not builder.registry:
                 return None
+            voice_id = json_params.get("voice") or "de_DE-thorsten-medium"
             voice = builder.registry.ensure_loaded(voice_id)
             syn = builder.registry.create_synthesis_config(voice, {})
             # TTS needs a text source — can't build standalone
             return None
         elif typ == "vc":
             from .VCConverter import VCConverter
-            voice2 = params[0] if params else None
-            if not voice2:
+            ref_url = json_params.get("url", "")
+            if not ref_url:
                 return None
-            from .FileFetcher import FileFetcher
-            from pathlib import Path
-            here = Path(__file__).resolve().parent.parent
-            tmpl = getattr(builder.args, "soundpath", "../voices/%s.wav")
-            ref = FileFetcher.build_ref(voice2, tmpl, here)
+            from .media_refs import resolve_media_ref
+            ref = resolve_media_ref(ref_url, getattr(builder.args, "media_folder", None))
             bearer = getattr(builder.args, "bearer", "")
             return VCConverter(ref, bearer=bearer)
         elif typ == "pitch":

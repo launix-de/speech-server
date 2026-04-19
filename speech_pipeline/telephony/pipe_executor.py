@@ -43,7 +43,9 @@ import time
 from typing import Any, Dict, List, Tuple
 
 from speech_pipeline.dsl_parser import parse_dsl  # noqa: F401 — re-export
+from speech_pipeline.telephony import _shared
 from urllib.parse import urlparse as _urlparse
+from .id_scope import expand_for_account
 
 
 def _same_origin(url: str, base: str | None) -> bool:
@@ -69,8 +71,10 @@ _TTS_CHUNK_SECONDS = 0.10
 # ---------------------------------------------------------------------------
 
 class CallPipeExecutor:
-    def __init__(self, call=None, tts_registry=None, subscriber=None, ws=None):
+    def __init__(self, call=None, tts_registry=None, subscriber=None, ws=None,
+                 account_id=None):
         self.call = call
+        self._account_id = account_id or (call.account_id if call else None)
         self._tts_registry = tts_registry
         self._subscriber = subscriber
         self._ws = ws                        # WebSocket connection (for ws: elements)
@@ -171,6 +175,7 @@ class CallPipeExecutor:
             if not elem_id:
                 raise ValueError("answer requires a leg ID")
             from . import leg as leg_mod
+            elem_id = expand_for_account(elem_id, self._account_id)
             leg = leg_mod.get_leg(elem_id)
             if not leg:
                 raise ValueError(f"Leg '{elem_id}' not found")
@@ -273,14 +278,23 @@ class CallPipeExecutor:
         if typ == "webclient":
             if not self.call:
                 raise ValueError("webclient requires a call context")
+            from . import auth, webclient as wc
             user = elem_id or "anonymous"
             callback = params.get("callback", "")
             base_url = params.get("base_url", "")
             if not base_url:
                 raise ValueError("webclient requires base_url")
+            base_url = wc.normalize_base_url(base_url)
 
-            from . import auth, webclient as wc, _shared
-            from . import subscriber as sub_mod
+            forbidden = [
+                key for key in ("pipes", "dsl", "stt_callback", "transcript")
+                if params.get(key)
+            ]
+            if forbidden:
+                raise ValueError(
+                    "webclient only creates a slot; build codec/webhook "
+                    "pipes separately after the answered callback"
+                )
 
             if not auth.check_feature(self.call.account_id, "webclient"):
                 raise ValueError("Account lacks webclient feature")
@@ -291,84 +305,14 @@ class CallPipeExecutor:
                 user=user)
             nonce = nonce_entry["nonce"]
 
-            # Auto-build a pipes array that mirrors the SIP-leg STT tap
-            # (tee → stt → webhook) when the CRM asks for transcript.
-            # This matches what ``transcript.fop::add-stt`` does for
-            # ``sip:LEG -> call:C -> sip:LEG`` and saves every caller
-            # from rebuilding the DSL by hand.
-            pipes = params.get("pipes")
-            stt_callback = params.get("stt_callback") or params.get("transcript")
-            if not pipes and not params.get("dsl") and stt_callback:
-                # Ensure the webhook URL is fully qualified — Python
-                # ``requests`` rejects scheme-less URLs and the whole
-                # WebhookSink fails silently.
-                stt_url = str(stt_callback)
-                if not stt_url.startswith("http://") and not stt_url.startswith("https://"):
-                    base = base_url.rstrip("/")
-                    if "://" not in base:
-                        base = "https://" + base
-                    stt_url = base + "/" + stt_url.lstrip("/")
-                # Use the unified ``->`` pipe-executor DSL.  pipe_executor
-                # keeps a single ``tee:NAME`` per executor and treats a
-                # second pipe with the same ``tee:NAME`` as the first
-                # element as a sidechain attachment (no duplicate
-                # AudioTee), so the STT branch cleanly taps the codec
-                # audio.
-                pipes = [
-                    "codec:{session_id} -> tee:{session_id}_tap "
-                    "-> call:{call_id} -> codec:{session_id}",
-                    "tee:{session_id}_tap -> stt:de -> webhook:" + stt_url,
-                ]
-
-            sess = wc.register_webclient(self.call, user, nonce,
-                                          dsl=params.get("dsl"),
-                                          pipes=pipes)
+            sess = wc.register_webclient(self.call, user, nonce)
             session_id = sess["session_id"]
-
-            # Build the webclient pipes immediately via pipe_executor.
-            # Previously phone.html had to open /ws/pipe to trigger the
-            # build via PipelineBuilder; that was a race against the
-            # codec WS open and required the legacy ``|`` DSL.  The
-            # unified DSL via the same executor handles the codec
-            # element + sidechain tee → stt → webhook in one place.
-            # Build pipes in a background thread.  Synchronous build can
-            # load Whisper, wire ConferenceLeg, etc., exceeding the CRM's
-            # proxy timeout (observed 504).  The browser doesn't need the
-            # pipes until it opens /ws/socket/<sid>.
-            try:
-                stored = sess.get("dsl") or ""
-                if stored.startswith("{"):
-                    inner = json.loads(stored).get("pipes", [])
-                else:
-                    inner = [stored] if stored else []
-                if inner:
-                    def _bg_build(pipes_to_build=inner, sid=session_id):
-                        try:
-                            self.add_pipes(pipes_to_build)
-                        except Exception as e:
-                            _LOGGER.warning(
-                                "WebClient %s: async pipe build failed: %s",
-                                sid, e)
-                    threading.Thread(
-                        target=_bg_build, daemon=True,
-                        name=f"wc-build-{session_id}").start()
-            except Exception as e:
-                _LOGGER.warning(
-                    "WebClient %s: pipe build failed: %s",
-                    session_id, e,
-                )
 
             self.call.register_participant(session_id, type="webclient",
                                            user=user, nonce=nonce,
                                            callback=callback)
 
-            from urllib.parse import urlencode
-            query = urlencode({
-                "base": base_url,
-                "session": session_id,
-                "dsl": sess["dsl"],
-            })
-            iframe_url = f"{base_url}/phone/{nonce}?{query}"
+            iframe_url = f"{base_url}/phone/{nonce}"
             _LOGGER.info("WebClient slot for call %s: %s",
                          self.call.call_id, iframe_url)
             sess["iframe_url"] = iframe_url
@@ -560,7 +504,7 @@ class CallPipeExecutor:
                 cid = elements[cp][1]
                 if not cid:
                     raise ValueError("call requires a call id")
-                if self.call and cid != self.call.call_id:
+                if self.call and expand_for_account(cid, self._account_id) != self.call.call_id:
                     raise ValueError(
                         f"Pipe targets call {cid}, but executor is bound to {self.call.call_id}"
                     )
@@ -622,6 +566,7 @@ class CallPipeExecutor:
 
     def _resolve_call(self, call_id: str):
         """Resolve a call by ID — uses self.call if bound, otherwise registry."""
+        call_id = expand_for_account(call_id, self._account_id)
         if self.call and (not call_id or call_id == self.call.call_id):
             return self.call
         from . import call_state
@@ -727,14 +672,12 @@ class CallPipeExecutor:
 
         # -- vc: voice conversion --
         if typ == "vc":
-            if not elem_id:
-                raise ValueError("vc requires a voice reference")
+            ref_url = params.get("url", "")
+            if not ref_url:
+                raise ValueError("vc requires a url parameter")
             from speech_pipeline.VCConverter import VCConverter
-            from speech_pipeline.FileFetcher import FileFetcher
-            from pathlib import Path
-            here = Path(__file__).resolve().parent.parent.parent
-            tmpl = params.get("soundpath", "../voices/%s.wav")
-            ref = FileFetcher.build_ref(elem_id, tmpl, here)
+            from speech_pipeline.media_refs import resolve_media_ref
+            ref = resolve_media_ref(ref_url, getattr(_shared, "media_folder", None))
             bearer = params.get("bearer", "")
             return VCConverter(ref, bearer=bearer)
 
@@ -746,6 +689,7 @@ class CallPipeExecutor:
         if typ == "codec":
             if not elem_id:
                 raise ValueError("codec requires a session id (e.g. codec:wc-abc)")
+            elem_id = expand_for_account(elem_id, self._account_id)
             from speech_pipeline.CodecSocketSession import (
                 CodecSocketSession, get_session,
             )
@@ -796,6 +740,7 @@ class CallPipeExecutor:
 
         if not leg_id:
             raise ValueError("sip requires a leg id")
+        leg_id = expand_for_account(leg_id, self._account_id)
 
         leg = leg_mod.get_leg(leg_id)
         if not leg:
@@ -827,13 +772,11 @@ class CallPipeExecutor:
 
     def _create_play(self, play_id, params):
         from speech_pipeline.AudioReader import AudioReader
-        url = params.get("url", play_id)
-        if not url:
-            raise ValueError("play requires url")
-        # SSRF check: only allow http(s) URLs to public hosts
-        if url.startswith("http://") or url.startswith("https://"):
-            from speech_pipeline.url_safety import require_safe_url
-            require_safe_url(url)
+        from speech_pipeline.media_refs import resolve_media_ref
+        src_ref = params.get("url", "")
+        if not src_ref:
+            raise ValueError("play requires a url parameter")
+        url = resolve_media_ref(src_ref, getattr(_shared, "media_folder", None))
         volume = params.get("volume", 100)
         stage_id = f"play:{play_id or secrets.token_urlsafe(6)}"
 
@@ -964,9 +907,9 @@ class CallPipeExecutor:
         return tee
 
     def _create_tts(self, voice_name, params):
-        # Allow language shortcut: tts:de → de_DE-thorsten-medium
-        if not voice_name or voice_name == "de":
-            voice_name = "de_DE-thorsten-medium"
+        if voice_name:
+            raise ValueError("tts voice must be passed via JSON params")
+        voice_name = params.get("voice", "") or "de_DE-thorsten-medium"
         if not self._tts_registry:
             raise ValueError("TTS not available")
         voice = self._tts_registry.ensure_loaded(voice_name)

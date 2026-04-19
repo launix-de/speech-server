@@ -132,7 +132,7 @@ async function start() {
   var pipeConfig = {
     pipes: [
       'codec:' + sessionId + ' | resample:48000:16000 | stt:de | ws:ndjson',
-      'ws:text | tts:' + voice + ' | resample:22050:48000 | codec:' + sessionId
+      'ws:text | tts{"voice":"' + voice + '"} | resample:22050:48000 | codec:' + sessionId
     ]
   };
 

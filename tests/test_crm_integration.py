@@ -17,7 +17,7 @@ from unittest.mock import patch, MagicMock
 
 import pytest
 
-from conftest import SUBSCRIBER_ID, create_call
+from conftest import ACCOUNT_ID, SUBSCRIBER_ID, create_call
 from speech_pipeline.telephony import call_state
 
 
@@ -138,7 +138,7 @@ class TestCrmFindExternalLegs:
         filters on (``type == 'sip' && direction == 'inbound'``)."""
         call_id = create_call(client, account)
         try:
-            call = call_state.get_call(call_id)
+            call = call_state.get_call(f"{ACCOUNT_ID}:{call_id}")
             call.register_participant(
                 "leg-fake-123",
                 type="sip",
@@ -202,15 +202,19 @@ class TestCrmWebclientJoin:
                 assert body.get("iframe_url", "").startswith(
                     "https://crm.example.com/phone/"
                 )
+                assert "?" not in body.get("iframe_url", ""), (
+                    f"iframe_url must not expose DSL/base/session query params: {body}"
+                )
 
                 # Slot creation alone must NOT tell the CRM the browser
                 # joined yet.
                 assert not mock_post.called
 
+                browser_nonce = body["iframe_url"].rsplit("/", 1)[-1]
                 resp2 = client.post(
-                    f"/phone/{body['nonce']}/event",
+                    f"/phone/{browser_nonce}/event",
                     data=json.dumps({
-                        "session": body["session_id"],
+                        "session": f"{ACCOUNT_ID}:{body['session_id']}",
                         "event": "answered",
                     }),
                     headers={"Content-Type": "application/json"},
@@ -230,6 +234,7 @@ class TestCrmWebclientJoin:
             payload = _args[1] if len(_args) > 1 else _kwargs.get("payload", {})
             assert "iframe_url" in payload
             assert payload["iframe_url"].startswith("https://crm.example.com/phone/")
+            assert "?" not in payload["iframe_url"]
         finally:
             client.delete(f"/api/calls/{call_id}", headers=account)
 
@@ -315,7 +320,7 @@ class TestCrmOriginate:
             assert "leg_id" in body, f"leg_id missing from response: {body}"
             assert body["leg_id"].startswith("leg-")
             # Leg is registered on the server side.
-            assert leg_mod.get_leg(body["leg_id"]) is not None
+            assert leg_mod.get_leg(f"{ACCOUNT_ID}:{body['leg_id']}") is not None
         finally:
             client.delete(f"/api/calls/{call_id}", headers=account)
 
@@ -383,7 +388,7 @@ class TestLegacyEndpointsRemoved:
     def test_call_has_no_command_queue(self, client, account):
         call_id = create_call(client, account)
         try:
-            call = call_state.get_call(call_id)
+            call = call_state.get_call(f"{ACCOUNT_ID}:{call_id}")
             assert not hasattr(call, "command_queue")
         finally:
             client.delete(f"/api/calls/{call_id}", headers=account)
@@ -410,7 +415,7 @@ class TestCrmDslStringsParse:
         '"busy":"/cb/busy","canceled":"/cb/cancel",'
         '"caller_id":"Anruf CRM"} -> call:call-X',
         # webhooks.fop:58  TTS denial message
-        'tts:de{"text":"Geschlossen","completed":"/cb/tts"} -> call:call-X',
+        'tts{"voice":"de_DE-thorsten-medium","text":"Geschlossen","completed":"/cb/tts"} -> call:call-X',
         # webclient.fop  webclient join (new)
         'webclient:user_42{"callback":"/cb/wc",'
         '"base_url":"https://crm.example.com","call_id":"call-X"}',

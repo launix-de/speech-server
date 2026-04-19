@@ -1,7 +1,7 @@
 """CLI entry point for speech-pipeline.
 
 Usage:
-    speech-pipeline run  "cli:text | tts:de_DE-thorsten-medium | cli:raw"
+    speech-pipeline run  "cli:text | tts{\"voice\":\"de_DE-thorsten-medium\"} | cli:raw"
     speech-pipeline serve [--host HOST] [--port PORT] [--voices-path DIR]
     speech-pipeline sip-bridge [--extension EXT] [--voice VOICE] [--lang LANG]
     speech-pipeline voices [--voices-path DIR]
@@ -52,6 +52,7 @@ def cmd_serve(args: argparse.Namespace) -> None:
         soundpath=getattr(args, "soundpath", "../voices/%s.wav"),
         bearer=getattr(args, "bearer", ""),
         whisper_model=getattr(args, "whisper_model", "small"),
+        media_folder=getattr(args, "media_folder", None),
         admin_token=getattr(args, "admin_token", ""),
         debug=args.debug,
         voice_ttl_seconds=7200,
@@ -107,10 +108,11 @@ def main() -> None:
 
     # --- run ---
     p_run = sub.add_parser("run", help="Run a pipeline from DSL string")
-    p_run.add_argument("pipeline", help='Pipeline DSL, e.g. "cli:text | tts:voice | cli:raw"')
+    p_run.add_argument("pipeline", help='Pipeline DSL, e.g. "cli:text | tts{\\"voice\\":\\"de_DE-thorsten-medium\\"} | cli:raw"')
     p_run.add_argument("--voices-path", default="voices-piper")
     p_run.add_argument("--cuda", action="store_true")
     p_run.add_argument("--whisper-model", default="small")
+    p_run.add_argument("--media-folder", default=None)
 
     # --- serve ---
     p_serve = sub.add_parser("serve", help="Start the HTTP/WS server")
@@ -119,7 +121,9 @@ def main() -> None:
     p_serve.add_argument("--voices-path", default="voices-piper")
     p_serve.add_argument("--cuda", action="store_true")
     p_serve.add_argument("--whisper-model", default="small")
-    p_serve.add_argument("--soundpath", default="../voices/%s.wav")
+    p_serve.add_argument("--media-folder", default=None)
+    p_serve.add_argument("--soundpath", default="../voices/%s.wav",
+                         help="Deprecated legacy voice-ref template. Prefer JSON params with URLs or --media-folder filenames.")
     p_serve.add_argument("--bearer", default="")
     p_serve.add_argument("--admin-token", default="", help="Bearer token to enable /api/ pipeline control")
 

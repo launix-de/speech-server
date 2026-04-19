@@ -98,6 +98,7 @@ def app():
 
     import speech_pipeline.telephony._shared as _shared
     _shared.flask_app = app
+    _shared.media_folder = str(__import__("pathlib").Path(__file__).resolve().parents[1])
 
     yield app
 
@@ -118,6 +119,7 @@ def app():
     auth._nonces.clear()
     subscriber._subscribers.clear()
     subscriber._did_map.clear()
+    _shared.media_folder = None
     subscriber._sip_domain_map.clear()
     pbx._pbx_list.clear()
     from speech_pipeline import live_pipeline
@@ -189,7 +191,7 @@ def account2(client, admin):
 # ---------------------------------------------------------------------------
 
 def create_call(client, headers, subscriber_id=SUBSCRIBER_ID):
-    """Create a call via the API and return its call_id."""
+    """Create a call via the API and return its public/API call_id."""
     resp = client.post("/api/calls",
                        data=json.dumps({"subscriber_id": subscriber_id}),
                        headers=headers)

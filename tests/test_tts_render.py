@@ -71,7 +71,7 @@ class TestRenderEndpoint:
 
         resp = client.post("/api/pipelines/render",
                            data=json.dumps({
-                               "dsl": 'tts:de_DE-thorsten-medium{"text":"Hallo Welt"}'
+                               "dsl": 'tts{"voice":"de_DE-thorsten-medium","text":"Hallo Welt"}'
                            }),
                            headers=account)
         assert resp.status_code == 200
@@ -81,6 +81,31 @@ class TestRenderEndpoint:
         pcm, rate = _parse_wav_response(resp)
         assert rate == 22050
         assert len(pcm) > 0
+
+    def test_render_tts_uses_default_voice(self, client, account):
+        if not _has_tts():
+            pytest.skip("No TTS voices")
+        _ensure_tts_registry()
+
+        resp = client.post("/api/pipelines/render",
+                           data=json.dumps({
+                               "dsl": 'tts{"text":"Hallo Welt"}'
+                           }),
+                           headers=account)
+        assert resp.status_code == 200
+        assert resp.content_type == "audio/wav"
+
+    def test_render_rejects_legacy_tts_voice_in_id(self, client, account):
+        if not _has_tts():
+            pytest.skip("No TTS voices")
+        _ensure_tts_registry()
+
+        resp = client.post("/api/pipelines/render",
+                           data=json.dumps({
+                               "dsl": 'tts:de_DE-thorsten-medium{"text":"Hallo Welt"}'
+                           }),
+                           headers=account)
+        assert resp.status_code == 400
 
     def test_render_rejects_sip(self, client, account):
         resp = client.post("/api/pipelines/render",
@@ -121,7 +146,7 @@ class TestTTSReference:
 
         resp = client.post("/api/pipelines/render",
                            data=json.dumps({
-                               "dsl": 'tts:de_DE-thorsten-medium{"text":"Hallo, das ist ein Test."}'
+                               "dsl": 'tts{"voice":"de_DE-thorsten-medium","text":"Hallo, das ist ein Test."}'
                            }),
                            headers=account)
         assert resp.status_code == 200
@@ -161,7 +186,7 @@ class TestTTSReference:
 
         resp = client.post("/api/pipelines/render",
                            data=json.dumps({
-                               "dsl": 'tts:de_DE-thorsten-medium{"text":"Test mit Pitch"} | pitch:3.0'
+                               "dsl": 'tts{"voice":"de_DE-thorsten-medium","text":"Test mit Pitch"} | pitch:3.0'
                            }),
                            headers=account)
         assert resp.status_code == 200
@@ -179,12 +204,12 @@ class TestTTSReference:
 
         resp_a = client.post("/api/pipelines/render",
                              data=json.dumps({
-                                 "dsl": 'tts:de_DE-thorsten-medium{"text":"Hallo, das ist ein Test."}'
+                                 "dsl": 'tts{"voice":"de_DE-thorsten-medium","text":"Hallo, das ist ein Test."}'
                              }),
                              headers=account)
         resp_b = client.post("/api/pipelines/render",
                              data=json.dumps({
-                                 "dsl": 'tts:de_DE-thorsten-medium{"text":"Guten Morgen, wie geht es Ihnen?"}'
+                                 "dsl": 'tts{"voice":"de_DE-thorsten-medium","text":"Guten Morgen, wie geht es Ihnen?"}'
                              }),
                              headers=account)
         assert resp_a.status_code == 200
@@ -212,23 +237,30 @@ class TestTTSVCPitchChain:
             pytest.skip("No TTS voices")
         _ensure_tts_registry()
 
-        # VC needs a voice reference WAV — use an existing one
+        # VC target may be given as a filename relative to media_folder.
         vc_ref = os.path.join(VOICES_PATH, "de_DE-thorsten-high.onnx")
         if not os.path.exists(vc_ref):
             pytest.skip("No VC reference voice available")
 
-        resp = client.post("/api/pipelines/render",
-                           data=json.dumps({
-                               "dsl": 'tts:de_DE-thorsten-medium{"text":"Voice Conversion Test"} '
-                                      '| vc:de_DE-thorsten-high | pitch:2.0'
-                           }),
-                           headers=account)
-        # VC might fail if model not available — that's OK for now
-        if resp.status_code == 400 and "vc" in resp.data.decode().lower():
-            pytest.skip("VC not available in test environment")
+        import speech_pipeline.telephony._shared as _shared
+        old_media_folder = _shared.media_folder
+        _shared.media_folder = VOICES_PATH
 
-        assert resp.status_code == 200
-        pcm, rate = _parse_wav_response(resp)
-        samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float64)
-        rms = float(np.sqrt(np.mean(samples ** 2)))
-        assert rms > 100, f"TTS+VC+pitch output RMS={rms:.0f} — no audio"
+        try:
+            resp = client.post("/api/pipelines/render",
+                               data=json.dumps({
+                                   "dsl": 'tts{"voice":"de_DE-thorsten-medium","text":"Voice Conversion Test"} '
+                                          '| vc{"url":"de_DE-thorsten-high.onnx"} | pitch:2.0'
+                               }),
+                               headers=account)
+            # VC might fail if model not available — that's OK for now
+            if resp.status_code == 400 and "vc" in resp.data.decode().lower():
+                pytest.skip("VC not available in test environment")
+
+            assert resp.status_code == 200
+            pcm, rate = _parse_wav_response(resp)
+            samples = np.frombuffer(pcm, dtype=np.int16).astype(np.float64)
+            rms = float(np.sqrt(np.mean(samples ** 2)))
+            assert rms > 100, f"TTS+VC+pitch output RMS={rms:.0f} — no audio"
+        finally:
+            _shared.media_folder = old_media_folder

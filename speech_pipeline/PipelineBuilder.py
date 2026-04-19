@@ -6,6 +6,7 @@ import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 from .base import Stage
+from .telephony.id_scope import local_id
 
 _LOGGER = logging.getLogger("pipeline-builder")
 
@@ -21,11 +22,13 @@ def inject_conference_mixers(builder: "PipelineBuilder", dsl: str) -> None:
     try:
         from .telephony.webclient import get_mixer_for_session
         from .telephony.call_state import get_call
-        for sid in re.findall(r'codec:(wc-[^\s|]+)', dsl):
+        for sid in re.findall(r'codec:([^\s|]+)', dsl):
+            sid = local_id(sid)
             mixer_name, mixer = get_mixer_for_session(sid)
             if mixer and mixer_name:
                 builder._mixers[mixer_name] = mixer
-        for call_id in re.findall(r'conference:(call-[^\s|:]+)', dsl):
+        for call_id in re.findall(r'conference:([^\s|]+)', dsl):
+            call_id = local_id(call_id)
             call = get_call(call_id)
             if call:
                 builder._mixers[call_id] = call.mixer
@@ -78,9 +81,9 @@ class PipelineBuilder:
         cli:ndjson  CLI stdout NDJSON sink
         resample    SampleRateConverter  (resample:FROM:TO)
         stt         WhisperTranscriber   (stt:LANG)
-        tts         StreamingTTSProducer (tts:VOICE)
+        tts         StreamingTTSProducer (tts{"voice":"VOICE"})
         sip         SIPSource/SIPSink    (sip:TARGET)
-        vc          VCConverter          (vc:VOICE2)
+        vc          VCConverter          (vc{"url":"https://..."})
         pitch       PitchAdjuster        (pitch:ST)
         record      FileRecorder sidechain (record:FILE or record:FILE:RATE)
         tee         AudioTee feeding a named mixer (tee:NAME)
@@ -100,17 +103,28 @@ class PipelineBuilder:
         self._codec_sessions: Dict[str, Any] = {}  # id -> CodecSocketSession
         self._named_queues: Dict[str, Any] = {}  # name -> queue.Queue
 
-    def parse(self, pipe_str: str) -> List[Tuple[str, List[str]]]:
-        """Parse ``'a:x:y | b:z | c'`` into ``[('a', ['x','y']), ('b', ['z']), ('c', [])]``."""
+    def parse(self, pipe_str: str) -> List[Tuple[str, List[str], Dict[str, Any]]]:
+        """Parse ``'a:x:y | b:z | c'`` plus optional inline JSON params.
+
+        Examples:
+            ``tts{"voice":"de_DE-thorsten-medium"}``
+            ``vc{"url":"https://cdn.example.com/voice.wav"}``
+            ``play:hold{"url":"https://cdn.example.com/hold.mp3"}``
+        """
         elements = []
         for part in pipe_str.split("|"):
             part = part.strip()
             if not part:
                 continue
-            tokens = part.split(":")
+            json_params: Dict[str, Any] = {}
+            if "{" in part:
+                head, json_blob = part.split("{", 1)
+                part = head.strip()
+                json_params = json.loads("{" + json_blob)
+            tokens = part.split(":") if part else []
             typ = tokens[0].strip()
             params = [t.strip() for t in tokens[1:]]
-            elements.append((typ, params))
+            elements.append((typ, params, json_params))
         return elements
 
     def build(self, pipe_str: str) -> PipelineRun:
@@ -126,7 +140,7 @@ class PipelineBuilder:
         # For text iterators (not Stage subclasses)
         current_text_iter = None
 
-        for i, (typ, params) in enumerate(elements):
+        for i, (typ, params, json_params) in enumerate(elements):
             is_first = (i == 0)
             is_last = (i == len(elements) - 1)
 
@@ -278,10 +292,9 @@ class PipelineBuilder:
 
             elif typ == "tts":
                 from .StreamingTTSProducer import StreamingTTSProducer
-                voice_id = params[0] if params else None
-                if not voice_id:
-                    # Use server default
-                    voice_id = sorted(self.registry.index.keys())[0] if self.registry.index else None
+                if params:
+                    raise ValueError("tts voice must be passed via JSON params")
+                voice_id = json_params.get("voice") or "de_DE-thorsten-medium"
                 if not voice_id:
                     raise ValueError("tts: no voice specified and no default available")
                 voice = self.registry.ensure_loaded(voice_id)
@@ -329,13 +342,11 @@ class PipelineBuilder:
 
             elif typ == "vc":
                 from .VCConverter import VCConverter
-                voice2 = params[0] if params else None
-                if not voice2:
-                    raise ValueError("vc requires a target voice ID")
-                from .FileFetcher import FileFetcher
-                here = __import__("pathlib").Path(__file__).resolve().parent.parent
-                tmpl = getattr(self.args, "soundpath", "../voices/%s.wav")
-                ref = FileFetcher.build_ref(voice2, tmpl, here)
+                ref_url = json_params.get("url", "")
+                if not ref_url:
+                    raise ValueError("vc requires a url parameter")
+                from .media_refs import resolve_media_ref
+                ref = resolve_media_ref(ref_url, getattr(self.args, "media_folder", None))
                 bearer = getattr(self.args, "bearer", "")
                 stage = VCConverter(ref, bearer=bearer)
                 if current_stage:
@@ -719,7 +730,7 @@ class PipelineBuilder:
         """Register all stages and edges from a built PipelineRun in the LivePipeline."""
         lp = self.live_pipeline
         # Map element types to stages by position
-        elem_types = {i: f"{t}:{':'.join(p)}" if p else t for i, (t, p) in enumerate(elements)}
+        elem_types = {i: f"{t}:{':'.join(p)}" if p else t for i, (t, p, _) in enumerate(elements)}
         for i, stage in enumerate(run.stages):
             typ = elem_types.get(i, "unknown")
             lp.add_stage(stage, typ)

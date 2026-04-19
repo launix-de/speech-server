@@ -154,6 +154,7 @@ def create_app(args: argparse.Namespace) -> Flask:
         import speech_pipeline.telephony._shared as _tel_shared
         _tel_shared.tts_registry = registry
         _tel_shared.flask_app = app
+        _tel_shared.media_folder = getattr(args, "media_folder", None)
 
         # WebClient: phone UI + WebSocket
         from speech_pipeline.telephony.webclient import bp as webclient_bp
@@ -641,8 +642,8 @@ def create_app(args: argparse.Namespace) -> Flask:
                 if v is not None:
                     payload[k] = v
         text = (str(payload.get("text") or "")).strip()
-        voice2 = (str(payload.get("voice2") or "")).strip()  # target timbre id for VC
-        sound = (str(payload.get("sound") or "")).strip()    # source audio id from voices folder
+        voice2 = (str(payload.get("voice2") or "")).strip()  # target VC reference (URL or media-folder filename)
+        sound = (str(payload.get("sound") or "")).strip()    # source audio (URL or media-folder filename)
         # Require either text or sound; otherwise return generic 400 without hints
         if (not text) and (not sound):
             return ("bad request", 400, {"Content-Type": "text/plain"})
@@ -697,30 +698,20 @@ def create_app(args: argparse.Namespace) -> Flask:
                      len(text), model_id, (voice2 or '-'), (sound or '-'),
                      payload.get('pitch_st'), payload.get('pitch_factor'), pitch_disable)
 
-        # ID validator to prevent path/URL hijacking
-        def _valid_id(s: str) -> bool:
-            if not s:
-                return False
-            if any(ch in s for ch in ('/', '&')):
-                return False
-            # Strict allowlist: alnum, underscore, dash, dot
-            import re as _re
-            return bool(_re.fullmatch(r'[A-Za-z0-9_.\-]{1,128}', s))
+        from speech_pipeline.media_refs import resolve_media_ref
 
-        # no resolver here: validate IDs; build absolute/URL refs via FileFetcher.build_ref
-
-        # Download helper is now provided by stages.FileFetcher.fetch_to_temp
+        def _resolve_media_arg(raw: str, field: str) -> str:
+            try:
+                return resolve_media_ref(raw, getattr(args, "media_folder", None))
+            except ValueError as e:
+                raise ValueError(f"{field}: {e}") from e
 
         # If 'sound' is provided: stream a WAV from voices/ optionally through VC to target 'voice2'
         if sound:
-            if not _valid_id(sound):
-                return ("bad request", 400, {"Content-Type": "text/plain"})
-            # Validate and resolve to ref
-            here = Path(__file__).resolve().parent
-            if not _valid_id(sound):
-                return ("bad request", 400, {"Content-Type": "text/plain"})
-            tmpl = args.soundpath if hasattr(args, 'soundpath') else "../voices/%s.wav"
-            value_s = FileFetcher.build_ref(sound, tmpl, here)
+            try:
+                value_s = _resolve_media_arg(sound, "sound")
+            except ValueError as e:
+                return (str(e), 400, {"Content-Type": "text/plain"})
             # If no voice2, shortcut via FileFetcher -> RawResponseWriter (no resample, raw passthrough)
             if not voice2:
                 src_ref = value_s
@@ -779,22 +770,10 @@ def create_app(args: argparse.Namespace) -> Flask:
                 return resp
 
             # With voice2: convert whole file using VC stage (passes through if unavailable)
-            if not _valid_id(voice2):
-                return ("bad request", 400, {"Content-Type": "text/plain"})
-            # Resolve target reference (URL or file path string)
-            here = Path(__file__).resolve().parent
-            if not _valid_id(voice2):
-                return ("bad request", 400, {"Content-Type": "text/plain"})
-            tmpl = args.soundpath if hasattr(args, 'soundpath') else "../voices/%s.wav"
-            value_t = FileFetcher.build_ref(voice2, tmpl, here)
-            # Resolve source based on soundpath
-            if not _valid_id(sound):
-                return ("bad request", 400, {"Content-Type": "text/plain"})
-            here = Path(__file__).resolve().parent
-            if not _valid_id(sound):
-                return ("bad request", 400, {"Content-Type": "text/plain"})
-            tmpl = args.soundpath if hasattr(args, 'soundpath') else "../voices/%s.wav"
-            value_s = FileFetcher.build_ref(sound, tmpl, here)
+            try:
+                value_t = _resolve_media_arg(voice2, "voice2")
+            except ValueError as e:
+                return (str(e), 400, {"Content-Type": "text/plain"})
             src_ref = value_s
             _LOGGER.info("SOUND+VC: source ref=%s target ref=%s (downloading if http)", src_ref, value_t)
             source = AudioReader(src_ref, bearer=getattr(args, 'bearer', ''))
@@ -825,13 +804,10 @@ def create_app(args: argparse.Namespace) -> Flask:
 
         # 2) If voice2 requested, run VC; stage handles passthrough if VC unavailable
         if voice2:
-            if not _valid_id(voice2):
-                return ("bad request", 400, {"Content-Type": "text/plain"})
-            here = Path(__file__).resolve().parent
-            if not _valid_id(voice2):
-                return ("bad request", 400, {"Content-Type": "text/plain"})
-            tmpl = args.soundpath if hasattr(args, 'soundpath') else "../voices/%s.wav"
-            value_t = FileFetcher.build_ref(voice2, tmpl, here)
+            try:
+                value_t = _resolve_media_arg(voice2, "voice2")
+            except ValueError as e:
+                return (str(e), 400, {"Content-Type": "text/plain"})
             # Build pipeline: TTSProducer -> VC -> Pitch -> Writer
             _LOGGER.info("TTS+VC: target ref=%s (downloading if http)", value_t)
             source = registry.create_tts_stream(model_id, text, {"sentence_silence": sentence_silence, "chunk_seconds": CHUNKSIZE_SECONDS, "speaker": payload.get("speaker"), "speaker_id": payload.get("speaker_id"), "length_scale": payload.get("length_scale"), "noise_scale": payload.get("noise_scale"), "noise_w_scale": payload.get("noise_w_scale")} )
@@ -1204,7 +1180,7 @@ def create_app(args: argparse.Namespace) -> Flask:
             {"pipe": "ws:pcm | resample:48000:16000 | stt:de | ws:ndjson"}
           or for duplex:
             {"pipes": ["sip:100@pbx | resample:8000:16000 | stt:de | ws:ndjson",
-                        "ws:text | tts:de_DE-thorsten-medium | resample:24000:8000 | sip:100@pbx"]}
+                        "ws:text | tts{\"voice\":\"de_DE-thorsten-medium\"} | resample:24000:8000 | sip:100@pbx"]}
         - Then data flows according to the pipeline definition.
         """
         import json as _json
@@ -1445,7 +1421,8 @@ def main() -> None:
     parser.add_argument("--scan-dir", help="(legacy) Single directory to scan for *.onnx voices; same as --voices-path")
     parser.add_argument("--cuda", action="store_true", help="Use GPU")
     parser.add_argument("--sentence-silence", type=float, default=0.0, help="Seconds of silence between sentences")
-    parser.add_argument("--soundpath", default="../voices/%s.wav", help="Template for sound/voice2 source. Use %s placeholder for id. Supports file paths or http(s) URLs.")
+    parser.add_argument("--media-folder", default=None, help="Folder for relative play/vc media names. URLs remain allowed; '../' is rejected.")
+    parser.add_argument("--soundpath", default="../voices/%s.wav", help="Deprecated voice-ref template. Prefer JSON params with URLs or --media-folder filenames.")
     parser.add_argument("--bearer", default="", help="Bearer token for authorizing remote (http/https) downloads/streams")
     parser.add_argument("--whisper-model", default="base", help="Whisper model size for STT (default: base)")
     parser.add_argument("--admin-token", default="", help="Bearer token to enable the /api/ pipeline control endpoints")

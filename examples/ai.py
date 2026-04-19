@@ -10,7 +10,7 @@ Pipelines per room:
      codec:{session} | tee:stt | conference:{call} | codec:{session}
      mix:stt | stt:de | webhook:http://localhost:PORT/stt
   2. Streaming TTS (created via pipeline API):
-     text_input | tts:VOICE | conference:CALL_ID
+     text_input | tts{"voice":"VOICE"} | conference:CALL_ID
      Text fed via POST /api/pipelines/<pid>/input
 
 Usage:
@@ -185,7 +185,9 @@ def create_webclient_slot(room: Room) -> str:
 
 def create_tts_pipeline(room: Room) -> str | None:
     """Create a streaming TTS pipeline via the pipeline API."""
-    dsl = f"text_input | tts:{VOICE} | conference:{room.call_id}"
+    dsl = (
+        f'text_input | tts{{"voice":"{VOICE}"}} | conference:{room.call_id}'
+    )
     result = piper("POST", "/api/pipelines", {"dsl": dsl})
     pid = result.get("id")
     if pid:

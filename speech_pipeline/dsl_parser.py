@@ -6,11 +6,11 @@ Separator: ``->`` or ``|``
 Examples::
 
     sip:leg1{"completed":"/cb"} -> call:call-xxx -> sip:leg1
-    play:hold{"url":"music.mp3","loop":true} -> call:call-xxx
-    tts:de{"text":"Hallo"} -> call:call-xxx
+    play:hold{"url":"https://cdn.example.com/music.mp3","loop":true} -> call:call-xxx
+    tts{"voice":"de_DE-thorsten-medium","text":"Hallo"} -> call:call-xxx
     tee:tap -> stt:de -> webhook:https://example.com/stt
     codec:wc-abc | tee:stt | conference:call-xxx | codec:wc-abc
-    text_input | tts:de_DE-thorsten-medium | conference:call-xxx
+    text_input | tts{"voice":"de_DE-thorsten-medium"} | conference:call-xxx
 """
 from __future__ import annotations
 

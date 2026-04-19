@@ -16,6 +16,7 @@ _LOGGER = logging.getLogger("telephony.shared")
 # Set by piper_multi_server.py during create_app()
 tts_registry: Optional[Any] = None  # TTSRegistry
 flask_app: Optional[Any] = None
+media_folder: Optional[str] = None
 
 
 def subscriber_url(sub: dict, path: str) -> str:

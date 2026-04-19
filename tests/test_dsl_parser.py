@@ -66,8 +66,16 @@ class TestDSLJSONParams:
         assert result[0][2] == {"url": "https://example.com/a.wav", "loop": True}
 
     def test_nested_json(self):
-        result = parse_dsl('tts:de{"text":"Hallo","opts":{"speed":1.2}}')
+        result = parse_dsl('tts{"voice":"de_DE-thorsten-medium","text":"Hallo","opts":{"speed":1.2}}')
         assert result[0][2]["opts"]["speed"] == 1.2
+
+    def test_tts_voice_in_params(self):
+        result = parse_dsl('tts{"voice":"de_DE-thorsten-medium","text":"Hallo"}')
+        assert result == [("tts", "", {"voice": "de_DE-thorsten-medium", "text": "Hallo"})]
+
+    def test_vc_url_in_params(self):
+        result = parse_dsl('vc{"url":"https://cdn.example.com/voice.wav"}')
+        assert result == [("vc", "", {"url": "https://cdn.example.com/voice.wav"})]
 
     def test_json_with_numbers(self):
         result = parse_dsl('play:x{"volume":80,"loop":3}')
@@ -83,7 +91,7 @@ class TestDSLJSONParams:
         assert result[0][2] == {}
 
     def test_json_with_escaped_quotes(self):
-        result = parse_dsl(r'tts:de{"text":"Er sagte \"Hallo\""}')
+        result = parse_dsl(r'tts{"voice":"de_DE-thorsten-medium","text":"Er sagte \"Hallo\""}')
         assert '"Hallo"' in result[0][2]["text"]
 
     def test_json_params_then_arrow(self):
@@ -130,8 +138,8 @@ class TestDSLAllElementTypes:
         assert result == [("pitch", "3.5", {})]
 
     def test_vc(self):
-        result = parse_dsl("vc:target_voice")
-        assert result == [("vc", "target_voice", {})]
+        result = parse_dsl('vc{"url":"https://cdn.example.com/target.wav"}')
+        assert result == [("vc", "", {"url": "https://cdn.example.com/target.wav"})]
 
     def test_record(self):
         result = parse_dsl('record:output.wav{"rate":16000}')
@@ -142,10 +150,10 @@ class TestDSLAllElementTypes:
         assert result == [("conference", "call-abc123", {})]
 
     def test_text_input(self):
-        result = parse_dsl("text_input | tts:de_DE-thorsten-medium")
+        result = parse_dsl('text_input | tts{"voice":"de_DE-thorsten-medium"}')
         assert len(result) == 2
         assert result[0] == ("text_input", "", {})
-        assert result[1] == ("tts", "de_DE-thorsten-medium", {})
+        assert result[1] == ("tts", "", {"voice": "de_DE-thorsten-medium"})
 
     def test_codec(self):
         result = parse_dsl("codec:wc-session123")
@@ -158,7 +166,7 @@ class TestDSLAllElementTypes:
         assert result[2] == ("ws", "ndjson", {})
 
     def test_cli(self):
-        result = parse_dsl("cli:text | tts:de | cli:raw")
+        result = parse_dsl('cli:text | tts{"voice":"de_DE-thorsten-medium"} | cli:raw')
         assert len(result) == 3
         assert result[0] == ("cli", "text", {})
         assert result[2] == ("cli", "raw", {})
@@ -201,12 +209,12 @@ class TestDSLAllElementTypes:
         assert result[0][2]["volume"] == 50
 
     def test_tts_announcement_pipe(self):
-        dsl = 'tts:de{"text":"Bitte warten Sie."} -> call:call-xyz'
+        dsl = 'tts{"voice":"de_DE-thorsten-medium","text":"Bitte warten Sie."} -> call:call-xyz'
         result = parse_dsl(dsl)
         assert result[0][2]["text"] == "Bitte warten Sie."
 
     def test_streaming_tts_pipeline(self):
-        dsl = "text_input | tts:de_DE-thorsten-medium | conference:call-xyz"
+        dsl = 'text_input | tts{"voice":"de_DE-thorsten-medium"} | conference:call-xyz'
         result = parse_dsl(dsl)
         assert len(result) == 3
         assert result[0][0] == "text_input"

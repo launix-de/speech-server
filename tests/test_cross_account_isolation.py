@@ -79,10 +79,12 @@ class TestCrossAccountPipelineMutation:
                                 headers=account).get_json()["call_id"]
         try:
             resp = client.post("/api/pipelines",
-                                data=json.dumps({
-                                    "dsl": f"tts:de_DE-thorsten-medium"
-                                           f'{{"text":"hi"}} -> call:{call_sid}',
-                                }),
+                data=json.dumps({
+                    "dsl": (
+                        f'tts{{"voice":"de_DE-thorsten-medium","text":"hi"}} '
+                        f'-> call:{call_sid}'
+                    ),
+                }),
                                 headers=account2)
             assert resp.status_code in (403, 404), (
                 f"Account 2 was able to POST a pipeline into account "

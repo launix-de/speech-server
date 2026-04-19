@@ -13,17 +13,30 @@ the routes registered directly on the main ``app`` (not via blueprint).
 from __future__ import annotations
 
 import argparse
-import importlib
-from types import SimpleNamespace
+import importlib.util
+import sys
+from pathlib import Path
 
 import pytest
+
+
+def _load_main_module():
+    root = Path(__file__).resolve().parents[1]
+    module_path = root / "piper_multi_server.py"
+    if str(root) not in sys.path:
+        sys.path.insert(0, str(root))
+    spec = importlib.util.spec_from_file_location("piper_multi_server", module_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules["piper_multi_server"] = module
+    assert spec.loader is not None
+    spec.loader.exec_module(module)
+    return module
 
 
 @pytest.fixture(scope="module")
 def main_app():
     """Build the real ``piper_multi_server`` app with minimal args."""
-    import piper_multi_server as pms
-    importlib.reload(pms)  # pick up the module fresh
+    pms = _load_main_module()
 
     args = argparse.Namespace(
         host="127.0.0.1",
@@ -34,6 +47,7 @@ def main_app():
         cuda=False,
         sentence_silence=0.0,
         soundpath="../voices/%s.wav",
+        media_folder=str(Path(__file__).resolve().parents[1]),
         bearer="",
         whisper_model="base",
         admin_token="test-admin-token",
@@ -58,7 +72,8 @@ class TestBootstrapCompiles:
     entrypoint."""
 
     def test_module_imports(self):
-        import piper_multi_server  # noqa: F401
+        mod = _load_main_module()
+        assert mod is not None
 
     def test_create_app_succeeds(self, main_app):
         assert main_app is not None
@@ -95,3 +110,27 @@ class TestCoreRoutes:
         """Removed in an earlier hardening — guard against re-introduction."""
         resp = main_client.post("/inputstream")
         assert resp.status_code == 404
+
+    def test_root_sound_rejects_parent_traversal(self, main_client):
+        resp = main_client.post(
+            "/",
+            json={"sound": "../secret.wav"},
+        )
+        assert resp.status_code == 400
+        assert b"must not contain" in resp.data
+
+    def test_root_sound_accepts_media_folder_file(self, main_client):
+        resp = main_client.post(
+            "/",
+            json={"sound": "examples/queue.mp3"},
+        )
+        assert resp.status_code == 200
+        assert len(resp.data) > 100
+
+    def test_root_vc_rejects_parent_traversal(self, main_client):
+        resp = main_client.post(
+            "/",
+            json={"sound": "examples/queue.mp3", "voice2": "../secret.wav"},
+        )
+        assert resp.status_code == 400
+        assert b"must not contain" in resp.data

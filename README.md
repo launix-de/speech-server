@@ -5,7 +5,7 @@ A composable, real-time speech processing toolkit for Python. Build text-to-spee
 Stages snap together like UNIX pipes. Format conversion (sample rate, encoding) is automatic. Streaming is the default: audio plays as it is synthesized, transcriptions arrive as words are spoken.
 
 ```
-echo "Hallo Welt" | speech-pipeline run "cli:text | tts:de_DE-thorsten-medium | cli:raw" > out.raw
+echo "Hallo Welt" | speech-pipeline run 'cli:text | tts{"voice":"de_DE-thorsten-medium"} | cli:raw' > out.raw
 ```
 
 ## Key Features
@@ -18,7 +18,7 @@ echo "Hallo Welt" | speech-pipeline run "cli:text | tts:de_DE-thorsten-medium | 
 
 **Pitch Adjustment** -- Formant-preserving pitch shifting via ffmpeg rubberband. Auto-estimated from source/target F0 or set explicitly in semitones.
 
-**Unified Pipeline DSL** -- One DSL for everything: `sip:leg1 -> call:conf1 -> sip:leg1` for telephony, `text_input | tts:voice | conference:call1` for streaming TTS, `tts:de{"text":"Hallo"} | pitch:2.0` for offline rendering. All through a single REST API.
+**Unified Pipeline DSL** -- One DSL for everything: `sip:leg1 -> call:conf1 -> sip:leg1` for telephony, `text_input | tts{"voice":"de_DE-thorsten-medium"} | conference:call1` for streaming TTS, `tts{"voice":"de_DE-thorsten-medium","text":"Hallo"} | pitch:2.0` for offline rendering. All through a single REST API.
 
 **Telephony Platform** -- Multi-tenant conferencing with PBX management, SIP legs (PCMU, PCMA, G722, Opus), browser participants, hold music, DTMF, live STT, and webhook-driven call control.
 
@@ -52,7 +52,7 @@ speech-pipeline serve --admin-token SECRET --voices-path voices-piper
 speech-pipeline voices --voices-path voices-piper
 
 # Synthesize from the command line
-echo "Hallo Welt" | speech-pipeline run "cli:text | tts:de_DE-thorsten-medium | cli:raw" > out.raw
+echo "Hallo Welt" | speech-pipeline run 'cli:text | tts{"voice":"de_DE-thorsten-medium"} | cli:raw' > out.raw
 ```
 
 ## Library Usage
@@ -208,7 +208,7 @@ API.
 
 ```bash
 # Run a pipeline from a DSL string
-speech-pipeline run "cli:text | tts:de_DE-thorsten-medium | cli:raw"
+speech-pipeline run 'cli:text | tts{"voice":"de_DE-thorsten-medium"} | cli:raw'
 
 # Start the HTTP/WebSocket server with API
 speech-pipeline serve --admin-token SECRET --voices-path voices-piper
@@ -222,84 +222,376 @@ speech-pipeline voices --voices-path voices-piper
 
 ## Pipeline DSL
 
-All pipeline operations use a single DSL. Separators `->` and `|` are interchangeable. Each element has the form `type`, `type:id`, or `type:id{json_params}`.
+All pipeline operations use one DSL. Separators `->` and `|` are interchangeable.
 
-### Element Reference
+### Syntax Rules
 
-| Type | ID | JSON Params | Description |
-|------|-----|-------------|-------------|
-| `sip` | leg_id | `{completed, dtmf}` | SIP leg source/sink (bidirectional in `sip:L -> call:C -> sip:L`) |
-| `call` | call_id | -- | Conference participant (ConferenceLeg with mix-minus) |
-| `conference` | call_id | -- | Alias for `call` |
-| `play` | stage_name | `{url, loop, volume, completed}` | Audio playback from URL into conference or SIP leg |
-| `tts` | voice | `{text}` | TTS: fixed text with `{"text":"..."}`, or streaming from upstream `text_input` |
-| `stt` | language | `{model, chunk}` | Speech-to-text via Whisper |
-| `tee` | tee_id | -- | Audio splitter for sidechains (`tee:tap -> stt:de -> webhook:URL`) |
-| `webhook` | url | `{bearer}` | POST NDJSON to HTTP endpoint (terminal) |
-| `text_input` | -- | -- | Queue-backed text source for API-driven streaming TTS |
-| `gain` | factor | -- | Volume adjustment (1.0 = unity) |
-| `delay` | ms | -- | Audio delay line |
-| `pitch` | semitones | -- | Pitch shift (formant-preserving) |
-| `vc` | voice_ref | -- | Voice conversion via FreeVC |
-| `save` | name | `{rate, format}` | Record to managed download URL (returns via webhook) |
-| `answer` | leg_id | -- | Send SIP 200 OK on inbound leg (single-element action) |
-| `originate` | number | `{ringing, answered, completed, ...}` | Dial outbound (2-elem pipe: `originate:N{cb} -> call:C`) |
-| `webclient` | user | `{callback, base_url}` | Create webclient session + iframe URL (single action) |
-| `ws` | mode | -- | WebSocket source/sink (`ws:pcm`, `ws:text`, `ws:ndjson`) |
-| `cli` | mode | -- | CLI stdin/stdout (`cli:text`, `cli:raw`, `cli:ndjson`) |
-| `codec` | session_id | `{profile}` | Fourier codec WebSocket source/sink |
-| `mix` | mixer_name | `{rate}` | Named mixer source |
-| `mixminus` | queue_name | -- | Subtract own audio from full mix |
+Every element is one of:
+- `type`
+- `type:id`
+- `type:id{json_params}`
 
-### Example DSL Pipelines
+Important rules:
+- The part after `:` is the element ID or mode, not an extra parameter bag.
+- Structured parameters belong into the JSON object.
+- `tts` voice selection is JSON-only: `tts{"voice":"..."}`. `tts:VOICE` is rejected.
+- `play` and `vc` media references are JSON-only: `{"url":"..."}`.
+- `play` and `vc` URLs must be absolute `http(s)` URLs, or filenames relative to `--media-folder`.
+- `../`, `./`, absolute filesystem paths, and escaping out of `--media-folder` are rejected.
 
-**Telephony (via REST API):**
+### DSL Reference
+
+#### `sip:LEG_ID{...}`
+Bidirectional SIP leg endpoint.
+
+Syntax:
+```text
+sip:LEG_ID
+sip:LEG_ID{"completed":"/cb","dtmf":"/cb"}
 ```
-# Bidirectional SIP bridge with STT sidechain
+
+JSON params:
+- `completed`: callback URL/path fired when the leg completes
+- `dtmf`: callback URL/path fired on DTMF events
+
+Example:
+```text
+sip:leg1{"completed":"/cb/done"} -> call:call-123 -> sip:leg1
+```
+
+#### `originate:NUMBER{...}`
+Asynchronous outbound SIP/PSTN leg creation.
+
+Syntax:
+```text
+originate:+491701234567{"ringing":"/cb/ring","answered":"/cb/ans","completed":"/cb/end"} -> call:call-123
+```
+
+JSON params:
+- `ringing`
+- `answered`
+- `completed`
+- `failed`
+- `no-answer`
+- `busy`
+- `canceled`
+- `caller_id`
+
+#### `answer:LEG_ID`
+Accept an inbound SIP leg with `200 OK`.
+
+Syntax:
+```text
+answer:leg-abc
+```
+
+#### `call:CALL_ID`
+Conference leg inside a telephony call.
+
+Syntax:
+```text
+call:call-123
+```
+
+Used in bridges such as:
+```text
+sip:leg1 -> call:call-123 -> sip:leg1
+```
+
+#### `conference:CALL_ID`
+Alias for `call:CALL_ID`.
+
+Syntax:
+```text
+conference:call-123
+```
+
+#### `play:STAGE_ID{...}`
+Audio playback stage.
+
+Syntax:
+```text
+play:hold{"url":"https://cdn.example.com/hold.mp3"}
+play:hold{"url":"hold.mp3","loop":true,"volume":50}
+```
+
+JSON params:
+- `url`: required; absolute `http(s)` URL or filename relative to `--media-folder`
+- `loop`: optional bool/int; repeat playback
+- `volume`: optional percent, default `100`
+- `completed`: optional callback URL/path fired when non-looping playback finishes
+
+Examples:
+```text
+play:hold{"url":"https://cdn.example.com/hold.mp3","loop":true,"volume":50} -> call:call-123
+play:hold_b{"url":"hold.mp3","loop":true,"volume":50} -> sip:leg2
+```
+
+#### `tts{...}`
+Text-to-speech stage. Voice selection is JSON-only. Default voice is `de_DE-thorsten-medium`.
+
+Syntax:
+```text
+tts{"text":"Hallo Welt"}
+tts{"voice":"de_DE-thorsten-medium","text":"Hallo Welt"}
+text_input | tts{"voice":"de_DE-thorsten-medium"} | conference:call-123
+```
+
+JSON params:
+- `voice`: optional, default `de_DE-thorsten-medium`
+- `text`: optional fixed text; omit it when using upstream `text_input`, `ws:text`, or `cli:text`
+- `completed`: optional telephony callback path for fixed-text TTS completion
+
+Examples:
+```text
+tts{"text":"Bitte warten Sie."} -> call:call-123
+text_input | tts{} | conference:call-123
+```
+
+#### `stt:LANG`
+Speech-to-text stage.
+
+Syntax:
+```text
+stt:de
+stt:de:3.0:small
+```
+
+Positional fields:
+- `LANG`: optional Whisper language hint
+- `CHUNK`: optional chunk size in seconds
+- `MODEL`: optional Whisper model name
+
+Examples:
+```text
+tee:tap -> stt:de -> webhook:https://crm.example.com/stt
+ws:pcm | stt:de | ws:ndjson
+```
+
+#### `tee:TEE_ID`
+Audio tee for sidechains. A tee appears once in the main audio path and can then feed extra pipes.
+
+Syntax:
+```text
+tee:tap
+```
+
+Example:
+```text
+sip:leg1 -> tee:leg1_tap -> call:call-123 -> sip:leg1
+tee:leg1_tap -> stt:de -> webhook:https://crm.example.com/stt
+```
+
+#### `webhook:URL{...}`
+NDJSON webhook sink.
+
+Syntax:
+```text
+webhook:https://crm.example.com/stt
+webhook:https://crm.example.com/stt{"bearer":"TOKEN"}
+```
+
+JSON params:
+- `bearer`: optional bearer token override
+
+#### `text_input`
+Queue-backed text source for API-fed streaming TTS.
+
+Syntax:
+```text
+text_input
+```
+
+Typical use:
+```text
+text_input | tts{} | conference:call-123
+```
+
+#### `vc{...}`
+Voice conversion stage.
+
+Syntax:
+```text
+vc{"url":"https://cdn.example.com/voices/target.wav"}
+vc{"url":"target.wav"}
+```
+
+JSON params:
+- `url`: required; absolute `http(s)` URL or filename relative to `--media-folder`
+- `bearer`: optional bearer token for remote fetches
+
+#### `pitch:SEMITONES`
+Pitch-shift stage.
+
+Syntax:
+```text
+pitch:3.0
+```
+
+#### `gain:FACTOR`
+Volume gain stage.
+
+Syntax:
+```text
+gain:1.5
+```
+
+#### `delay:MS`
+Audio delay stage.
+
+Syntax:
+```text
+delay:120
+```
+
+#### `resample:FROM:TO`
+Sample rate conversion stage.
+
+Syntax:
+```text
+resample:48000:16000
+```
+
+#### `save:NAME{...}` and `record:NAME{...}`
+Managed recording stages.
+
+Syntax:
+```text
+save:recording_xyz{"format":"wav","rate":48000}
+record:recording_xyz{"format":"wav","rate":16000}
+```
+
+JSON params:
+- `format`: optional output format, default depends on call site
+- `rate`: optional output sample rate
+- `completed`: optional callback URL/path used on telephony side
+
+#### `webclient:USER{...}`
+Create a browser slot. This only creates nonce/session/iframe URL. Audio pipes must be built separately after the webclient callback.
+
+Syntax:
+```text
+webclient:user42{"callback":"/cb/wc","base_url":"https://srv.example.com","call_id":"call-123"}
+```
+
+JSON params:
+- `callback`: callback URL/path for the answered/joined webclient event
+- `base_url`: public speech-server base URL used for the browser iframe
+- `call_id`: optional call identifier supplied by the CRM for its own bookkeeping
+
+#### `codec:SESSION_ID[:PROFILE]`
+Fourier codec WebSocket endpoint.
+
+Syntax:
+```text
+codec:wc-abc
+codec:wc-abc:medium
+```
+
+Positional fields:
+- `SESSION_ID`: required codec session ID
+- `PROFILE`: optional codec profile
+
+#### `ws:MODE`
+WebSocket transport endpoint.
+
+Syntax:
+```text
+ws:pcm
+ws:text
+ws:ndjson
+```
+
+Modes:
+- `pcm`: binary PCM audio
+- `text`: text input lines
+- `ndjson`: NDJSON/text output
+
+Examples:
+```text
+ws:pcm | stt:de | ws:ndjson
+ws:text | tts{"voice":"de_DE-thorsten-medium"} | ws:pcm
+```
+
+#### `cli:MODE`
+CLI transport endpoint.
+
+Syntax:
+```text
+cli:text
+cli:raw
+cli:ndjson
+```
+
+Modes:
+- `text`: stdin text input
+- `raw`: stdout raw binary output
+- `ndjson`: stdout NDJSON output
+
+Example:
+```text
+cli:text | tts{} | cli:raw
+```
+
+#### `mix:NAME[:RATE]`
+Named mixer source.
+
+Syntax:
+```text
+mix:room
+mix:room:16000
+```
+
+Positional fields:
+- `NAME`: mixer name
+- `RATE`: optional sample rate
+
+#### `mixminus:NAME`
+Mix-minus source that subtracts the caller's own signal from the mix.
+
+Syntax:
+```text
+mixminus:own
+```
+
+#### `hangup`
+Immediate sink that tears down the upstream SIP leg when reached.
+
+Syntax:
+```text
+hangup
+```
+
+### Example Pipelines
+
+**Telephony**
+```text
 sip:leg1{"completed":"/cb/done"} -> tee:leg1_tap -> call:call-xxx -> sip:leg1
 tee:leg1_tap -> stt:de -> webhook:https://crm.example.com/stt
-
-# Hold music (looping, 50% volume)
 play:hold{"url":"https://cdn.example.com/hold.mp3","loop":true,"volume":50} -> call:call-xxx
-
-# Hold music directly to a held SIP leg
-play:hold_b{"url":"hold.mp3","loop":true,"volume":50} -> sip:leg2
-
-# TTS announcement
-tts:de{"text":"Bitte warten Sie."} -> call:call-xxx
-
-# Streaming TTS into conference (text fed via API)
-text_input | tts:de_DE-thorsten-medium | conference:call-xxx
-
-# Streaming TTS with voice conversion
-text_input | tts:de_DE-thorsten-medium | vc:de_DE-thorsten-high | conference:call-xxx
-
-# Originate outbound leg (async fire-and-forget with callbacks)
+tts{"text":"Bitte warten Sie."} -> call:call-xxx
 originate:+4917099999{"answered":"/cb/ans","completed":"/cb/end"} -> call:call-xxx
-
-# Answer an inbound leg (single-element action)
-answer:leg-abc
-
-# Create webclient session (single-element action)
 webclient:user42{"callback":"/cb/wc","base_url":"https://srv.example.com"}
-
-# Record to managed download URL (webhook fires with URL when done)
-sip:leg1 -> tee:rec -> call:call-xxx -> sip:leg1
-tee:rec -> save:recording_xyz{"format":"wav"}
 ```
 
-**Offline rendering (returns WAV):**
-```
-tts:de_DE-thorsten-medium{"text":"Hallo Welt"}
-tts:de{"text":"Test"} | pitch:3.0
-tts:de{"text":"Voice test"} | vc:target_voice | pitch:2.0
+**Streaming**
+```text
+text_input | tts{} | conference:call-xxx
+text_input | tts{"voice":"de_DE-thorsten-medium"} | vc{"url":"https://cdn.example.com/voices/thorsten-high.wav"} | conference:call-xxx
 ```
 
-**WebSocket / CLI:**
+**Offline render**
+```text
+tts{"text":"Hallo Welt"}
+tts{"text":"Test"} | pitch:3.0
+tts{"text":"Voice test"} | vc{"url":"https://cdn.example.com/voices/target.wav"} | pitch:2.0
 ```
+
+**WebSocket and CLI**
+```text
 ws:pcm | stt:de | ws:ndjson
-ws:text | tts:de_DE-thorsten-medium | ws:pcm
-cli:text | tts:de_DE-thorsten-medium | cli:raw
+ws:text | tts{} | ws:pcm
+cli:text | tts{} | cli:raw
 codec:session1 | conference:call-xxx | codec:session1
 ```
 
@@ -347,7 +639,7 @@ curl -X POST -H "Authorization: Bearer TOKEN" \
 **Rendering TTS as WAV (synchronous, returns audio/wav):**
 ```bash
 curl -X POST -H "Authorization: Bearer TOKEN" \
-  -d '{"dsl": "tts:de{\"text\":\"Hallo Welt\"}", "render": true}' \
+  -d '{"dsl": "tts{\"voice\":\"de_DE-thorsten-medium\",\"text\":\"Hallo Welt\"}", "render": true}' \
   -o output.wav \
   http://localhost:5000/api/pipelines
 ```
@@ -371,7 +663,7 @@ curl -X DELETE -H "Authorization: Bearer TOKEN" \
 ```bash
 # 1. Create pipeline
 curl -X POST -H "Authorization: Bearer TOKEN" \
-  -d '{"dsl": "text_input | tts:de_DE-thorsten-medium | conference:call-xxx"}' \
+  -d '{"dsl": "text_input | tts{\"voice\":\"de_DE-thorsten-medium\"} | conference:call-xxx"}' \
   http://localhost:5000/api/pipelines
 # Returns {"id": "abc123", ...}
 
@@ -433,10 +725,12 @@ auto-cancel to prevent memory leaks.
 ```
 POST   /api/calls              Create call/conference
 GET    /api/calls              List calls
-GET    /api/calls/<id>         Call details (participants, status)
-GET    /api/calls/<id>/participants  List active participants
 DELETE /api/calls/<id>         End call (hangs up all legs, cleans up)
 ```
+
+Call detail and participant lookup are no longer served from `/api/calls/<id>`.
+Use `GET /api/pipelines?dsl=call:CALL_ID` instead; the response includes the
+call plus nested `participants`.
 
 Leg operations use the pipeline DSL:
 
@@ -469,15 +763,16 @@ The typical call flow for a CRM subscriber — everything through `/api/pipeline
 3. CRM: POST /api/pipelines → bridge inbound SIP leg + wait music + STT sidechain
    DSL: "sip:LEG{"completed":"/cb"} -> tee:LEG_tap -> call:CALL -> sip:LEG"
    DSL: "tee:LEG_tap -> stt:de -> webhook:https://crm/stt"
-   DSL: "play:CALL_wait{"url":"hold.mp3","loop":true} -> call:CALL"
+   DSL: "play:CALL_wait{"url":"hold.mp3","loop":true} -> call:CALL"   # requires --media-folder
 4. CRM: POST /api/pipelines {"dsl": "originate:+4917...{cb} -> call:CALL"}
    → async SIP INVITE; CRM receives "answered" callback
 5. On answered: CRM: POST /api/pipelines → bridge outbound leg
 6. CRM: DELETE /api/pipelines {"dsl": "play:CALL_wait"} → stop wait music
 7. Hold: DELETE /api/pipelines {"dsl": "bridge:LEG"} +
-        POST /api/pipelines with "play:hold{...} -> sip:LEG"
+        POST /api/pipelines with "play:hold{\"url\":\"https://cdn.example.com/hold.mp3\",\"loop\":true} -> sip:LEG"
 8. Unhold: DELETE hold music stage + POST /api/pipelines → rebridge
-9. CRM: DELETE /api/calls/CALL → teardown (or auto-cleanup after 30s idle)
+9. CRM: DELETE /api/pipelines?dsl=call:CALL → teardown
+   (or auto-cleanup after 30s idle)
 ```
 
 ### RTP Codecs

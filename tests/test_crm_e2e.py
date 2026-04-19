@@ -1344,7 +1344,7 @@ class TestInboundFlow:
 # ---------------------------------------------------------------------------
 
 class TestStreamingTTSPipeline:
-    """text_input | tts:VOICE | conference:CALL — streaming TTS into conference."""
+    """text_input | tts{"voice":"..."} | conference:CALL — streaming TTS into conference."""
 
     def _ensure_tts(self):
         try:
@@ -1359,7 +1359,7 @@ class TestStreamingTTSPipeline:
             pytest.skip(f"TTS unavailable: {e}")
 
     def test_streaming_tts_into_conference(self, client, account):
-        """text_input | tts:VOICE | conference:CALL — text produces audio."""
+        """text_input | tts{"voice":"..."} | conference:CALL — text produces audio."""
         self._ensure_tts()
         call_id = create_call(client, account)
         call = call_state.get_call(call_id)
@@ -1367,7 +1367,7 @@ class TestStreamingTTSPipeline:
         try:
             resp = client.post("/api/pipelines",
                                data=json.dumps({
-                                   "dsl": f"text_input | tts:de_DE-thorsten-medium | conference:{call_id}"
+                                   "dsl": f'text_input | tts{{"voice":"de_DE-thorsten-medium"}} | conference:{call_id}'
                                }),
                                headers=account)
             assert resp.status_code == 201, f"Pipeline creation failed: {resp.data}"
@@ -1417,7 +1417,7 @@ class TestStreamingTTSPipeline:
 
             resp = client.post("/api/pipelines",
                                data=json.dumps({
-                                   "dsl": f"text_input | tts:de_DE-thorsten-medium | conference:{call_id}"
+                                   "dsl": f'text_input | tts{{"voice":"de_DE-thorsten-medium"}} | conference:{call_id}'
                                }),
                                headers=account)
             assert resp.status_code == 201
@@ -1604,7 +1604,7 @@ class TestConcurrentPipelines:
 # ---------------------------------------------------------------------------
 
 class TestStreamingTTSVCPipeline:
-    """text_input | tts:VOICE | vc:VOICE2 | conference:CALL"""
+    """text_input | tts{"voice":"..."} | vc{"url":"..."} | conference:CALL"""
 
     def _ensure_tts(self):
         try:
@@ -1622,13 +1622,18 @@ class TestStreamingTTSVCPipeline:
         self._ensure_tts()
         call_id = create_call(client, account)
         call = call_state.get_call(call_id)
+        import speech_pipeline.telephony._shared as _shared
+        old_media_folder = _shared.media_folder
 
         try:
+            _shared.media_folder = VOICES_PATH
             resp = client.post("/api/pipelines",
                                data=json.dumps({
-                                   "dsl": f"text_input | tts:de_DE-thorsten-medium "
-                                          f"| vc:de_DE-thorsten-high "
-                                          f"| conference:{call_id}"
+                                   "dsl": (
+                                       f'text_input | tts{{"voice":"de_DE-thorsten-medium"}} '
+                                       f'| vc{{"url":"de_DE-thorsten-high.onnx"}} '
+                                       f'| conference:{call_id}'
+                                   )
                                }),
                                headers=account)
             # VC might fail if model not set up for voice conversion
@@ -1663,6 +1668,7 @@ class TestStreamingTTSVCPipeline:
             assert rms > 100, f"TTS+VC output RMS={rms:.0f} — too quiet"
 
         finally:
+            _shared.media_folder = old_media_folder
             try:
                 client.delete(f"/api/pipelines/{pid}", headers=account)
             except Exception:

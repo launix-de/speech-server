@@ -34,6 +34,31 @@ def _register_message(sip_user: str, *, auth_header: str | None = None) -> dict:
     return sip_stack._parse_sip("\r\n".join(lines).encode("utf-8"))
 
 
+def _avm_register_message(
+    auth_username: str,
+    *,
+    auth_header: str | None = None,
+    cseq: int = 586,
+    expires: int = 1800,
+) -> dict:
+    lines = [
+        "REGISTER sip:sip-proxy.example.test SIP/2.0",
+        "Via: SIP/2.0/UDP 155.133.219.85:5060;rport;branch=z9hG4bK-avm",
+        "Route: <sip:sip-proxy.example.test:5061;lr>",
+        "From: <sip:1@sip-proxy.example.test>;tag=avm-tag",
+        "To: <sip:1@sip-proxy.example.test>",
+        "Call-ID: avm-reg-test",
+        f"CSeq: {cseq} REGISTER",
+        "Contact: <sip:1@155.133.219.85;uniq=DEVICE1>",
+        f"Expires: {expires}",
+        "User-Agent: AVM FRITZ!Box 7430 test",
+    ]
+    if auth_header:
+        lines.append(f"Authorization: {auth_header}")
+    lines.extend(["Content-Length: 0", "", ""])
+    return sip_stack._parse_sip("\r\n".join(lines).encode("utf-8"))
+
+
 def _invite_message(from_sip_user: str, target_number: str) -> dict:
     body = "\r\n".join([
         "v=0",
@@ -198,6 +223,90 @@ class TestSipRegisterWithFakeCrm:
         assert reg["base_url"] == deployed_crm.BASE_URL
         assert reg["contact_uri"] == "sip:alice@155.133.219.85:5060"
         assert reg["source_addr"] == ("155.133.219.85", 5060)
+
+    def test_avm_style_register_recovers_from_stale_nonce_and_can_be_called(
+            self, deployed_crm, monkeypatch):
+        sent: list[tuple[str, tuple[str, int]]] = []
+        monkeypatch.setattr(
+            sip_stack,
+            "_send",
+            lambda data, addr: sent.append((data, addr)),
+        )
+        monkeypatch.setattr(sip_stack, "_find_free_rtp_port", lambda: 24000)
+        monkeypatch.setattr(sip_stack, "_gen_call_id", lambda: "call-avm")
+        monkeypatch.setattr(sip_stack, "_gen_tag", lambda: "tag-avm")
+        monkeypatch.setattr(sip_stack, "_gen_branch", lambda: "z9hG4bK-avm-out")
+
+        sip_user = f"alice@{deployed_crm.sip_domain}"
+        with deployed_crm.active(monkeypatch):
+            first = _avm_register_message(auth_username=sip_user)
+            sip_stack._handle_inbound_register(first, ("155.133.219.85", 5060))
+
+            first_challenge = sent[-1][0]
+            first_nonce = re.search(r'nonce="([^"]+)"', first_challenge).group(1)
+            realm = deployed_crm.sip_domain
+            ha1 = hashlib.md5(
+                f"{sip_user}:{realm}:{deployed_crm.login_tokens['alice']}".encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+
+            stale_digest = sip_stack._compute_digest_response_ha1(
+                ha1, "stale-nonce", "REGISTER", "sip:sip-proxy.example.test"
+            )
+            stale_auth = (
+                "Digest "
+                f'username="{sip_user}", '
+                f'realm="{realm}", '
+                'nonce="stale-nonce", '
+                'uri="sip:sip-proxy.example.test", '
+                f'response="{stale_digest}", '
+                "algorithm=MD5"
+            )
+            stale = _avm_register_message(
+                auth_username=sip_user,
+                auth_header=stale_auth,
+            )
+            sip_stack._handle_inbound_register(stale, ("155.133.219.85", 5060))
+
+            stale_reply = sent[-1][0]
+            assert "SIP/2.0 401 Unauthorized" in stale_reply
+            retry_nonce = re.search(r'nonce="([^"]+)"', stale_reply).group(1)
+            assert retry_nonce not in {"stale-nonce", first_nonce}
+
+            retry_digest = sip_stack._compute_digest_response_ha1(
+                ha1, retry_nonce, "REGISTER", "sip:sip-proxy.example.test"
+            )
+            retry_auth = (
+                "Digest "
+                f'username="{sip_user}", '
+                f'realm="{realm}", '
+                f'nonce="{retry_nonce}", '
+                'uri="sip:sip-proxy.example.test", '
+                f'response="{retry_digest}", '
+                "algorithm=MD5"
+            )
+            retry = _avm_register_message(
+                auth_username=sip_user,
+                auth_header=retry_auth,
+            )
+            sip_stack._handle_inbound_register(retry, ("155.133.219.85", 5060))
+
+        assert "SIP/2.0 200 OK" in sent[-1][0]
+        regs = sip_stack.get_registrations(sip_user)
+        assert len(regs) == 1
+        reg = regs[0]
+        assert reg["contact_uri"] == "sip:1@155.133.219.85;uniq=DEVICE1"
+        assert reg["source_addr"] == ("155.133.219.85", 5060)
+
+        before_invite = len(sent)
+        sip_stack.call_registered_user(sip_user)
+        invite_payload, invite_addr = sent[-1]
+        assert len(sent) == before_invite + 1
+        assert invite_addr == ("155.133.219.85", 5060)
+        assert "INVITE sip:1@155.133.219.85;uniq=DEVICE1 SIP/2.0" in invite_payload
+        assert "Call-ID: call-avm" in invite_payload
+        assert "Contact: <sip:" in invite_payload
 
     def test_registered_client_invite_uses_full_aor_and_fires_device_dial(
             self, deployed_crm, monkeypatch):

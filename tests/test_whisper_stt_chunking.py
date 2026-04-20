@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 
 from speech_pipeline.WhisperSTT import WhisperTranscriber
+from speech_pipeline import WhisperSTT as whisper_mod
 from speech_pipeline.base import AudioFormat, Stage
 
 
@@ -80,3 +81,51 @@ def test_short_chunk_seconds_allows_earlier_pause_flush(monkeypatch):
     decoded = _decode(out)
     assert [row["text"] for row in decoded] == ["chunk-1", "chunk-2"]
 
+
+def test_hard_limit_prefers_longest_pause_in_recent_window():
+    sample_rate = 16000
+    pcm = b"".join([
+        _pcm(2.45, 2000, sample_rate),
+        _pcm(0.10, 0, sample_rate),
+        _pcm(0.15, 2000, sample_rate),
+        _pcm(0.40, 0, sample_rate),
+        _pcm(0.50, 2000, sample_rate),
+    ])
+
+    target_bytes = int(3.10 * sample_rate * 2)
+    search_window_bytes = int(0.75 * sample_rate * 2)
+    cut = whisper_mod._find_recent_pause_cut_bytes(
+        pcm,
+        sample_rate=sample_rate,
+        target_bytes=target_bytes,
+        search_window_bytes=search_window_bytes,
+        rms_floor=220,
+    )
+
+    assert cut is not None
+    lower = int(2.80 * sample_rate * 2)
+    upper = int(3.20 * sample_rate * 2)
+    assert lower <= cut <= upper, (
+        "smart hard-cut should land inside the longest recent pause, "
+        f"got cut={cut} outside [{lower}, {upper}]"
+    )
+
+
+def test_hard_limit_without_pause_keeps_small_overlap():
+    sample_rate = 16000
+    bps = sample_rate * 2
+    pcm = _pcm(16.0, 2000, sample_rate)
+
+    split = whisper_mod._choose_hard_split_bytes(
+        pcm,
+        sample_rate=sample_rate,
+        max_chunk_bytes=int(15.0 * bps),
+        search_window_bytes=int(0.75 * bps),
+        rms_floor=220,
+        overlap_bytes=int(0.30 * bps),
+    )
+
+    assert split == int((15.0 - 0.30) * bps), (
+        "hard limit without a usable pause must keep a small overlap "
+        "instead of cutting exactly at the limit"
+    )

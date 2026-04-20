@@ -1025,6 +1025,7 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
     # Verify credentials via CRM callback
     auth_params = _parse_www_authenticate(auth_h)
     nonce = auth_params.get("nonce", "")
+    auth_username = auth_params.get("username", "")
 
     # Check nonce validity
     if nonce not in _nonces:
@@ -1042,7 +1043,11 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
         return
 
     # Resolve subscriber
-    username, realm_resolved, subscriber = _resolve_sip_identity(to_uri)
+    username, realm_resolved, subscriber = _resolve_sip_identity(
+        f"sip:{auth_username}" if auth_username else to_uri
+    )
+    if not subscriber:
+        username, realm_resolved, subscriber = _resolve_sip_identity(to_uri)
     if not username:
         _LOGGER.warning("REGISTER: no username in %s", to_uri)
         resp = _build_response(403, "Forbidden", msg, to_tag=_gen_tag())
@@ -1050,10 +1055,17 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
         return
 
     if not subscriber:
-        _LOGGER.warning("REGISTER: no subscriber for %s", to_uri)
+        _LOGGER.warning(
+            "REGISTER: no subscriber for to=%s auth_username=%s",
+            to_uri,
+            auth_username,
+        )
         resp = _build_response(403, "Forbidden", msg, to_tag=_gen_tag())
         _send(resp, addr)
         return
+
+    if auth_username:
+        sip_user = _normalize_sip_user(auth_username)
 
     # Call CRM to get HA1
     raw_sip_user = auth_params.get("username", sip_user)

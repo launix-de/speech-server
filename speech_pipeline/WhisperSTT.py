@@ -29,6 +29,98 @@ _MIN_VOICED_MS = int(os.environ.get("WHISPER_MIN_VOICED_MS", "120"))
 _MIN_VOICED_RATIO = float(os.environ.get("WHISPER_MIN_VOICED_RATIO", "0.08"))
 
 
+def _find_recent_pause_cut_bytes(
+    pcm_bytes: bytes,
+    *,
+    sample_rate: int,
+    target_bytes: int,
+    search_window_bytes: int,
+    rms_floor: int,
+):
+    """Return a smart split point near ``target_bytes`` if a recent pause exists.
+
+    Searches the recent window before ``target_bytes`` for the longest silent
+    run and returns its midpoint in bytes.  Returns ``None`` if there is no
+    usable pause.
+    """
+    import numpy as np
+
+    if target_bytes <= 0 or not pcm_bytes:
+        return None
+
+    bytes_per_sample = 2
+    frame_samples = max(1, sample_rate * _VOICE_FRAME_MS // 1000)
+    frame_bytes = frame_samples * bytes_per_sample
+    if len(pcm_bytes) < frame_bytes:
+        return None
+
+    target_bytes = min(target_bytes, len(pcm_bytes))
+    start_byte = max(0, target_bytes - search_window_bytes)
+    start_byte -= start_byte % frame_bytes
+    end_byte = target_bytes - (target_bytes % frame_bytes)
+    if end_byte - start_byte < frame_bytes:
+        return None
+
+    samples = np.frombuffer(pcm_bytes[start_byte:end_byte], dtype=np.int16)
+    best_run = None
+    run_start = None
+    total_frames = len(samples) // frame_samples
+    for frame_idx in range(total_frames):
+        off = frame_idx * frame_samples
+        frame = samples[off:off + frame_samples]
+        if frame.size == 0:
+            continue
+        rms = int(np.sqrt(np.mean(frame.astype(np.float64) ** 2)))
+        silent = rms < rms_floor
+        if silent:
+            if run_start is None:
+                run_start = frame_idx
+        elif run_start is not None:
+            run_len = frame_idx - run_start
+            if run_len > 0 and (best_run is None or run_len > best_run[2]):
+                best_run = (run_start, frame_idx, run_len)
+            run_start = None
+    if run_start is not None:
+        run_len = total_frames - run_start
+        if run_len > 0 and (best_run is None or run_len > best_run[2]):
+            best_run = (run_start, total_frames, run_len)
+
+    if best_run is None:
+        return None
+
+    run_start_idx, run_end_idx, _ = best_run
+    mid_frame = run_start_idx + ((run_end_idx - run_start_idx) // 2)
+    cut = start_byte + (mid_frame * frame_bytes)
+    cut -= cut % bytes_per_sample
+    return cut if cut > 0 else None
+
+
+def _choose_hard_split_bytes(
+    pcm_bytes: bytes,
+    *,
+    sample_rate: int,
+    max_chunk_bytes: int,
+    search_window_bytes: int,
+    rms_floor: int,
+    overlap_bytes: int,
+):
+    """Choose a split point for forced chunking without a clean pause."""
+    pause_cut = _find_recent_pause_cut_bytes(
+        pcm_bytes,
+        sample_rate=sample_rate,
+        target_bytes=max_chunk_bytes,
+        search_window_bytes=search_window_bytes,
+        rms_floor=rms_floor,
+    )
+    if pause_cut is not None:
+        return pause_cut
+
+    split = max_chunk_bytes - overlap_bytes
+    split = max(split, 2)
+    split -= split % 2
+    return split
+
+
 def _detect_device() -> str:
     device = os.environ.get("WHISPER_DEVICE", "").lower()
     if device in ("cuda", "cpu"):
@@ -151,6 +243,7 @@ class WhisperTranscriber(Stage):
         min_chunk_bytes = int(bps * chunk_seconds)
         max_chunk_bytes = int(bps * max(chunk_seconds * 5.0, 15.0))
         silence_trigger = int(bps * min(max(chunk_seconds * 0.25, 0.3), 0.8))
+        overlap_bytes = int(bps * min(max(chunk_seconds * 0.10, 0.2), 0.3))
         rms_floor = _SILENCE_RMS_FLOOR        # int16 RMS below this = silence
 
         buf = b""
@@ -186,17 +279,28 @@ class WhisperTranscriber(Stage):
                 buf += pcm
 
                 # Transcribe when: enough audio AND pause detected, or buffer too long
-                should_flush = (len(buf) >= min_chunk_bytes and silence_run >= silence_trigger) \
-                            or len(buf) >= max_chunk_bytes
-                if should_flush:
-                    chunk_dur = len(buf) / bps
+                flush_on_pause = len(buf) >= min_chunk_bytes and silence_run >= silence_trigger
+                flush_on_limit = len(buf) >= max_chunk_bytes
+                if flush_on_pause or flush_on_limit:
+                    flush_bytes = len(buf)
+                    if flush_on_limit and not flush_on_pause:
+                        flush_bytes = _choose_hard_split_bytes(
+                            buf,
+                            sample_rate=self.sample_rate,
+                            max_chunk_bytes=max_chunk_bytes,
+                            search_window_bytes=silence_trigger,
+                            rms_floor=rms_floor,
+                            overlap_bytes=overlap_bytes,
+                        )
+                    chunk = buf[:flush_bytes]
+                    buf = buf[flush_bytes:]
+                    chunk_dur = len(chunk) / bps
                     _LOGGER.debug("transcribing %.1fs at offset=%.1fs (silence=%dms)",
                                   chunk_dur, time_offset, silence_run * 1000 // bps)
-                    for line in self._transcribe_chunk(model, buf, time_offset):
+                    for line in self._transcribe_chunk(model, chunk, time_offset):
                         _LOGGER.info("result: %s", line.decode().strip())
                         yield line
                     time_offset += chunk_dur
-                    buf = b""
                     silence_run = 0
 
             # Flush remaining

@@ -11,6 +11,7 @@ communicated via SDP; actual audio goes through ConferenceMixer/SIPSource/SIPSin
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import logging
 import os
 import random
@@ -57,6 +58,13 @@ _transactions_lock = threading.Lock()
 
 # Nonce -> True for registrar challenges we issued
 _nonces: Dict[str, float] = {}
+_register_challenges: Dict[str, Tuple[float, str]] = {}
+_REGISTER_CHALLENGE_TTL = 60.0
+_SERVER_HEADER_VALUE = "tts-piper SIP/1.0"
+_ALLOW_METHODS = (
+    "INVITE, ACK, OPTIONS, CANCEL, BYE, UPDATE, PRACK, INFO, "
+    "SUBSCRIBE, NOTIFY, REFER, MESSAGE, PUBLISH, REGISTER"
+)
 
 # ---------------------------------------------------------------------------
 # SIPCall handle
@@ -374,9 +382,95 @@ def _extract_user(uri: str) -> str:
 
 
 def _extract_host(uri: str) -> str:
-    """Extract host from sip:user@host or sip:user@host:port."""
-    m = re.match(r"sip:[^@]+@([^:;>]+)", uri)
+    """Extract host from SIP URIs with or without a user part."""
+    m = re.match(r"sips?:(?:[^@]+@)?([^:;>]+)", uri)
     return m.group(1) if m else ""
+
+
+def _is_ip_literal(host: str) -> bool:
+    try:
+        ipaddress.ip_address(host.strip("[]"))
+        return True
+    except ValueError:
+        return False
+
+
+def _parse_via_sent_by(via_value: str) -> Tuple[str, Optional[int]]:
+    m = re.match(r"^\S+\s+([^;]+)", via_value.strip())
+    if not m:
+        return ("", None)
+    sent_by = m.group(1).strip()
+    if sent_by.startswith("["):
+        host, _, rest = sent_by.partition("]")
+        host = host + "]"
+        port = None
+        if rest.startswith(":") and rest[1:].isdigit():
+            port = int(rest[1:])
+        return (host.strip("[]"), port)
+    if ":" in sent_by:
+        host, port_str = sent_by.rsplit(":", 1)
+        if port_str.isdigit():
+            return (host, int(port_str))
+    return (sent_by, None)
+
+
+def _augment_response_via(raw_via_line: str, source_addr: Tuple[str, int]) -> str:
+    """Return a Via header suitable for a SIP response.
+
+    RFC 3261/RFC 3581 require the server to populate ``received`` and
+    ``rport`` on the topmost Via when appropriate instead of copying the
+    request header back verbatim.
+    """
+    name, sep, value = raw_via_line.partition(":")
+    if not sep:
+        return raw_via_line
+
+    via_value = value.strip()
+    source_ip, source_port = source_addr
+    sent_by_host, _ = _parse_via_sent_by(via_value)
+
+    wants_rport = bool(re.search(r"(^|;)rport(?=;|$)", via_value))
+    has_rport_value = bool(re.search(r"(^|;)rport=\d+", via_value))
+    has_received = bool(re.search(r"(^|;)received=", via_value))
+    # RFC 3581 §4: when the request carries ``rport`` without a value, the
+    # server MUST populate both ``rport`` and ``received`` in the response —
+    # even if the source IP equals sent-by. AVM FRITZ!Box firmwares silently
+    # drop responses that violate this.
+    needs_received = (
+        wants_rport
+        or not _is_ip_literal(sent_by_host)
+        or (sent_by_host and sent_by_host != source_ip)
+    )
+
+    if wants_rport and not has_rport_value:
+        via_value = re.sub(
+            r"(^|;)rport(?=;|$)",
+            lambda m: f"{m.group(1)}rport={source_port}",
+            via_value,
+            count=1,
+        )
+
+    if needs_received and not has_received:
+        via_value += f";received={source_ip}"
+
+    return f"{name}: {via_value}"
+
+
+def _extract_realm_target(uri: str) -> str:
+    """Extract the raw registrar target from a SIP URI.
+
+    Mirrors the request target as sent by the client instead of normalizing
+    it down to a host. This preserves old working forms such as
+    ``sip:launix.de/crm`` and plain registrar hosts like
+    ``sip:crm.example.test``.
+    """
+    uri = uri.strip()
+    if not uri:
+        return ""
+    m = re.match(r"^sips?:(.+)$", uri)
+    target = m.group(1) if m else uri
+    target = target.split(";", 1)[0].split("?", 1)[0]
+    return target
 
 
 def _parse_www_authenticate(header: str) -> dict:
@@ -395,17 +489,25 @@ def _parse_www_authenticate(header: str) -> dict:
 def _compute_digest_response(
     username: str, password: str, realm: str, nonce: str,
     method: str, uri: str, algorithm: str = "MD5",
+    qop: str = "", cnonce: str = "", nc: str = "",
 ) -> str:
     """Compute Digest Auth response value."""
     ha1 = hashlib.md5(f"{username}:{realm}:{password}".encode()).hexdigest()
-    return _compute_digest_response_ha1(ha1, nonce, method, uri)
+    return _compute_digest_response_ha1(
+        ha1, nonce, method, uri, qop=qop, cnonce=cnonce, nc=nc,
+    )
 
 
 def _compute_digest_response_ha1(
     ha1: str, nonce: str, method: str, uri: str,
+    *, qop: str = "", cnonce: str = "", nc: str = "",
 ) -> str:
     """Compute Digest Auth response from pre-computed HA1."""
     ha2 = hashlib.md5(f"{method}:{uri}".encode()).hexdigest()
+    if qop:
+        return hashlib.md5(
+            f"{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}".encode()
+        ).hexdigest()
     return hashlib.md5(f"{ha1}:{nonce}:{ha2}".encode()).hexdigest()
 
 
@@ -416,12 +518,38 @@ def _build_authorization(
     """Build Authorization or Proxy-Authorization header value."""
     realm = challenge.get("realm", "")
     nonce = challenge.get("nonce", "")
-    response = _compute_digest_response(username, password, realm, nonce,
-                                        method, uri)
-    return (
-        f'Digest username="{username}", realm="{realm}", nonce="{nonce}", '
-        f'uri="{uri}", response="{response}", algorithm=MD5'
+    qop = ""
+    if challenge.get("qop"):
+        qop_tokens = [
+            token.strip() for token in challenge["qop"].split(",") if token.strip()
+        ]
+        if "auth" in qop_tokens:
+            qop = "auth"
+        elif qop_tokens:
+            qop = qop_tokens[0]
+    nc = "00000001" if qop else ""
+    cnonce = _rand_hex(16) if qop else ""
+    response = _compute_digest_response(
+        username, password, realm, nonce, method, uri,
+        qop=qop, cnonce=cnonce, nc=nc,
     )
+    params = [
+        f'username="{username}"',
+        f'realm="{realm}"',
+        f'nonce="{nonce}"',
+        f'uri="{uri}"',
+        f'response="{response}"',
+        "algorithm=MD5",
+    ]
+    if challenge.get("opaque"):
+        params.append(f'opaque="{challenge["opaque"]}"')
+    if qop:
+        params.extend([
+            f"qop={qop}",
+            f"nc={nc}",
+            f'cnonce="{cnonce}"',
+        ])
+    return "Digest " + ", ".join(params)
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +599,11 @@ def _build_response(
     status: int, reason: str, msg: dict, *,
     body: str = "", extra_headers: str = "",
     to_tag: str = "",
+    include_contact: bool = True,
+    include_allow: bool = False,
+    include_server: bool = True,
+    use_user_agent_header: bool = False,
+    preserve_via: bool = False,
 ) -> str:
     """Build a SIP response based on a received request."""
     via = _get_header(msg, "via")
@@ -482,20 +615,33 @@ def _build_response(
     if to_tag and ";tag=" not in to_h:
         to_h += f";tag={to_tag}"
 
-    contact = f"<sip:{_local_ip}:{_sip_port}>"
-
     content_type = ""
     if body:
         content_type = "Content-Type: application/sdp\r\n"
 
     # Reconstruct all Via headers from raw headers
     via_lines = ""
+    top_via_done = False
+    source_addr = msg.get("_source_addr")
     for raw_line in msg.get("raw_headers", []):
         if raw_line.lower().startswith("via:") or raw_line.lower().startswith("v:"):
+            if not preserve_via and not top_via_done and source_addr:
+                raw_line = _augment_response_via(raw_line, source_addr)
+                top_via_done = True
             via_lines += raw_line + "\r\n"
 
     if not via_lines:
         via_lines = f"Via: {via}\r\n"
+
+    contact_header = ""
+    if include_contact:
+        contact = f"<sip:{_local_ip}:{_sip_port}>"
+        contact_header = f"Contact: {contact}\r\n"
+    allow_header = f"Allow: {_ALLOW_METHODS}\r\n" if include_allow else ""
+    server_header = ""
+    if include_server:
+        header_name = "User-Agent" if use_user_agent_header else "Server"
+        server_header = f"{header_name}: {_SERVER_HEADER_VALUE}\r\n"
 
     resp = (
         f"SIP/2.0 {status} {reason}\r\n"
@@ -504,8 +650,9 @@ def _build_response(
         f"To: {to_h}\r\n"
         f"Call-ID: {call_id}\r\n"
         f"CSeq: {cseq}\r\n"
-        f"Contact: {contact}\r\n"
-        f"User-Agent: tts-piper SIP/1.0\r\n"
+        f"{contact_header}"
+        f"{server_header}"
+        f"{allow_header}"
         f"{extra_headers}"
         f"{content_type}"
         f"Content-Length: {len(body.encode('utf-8'))}\r\n"
@@ -703,6 +850,7 @@ def _recv_loop() -> None:
             if msg["type"] == "response":
                 _handle_response(msg, addr)
             else:
+                msg["_source_addr"] = addr
                 _LOGGER.debug(
                     "SIP dispatch ← %s: method=%s call_id=%s from=%s to=%s",
                     addr,
@@ -1006,19 +1154,17 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
     sip_user = _normalize_sip_user(raw_aor)
     contact = _get_header(msg, "contact")
 
-    # Check Authorization header
-    auth_h = _get_header(msg, "authorization")
+    # REGISTER auth is accepted in both header forms because clients disagree
+    # on whether the outbound-proxy hop should use Authorization or
+    # Proxy-Authorization for device registration.
+    proxy_auth_h = _get_header(msg, "proxy-authorization")
+    auth_h = proxy_auth_h or _get_header(msg, "authorization")
     if not auth_h:
-        # Challenge with 401
-        nonce = _rand_hex(32)
-        _nonces[nonce] = time.time()
-        challenge = (
-            f'Digest realm="{realm}", '
-            f'nonce="{nonce}", algorithm=MD5'
+        resp = _build_register_challenge_response(
+            msg,
+            addr,
+            realm=_register_auth_challenge_realm(msg, to_uri, realm),
         )
-        extra = f"WWW-Authenticate: {challenge}\r\n"
-        resp = _build_response(401, "Unauthorized", msg,
-                               extra_headers=extra, to_tag=_gen_tag())
         _send(resp, addr)
         return
 
@@ -1026,21 +1172,7 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
     auth_params = _parse_www_authenticate(auth_h)
     nonce = auth_params.get("nonce", "")
     auth_username = auth_params.get("username", "")
-
-    # Check nonce validity
-    if nonce not in _nonces:
-        _LOGGER.warning("REGISTER from %s: unknown nonce", addr)
-        fresh_nonce = _rand_hex(32)
-        _nonces[fresh_nonce] = time.time()
-        challenge = (
-            f'Digest realm="{realm}", '
-            f'nonce="{fresh_nonce}", algorithm=MD5'
-        )
-        extra = f"WWW-Authenticate: {challenge}\r\n"
-        resp = _build_response(401, "Unauthorized", msg,
-                               extra_headers=extra, to_tag=_gen_tag())
-        _send(resp, addr)
-        return
+    nonce_known = nonce in _nonces
 
     # Resolve subscriber
     username, realm_resolved, subscriber = _resolve_sip_identity(
@@ -1050,7 +1182,14 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
         username, realm_resolved, subscriber = _resolve_sip_identity(to_uri)
     if not username:
         _LOGGER.warning("REGISTER: no username in %s", to_uri)
-        resp = _build_response(403, "Forbidden", msg, to_tag=_gen_tag())
+        if not nonce_known:
+            resp = _build_register_challenge_response(
+                msg,
+                addr,
+                realm=_register_auth_challenge_realm(msg, to_uri, realm),
+            )
+        else:
+            resp = _build_response(403, "Forbidden", msg, to_tag=_gen_tag())
         _send(resp, addr)
         return
 
@@ -1060,7 +1199,14 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
             to_uri,
             auth_username,
         )
-        resp = _build_response(403, "Forbidden", msg, to_tag=_gen_tag())
+        if not nonce_known:
+            resp = _build_register_challenge_response(
+                msg,
+                addr,
+                realm=_register_auth_challenge_realm(msg, to_uri, realm),
+            )
+        else:
+            resp = _build_response(403, "Forbidden", msg, to_tag=_gen_tag())
         _send(resp, addr)
         return
 
@@ -1072,22 +1218,45 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
     auth_realm = auth_params.get("realm", realm_resolved)
     ha1_info = _crm_login(subscriber, username, auth_realm, raw_sip_user)
     if not ha1_info:
-        resp = _build_response(403, "Forbidden", msg, to_tag=_gen_tag())
+        if not nonce_known:
+            resp = _build_register_challenge_response(
+                msg,
+                addr,
+                realm=_register_auth_challenge_realm(msg, to_uri, realm),
+            )
+        else:
+            resp = _build_response(403, "Forbidden", msg, to_tag=_gen_tag())
         _send(resp, addr)
         return
 
     # Verify digest using HA1
     ha1 = ha1_info["ha1"]
     expected = _compute_digest_response_ha1(
-        ha1, nonce, "REGISTER",
-        auth_params.get("uri", f"sip:{_local_ip}:{_sip_port}"))
+        ha1,
+        nonce,
+        "REGISTER",
+        auth_params.get("uri", f"sip:{_local_ip}:{_sip_port}"),
+        qop=auth_params.get("qop", ""),
+        cnonce=auth_params.get("cnonce", ""),
+        nc=auth_params.get("nc", ""),
+    )
     actual = auth_params.get("response", "")
 
     if expected != actual:
         _LOGGER.warning("REGISTER: digest mismatch for %s", sip_user)
-        resp = _build_response(403, "Forbidden", msg, to_tag=_gen_tag())
+        resp = _build_register_challenge_response(
+            msg,
+            addr,
+            realm=_register_auth_challenge_realm(msg, to_uri, realm),
+        )
         _send(resp, addr)
         return
+
+    if not nonce_known:
+        _LOGGER.info(
+            "REGISTER from %s: accepted digest for uncached nonce", addr
+        )
+        _nonces[nonce] = time.time()
 
     # Keep nonce valid until it expires (SIP clients reuse it on re-REGISTER)
 
@@ -1124,6 +1293,80 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
     resp = _build_response(200, "OK", msg, extra_headers=extra,
                            to_tag=_gen_tag())
     _send(resp, addr)
+
+
+def _register_auth_challenge_headers(
+    realm: str,
+    nonce: str,
+) -> str:
+    params = [
+        f'realm="{realm}"',
+        f'nonce="{nonce}"',
+        "algorithm=MD5",
+    ]
+    challenge = "Digest " + ", ".join(params)
+    return f"WWW-Authenticate: {challenge}\r\n"
+
+
+def _register_auth_challenge_realm(
+    msg: dict,
+    to_uri: str,
+    fallback_realm: str,
+) -> str:
+    """Return the REGISTER digest realm anchored to the CRM identity."""
+    if fallback_realm:
+        return fallback_realm
+    request_target = _extract_realm_target(msg.get("uri", ""))
+    if request_target:
+        return request_target
+    return _extract_host(to_uri)
+
+
+def _register_challenge_key(msg: dict, addr: Tuple[str, int]) -> str:
+    auth_h = _get_header(msg, "proxy-authorization") or _get_header(
+        msg, "authorization"
+    )
+    return "|".join(
+        [
+            addr[0],
+            str(addr[1]),
+            _get_header(msg, "call-id"),
+            _get_header(msg, "cseq"),
+            _get_header(msg, "via"),
+            auth_h,
+        ]
+    )
+
+
+def _build_register_challenge_response(
+    msg: dict,
+    addr: Tuple[str, int],
+    *,
+    realm: str,
+) -> str:
+    now = time.time()
+    key = _register_challenge_key(msg, addr)
+    cached = _register_challenges.get(key)
+    if cached and (now - cached[0]) < _REGISTER_CHALLENGE_TTL:
+        return cached[1]
+
+    nonce = _rand_hex(32)
+    _nonces[nonce] = now
+    extra = _register_auth_challenge_headers(realm, nonce)
+    resp = _build_response(
+        401,
+        "Unauthorized",
+        msg,
+        extra_headers=extra,
+        to_tag=_gen_tag(),
+        include_contact=True,
+        include_allow=False,
+        include_server=True,
+        use_user_agent_header=True,
+        preserve_via=False,
+    )
+    _register_challenges[key] = (now, resp)
+    return resp
 
 
 def _split_sip_user_sep(sip_user: str) -> Tuple[str, str, str]:
@@ -1941,6 +2184,13 @@ def _cleanup_loop() -> None:
         stale = [n for n, t in _nonces.items() if now - t > 300]
         for n in stale:
             del _nonces[n]
+
+        stale_challenges = [
+            key for key, (ts, _) in _register_challenges.items()
+            if now - ts > _REGISTER_CHALLENGE_TTL
+        ]
+        for key in stale_challenges:
+            del _register_challenges[key]
 
 
 # ===========================================================================

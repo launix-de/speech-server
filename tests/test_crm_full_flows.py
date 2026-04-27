@@ -119,7 +119,14 @@ class TestInboundFullFlow:
                 "callee": "+493586",
                 "leg_id": leg.leg_id,
             })
-            time.sleep(0.1)
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if any(
+                    p.get("number") == "sip:admin@crm.example"
+                    for p in crm.participants.values()
+                ):
+                    break
+                time.sleep(0.05)
 
         # Participant for the internal phone was created + originate
         # DSL ran (the leg_id would be non-empty).

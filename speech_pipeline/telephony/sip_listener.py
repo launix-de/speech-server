@@ -19,6 +19,10 @@ from . import leg as leg_mod, subscriber as sub_mod, dispatcher
 _LOGGER = logging.getLogger("telephony.sip-listener")
 
 RING_TIMEOUT = 30  # seconds to wait for subscriber to bridge via API
+# Some CRM deployments answer the webhook quickly but only create/bridge the
+# call graph a bit later. Keep SIP legs alive for a bounded grace window so a
+# slightly late /api/calls + /api/pipelines sequence does not lose the leg.
+LATE_BRIDGE_GRACE_TIMEOUT = 45
 
 _phones: Dict[str, object] = {}  # pbx_id -> VoIPPhone
 _INBOUND_DIALOG_TTL = 300.0
@@ -239,13 +243,31 @@ def _handle_incoming(pbx_id: str, voip_call) -> None:
     _wait_for_bridge(leg, voip_call)
 
 
-def _wait_for_bridge(leg, voip_call) -> None:
-    """Wait for subscriber to bridge the leg via API, or timeout."""
-    deadline = time.time() + RING_TIMEOUT
-    while time.time() < deadline:
+def _wait_for_bridge(leg, voip_call, *,
+                     ring_timeout: float | None = None,
+                     grace_timeout: float | None = None) -> None:
+    """Wait for subscriber to bridge the leg via API, or timeout.
+
+    ``ring_timeout < 0`` disables the server-side timeout entirely and leaves
+    teardown to the remote SIP endpoint / explicit API cleanup. That is useful
+    for user-initiated registered-client outbound calls where the CRM may take
+    arbitrarily long before it posts the call graph back.
+    """
+    if ring_timeout is None:
+        ring_timeout = RING_TIMEOUT
+    if grace_timeout is None:
+        grace_timeout = LATE_BRIDGE_GRACE_TIMEOUT
+
+    deadline = time.time() + ring_timeout if ring_timeout >= 0 else None
+    hard_deadline = deadline
+    grace_logged = False
+    session = getattr(leg, "sip_session", None)
+    if session is not None and deadline is not None:
+        hard_deadline += grace_timeout
+
+    while hard_deadline is None or time.time() < hard_deadline:
         if leg.call_id:
             return  # bridged via API
-        session = getattr(leg, "sip_session", None)
         if session is not None and hasattr(session, "hungup") and session.hungup.is_set():
             leg.status = "completed"
             leg_mod.delete_leg(leg.leg_id)
@@ -259,11 +281,25 @@ def _wait_for_bridge(leg, voip_call) -> None:
                     return
             except Exception:
                 pass
+        if (
+            not grace_logged
+            and session is not None
+            and deadline is not None
+            and time.time() >= deadline
+        ):
+            grace_logged = True
+            _LOGGER.warning(
+                "Leg %s: no bridge within %ds — keeping SIP leg alive for %ds grace",
+                leg.leg_id,
+                ring_timeout,
+                grace_timeout,
+            )
         time.sleep(0.5)
 
     # Timeout — reject
+    total_timeout = ring_timeout + (grace_timeout if session is not None else 0)
     _LOGGER.warning("Leg %s: no bridge within %ds — hanging up",
-                    leg.leg_id, RING_TIMEOUT)
+                    leg.leg_id, total_timeout)
     leg.status = "no-answer"
     try:
         voip_call.hangup()

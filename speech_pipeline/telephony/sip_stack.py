@@ -51,15 +51,19 @@ _calls_lock = threading.Lock()
 # Client device registrations (registrar): sip_user -> registration_key -> _Registration
 _registrations: Dict[str, Dict[str, "_Registration"]] = {}
 _registrations_lock = threading.Lock()
-
 # Pending transactions: (branch or call_id, method) -> callback
 _transactions: Dict[str, Callable] = {}
 _transactions_lock = threading.Lock()
 
-# Nonce -> True for registrar challenges we issued
+# REGISTER auth state is intentionally RAM-only.
+# Do not add a persistence layer here just to survive process restarts:
+# this server is designed to stay stateless across restarts except for its
+# live in-memory SIP state/config, and device interoperability should be
+# handled via bounded nonce reuse / tolerant digest validation instead.
 _nonces: Dict[str, float] = {}
-_register_challenges: Dict[str, Tuple[float, str]] = {}
+_register_challenges: Dict[str, "_RegisterChallenge"] = {}
 _REGISTER_CHALLENGE_TTL = 60.0
+_REGISTER_NONCE_REUSE_TTL = 3600.0
 _SERVER_HEADER_VALUE = "tts-piper SIP/1.0"
 _ALLOW_METHODS = (
     "INVITE, ACK, OPTIONS, CANCEL, BYE, UPDATE, PRACK, INFO, "
@@ -120,6 +124,17 @@ class _Registration:
     subscriber_id: str = "" # CRM subscriber this device belongs to
     base_url: str = ""      # CRM base URL for callbacks/device dial
     source_addr: Tuple[str, int] = ("", 0)  # actual REGISTER source tuple
+
+
+@dataclass
+class _RegisterChallenge:
+    created_at: float
+    response: str
+    nonce: str
+    realm: str
+    call_id: str
+    cseq: str
+    source_addr: Tuple[str, int]
 
 
 def _registration_key(contact_uri: str, addr: Tuple[str, int]) -> str:
@@ -211,6 +226,28 @@ def _sdp_ip_for_remote_sdp(remote_sdp_ip: str) -> str:
     (direct LAN path).  If public, reply with our public IP.
     """
     if _is_private_ip(remote_sdp_ip):
+        return _local_ip
+    return _public_ip or _local_ip
+
+
+def _contact_ip_for_remote(remote_ip: str) -> str:
+    """Pick the Contact IP advertised to a given remote peer.
+
+    - LAN peer (RFC 1918 source address) → our local IP, the direct
+      LAN path.
+    - Anything else (public source address) → our public IP.
+
+    Sharing a NAT router with the peer is NOT a reason to fall back to
+    the local IP: the peer's SIP stack resolves the Contact header
+    verbatim, and a 192.168.x.y address is not routable from its
+    perspective even when it physically sits behind the same router.
+    If the client uses the Contact as the next-hop for its auth retry,
+    a private IP sends the packet to whatever happens to own that
+    address in the peer's own LAN — i.e. into the void. Public IP +
+    NAT hairpin is what got the request here in the first place; the
+    response follows the exact same path.
+    """
+    if not remote_ip or _is_private_ip(remote_ip):
         return _local_ip
     return _public_ip or _local_ip
 
@@ -383,8 +420,20 @@ def _extract_user(uri: str) -> str:
 
 def _extract_host(uri: str) -> str:
     """Extract host from SIP URIs with or without a user part."""
-    m = re.match(r"sips?:(?:[^@]+@)?([^:;>]+)", uri)
-    return m.group(1) if m else ""
+    uri = uri.strip()
+    m = re.match(r"^sips?:(.+)$", uri)
+    if not m:
+        return ""
+    target = m.group(1).split(";", 1)[0].split("?", 1)[0]
+    if "@" in target:
+        target = target.split("@", 1)[1]
+    if target.startswith("["):
+        end = target.find("]")
+        return target[1:end] if end > 0 else ""
+    host, sep, port = target.rpartition(":")
+    if sep and port.isdigit():
+        return host
+    return target
 
 
 def _is_ip_literal(host: str) -> bool:
@@ -461,7 +510,7 @@ def _extract_realm_target(uri: str) -> str:
 
     Mirrors the request target as sent by the client instead of normalizing
     it down to a host. This preserves old working forms such as
-    ``sip:launix.de/crm`` and plain registrar hosts like
+    ``sip:example.net/crm`` and plain registrar hosts like
     ``sip:crm.example.test``.
     """
     uri = uri.strip()
@@ -599,6 +648,8 @@ def _build_response(
     status: int, reason: str, msg: dict, *,
     body: str = "", extra_headers: str = "",
     to_tag: str = "",
+    contact_uri: str = "",
+    contact_params: str = "",
     include_contact: bool = True,
     include_allow: bool = False,
     include_server: bool = True,
@@ -635,7 +686,14 @@ def _build_response(
 
     contact_header = ""
     if include_contact:
-        contact = f"<sip:{_local_ip}:{_sip_port}>"
+        if contact_uri:
+            contact = f"<{contact_uri}>"
+        else:
+            remote_ip = source_addr[0] if source_addr else ""
+            contact_ip = _contact_ip_for_remote(remote_ip)
+            contact = f"<sip:{contact_ip}:{_sip_port}>"
+        if contact_params:
+            contact += contact_params
         contact_header = f"Contact: {contact}\r\n"
     allow_header = f"Allow: {_ALLOW_METHODS}\r\n" if include_allow else ""
     server_header = ""
@@ -1120,6 +1178,7 @@ def _resolve_sip_identity(to_uri: str) -> Tuple[str, str, Optional[dict]]:
       New: sip:alice@crm.example.test        (plain user, SIP domain)
       Old: sip:user%40crm.example/app@sip... (encoded CRM info in username)
       Old: sip:user:crm.example~app@sip...   (: separator, ~ for /)
+      Old: sip:user+crm.example~app@sip...   (+ separator, ~ for /)
 
     Returns (username, realm, subscriber) or (username, realm, None) on failure.
     """
@@ -1127,8 +1186,10 @@ def _resolve_sip_identity(to_uri: str) -> Tuple[str, str, Optional[dict]]:
     raw_user = _extract_user(to_uri)
     decoded_user = unquote(raw_user)
 
-    # Old format: encoded CRM info in username (contains @ or : after decode)
-    if "@" in decoded_user or ":" in decoded_user:
+    # Old format: encoded CRM info in username (contains @, :, or + after
+    # decode). ``+`` is supported for clients that reject ``@`` in usernames
+    # but also use ``:`` for their own local syntax.
+    if "@" in decoded_user or ":" in decoded_user or "+" in decoded_user:
         crm_user, base_url = _split_sip_user(decoded_user)
         realm = _realm_from_sip_user(decoded_user)
         subscriber = sub_mod.find_by_base_url(base_url) if base_url else None
@@ -1136,10 +1197,15 @@ def _resolve_sip_identity(to_uri: str) -> Tuple[str, str, Optional[dict]]:
 
     # New format: plain username, SIP domain identifies subscriber
     sip_domain = _extract_host(to_uri)
-    subscriber = sub_mod.find_by_sip_domain(sip_domain)
-    # Old direct syntax puts the CRM server into the URI host/path directly.
-    if not subscriber and "/" in sip_domain:
-        subscriber = sub_mod.find_by_base_url(sip_domain)
+    subscriber = sub_mod.find_by_registration_target(sip_domain)
+    if not subscriber and decoded_user and sip_domain:
+        unique = sub_mod.find_unique_subscriber()
+        if unique:
+            canonical_domain = sub_mod.base_url_to_sip_domain(
+                unique.get("base_url", "")
+            )
+            if canonical_domain:
+                return (decoded_user, canonical_domain, unique)
     return (decoded_user, sip_domain, subscriber)
 
 
@@ -1147,10 +1213,13 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
     """Process REGISTER from a SIP client device."""
     to_h = _get_header(msg, "to")
     to_uri = _extract_uri(to_h)
-    username, realm, _ = _resolve_sip_identity(to_uri)
+    username, realm, subscriber_hint = _resolve_sip_identity(to_uri)
     sip_domain = _extract_host(to_uri)
     # Canonical SIP AOR for registration storage — always normalize
-    raw_aor = f"{username}@{sip_domain}" if sip_domain else username
+    identity_domain = sip_domain or realm
+    if subscriber_hint and realm and realm != sip_domain and "/" not in realm:
+        identity_domain = realm
+    raw_aor = f"{username}@{identity_domain}" if identity_domain else username
     sip_user = _normalize_sip_user(raw_aor)
     contact = _get_header(msg, "contact")
 
@@ -1160,10 +1229,11 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
     proxy_auth_h = _get_header(msg, "proxy-authorization")
     auth_h = proxy_auth_h or _get_header(msg, "authorization")
     if not auth_h:
+        challenge_realm = _register_auth_challenge_realm(msg, to_uri, realm)
         resp = _build_register_challenge_response(
             msg,
             addr,
-            realm=_register_auth_challenge_realm(msg, to_uri, realm),
+            realm=challenge_realm,
         )
         _send(resp, addr)
         return
@@ -1172,21 +1242,28 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
     auth_params = _parse_www_authenticate(auth_h)
     nonce = auth_params.get("nonce", "")
     auth_username = auth_params.get("username", "")
-    nonce_known = nonce in _nonces
+    nonce_in_cache = nonce in _nonces
+    nonce_recent = _register_challenge_matches(msg, addr, nonce)
+    nonce_known = nonce_in_cache or nonce_recent
 
-    # Resolve subscriber
-    username, realm_resolved, subscriber = _resolve_sip_identity(
-        f"sip:{auth_username}" if auth_username else to_uri
-    )
-    if not subscriber:
-        username, realm_resolved, subscriber = _resolve_sip_identity(to_uri)
+    # Resolve subscriber from the From/To AOR — the AOR carries the CRM
+    # domain, the Authorization username carries the actual CRM login.
+    # The two are not interchangeable: AVM FRITZ!Box keeps a numeric
+    # "Rufnummer" (e.g. ``1``) in From for FB-internal compatibility while
+    # putting the real login (e.g. ``carli``) into Authorization.username.
+    _, realm_resolved, subscriber = _resolve_sip_identity(to_uri)
+    if auth_username:
+        username = _crm_username_from_sip_identity(auth_username)
+    else:
+        username = _crm_username_from_sip_identity(_extract_user(to_uri))
     if not username:
         _LOGGER.warning("REGISTER: no username in %s", to_uri)
         if not nonce_known:
+            challenge_realm = _register_auth_challenge_realm(msg, to_uri, realm)
             resp = _build_register_challenge_response(
                 msg,
                 addr,
-                realm=_register_auth_challenge_realm(msg, to_uri, realm),
+                realm=challenge_realm,
             )
         else:
             resp = _build_response(403, "Forbidden", msg, to_tag=_gen_tag())
@@ -1200,18 +1277,16 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
             auth_username,
         )
         if not nonce_known:
+            challenge_realm = _register_auth_challenge_realm(msg, to_uri, realm)
             resp = _build_register_challenge_response(
                 msg,
                 addr,
-                realm=_register_auth_challenge_realm(msg, to_uri, realm),
+                realm=challenge_realm,
             )
         else:
             resp = _build_response(403, "Forbidden", msg, to_tag=_gen_tag())
         _send(resp, addr)
         return
-
-    if auth_username:
-        sip_user = _normalize_sip_user(auth_username)
 
     # Call CRM to get HA1
     raw_sip_user = auth_params.get("username", sip_user)
@@ -1219,10 +1294,11 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
     ha1_info = _crm_login(subscriber, username, auth_realm, raw_sip_user)
     if not ha1_info:
         if not nonce_known:
+            challenge_realm = _register_auth_challenge_realm(msg, to_uri, realm)
             resp = _build_register_challenge_response(
                 msg,
                 addr,
-                realm=_register_auth_challenge_realm(msg, to_uri, realm),
+                realm=challenge_realm,
             )
         else:
             resp = _build_response(403, "Forbidden", msg, to_tag=_gen_tag())
@@ -1244,18 +1320,23 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
 
     if expected != actual:
         _LOGGER.warning("REGISTER: digest mismatch for %s", sip_user)
+        challenge_realm = _register_auth_challenge_realm(msg, to_uri, realm)
         resp = _build_register_challenge_response(
             msg,
             addr,
-            realm=_register_auth_challenge_realm(msg, to_uri, realm),
+            realm=challenge_realm,
         )
         _send(resp, addr)
         return
 
     if not nonce_known:
-        _LOGGER.info(
-            "REGISTER from %s: accepted digest for uncached nonce", addr
+        _LOGGER.warning(
+            "REGISTER from %s: accepted digest for unknown nonce (interop mode)",
+            addr,
         )
+        _nonces[nonce] = time.time()
+    elif nonce_recent and not nonce_in_cache:
+        _LOGGER.info("REGISTER from %s: accepted digest for recent nonce", addr)
         _nonces[nonce] = time.time()
 
     # Keep nonce valid until it expires (SIP clients reuse it on re-REGISTER)
@@ -1270,28 +1351,36 @@ def _handle_inbound_register(msg: dict, addr: Tuple[str, int]) -> None:
     if contact:
         contact_uri = _extract_uri(contact)
     else:
-        contact_uri = f"sip:{sip_user}@{addr[0]}:{addr[1]}"
+        contact_uri = f"sip:{username}@{addr[0]}:{addr[1]}"
 
     # Store/update registration
     reg_key = _registration_key(contact_uri, addr)
+    registration = _Registration(
+        sip_user=sip_user,
+        contact_uri=contact_uri,
+        expires=time.time() + expires,
+        user_id=ha1_info.get("user_id", 0),
+        subscriber_id=subscriber.get("id", ""),
+        base_url=subscriber.get("base_url", ""),
+        source_addr=addr,
+    )
     with _registrations_lock:
         regs = _registrations.setdefault(sip_user, {})
-        regs[reg_key] = _Registration(
-            sip_user=sip_user,
-            contact_uri=contact_uri,
-            expires=time.time() + expires,
-            user_id=ha1_info.get("user_id", 0),
-            subscriber_id=subscriber.get("id", ""),
-            base_url=subscriber.get("base_url", ""),
-            source_addr=addr,
-        )
+        regs[reg_key] = registration
 
     _LOGGER.info("REGISTER: %s registered (contact=%s, expires=%d)",
                  sip_user, contact_uri, expires)
 
     extra = f"Expires: {expires}\r\n"
-    resp = _build_response(200, "OK", msg, extra_headers=extra,
-                           to_tag=_gen_tag())
+    resp = _build_response(
+        200,
+        "OK",
+        msg,
+        extra_headers=extra,
+        to_tag=_gen_tag(),
+        contact_uri=contact_uri,
+        contact_params=f";expires={expires}",
+    )
     _send(resp, addr)
 
 
@@ -1299,9 +1388,17 @@ def _register_auth_challenge_headers(
     realm: str,
     nonce: str,
 ) -> str:
+    # AVM FRITZ!Box firmwares silently drop 401s without ``qop="auth"``;
+    # ``opaque`` is added defensively because some firmwares require it.
+    # ``stale`` is intentionally omitted on first challenge — AVM treats
+    # ``stale=false`` as "you sent bad credentials" and gives up instead of
+    # retrying with Authorization.
+    opaque = _rand_hex(16)
     params = [
         f'realm="{realm}"',
         f'nonce="{nonce}"',
+        f'opaque="{opaque}"',
+        'qop="auth"',
         "algorithm=MD5",
     ]
     challenge = "Digest " + ", ".join(params)
@@ -1313,10 +1410,27 @@ def _register_auth_challenge_realm(
     to_uri: str,
     fallback_realm: str,
 ) -> str:
-    """Return the REGISTER digest realm anchored to the CRM identity."""
+    """Return the REGISTER digest realm for the current client flow.
+
+    For canonical AORs (``user@crm.example``) the digest realm follows the
+    resolved CRM domain (``fallback_realm``).
+
+    For transport-host registrations whose username already embeds the CRM
+    mapping (``user+crm.example@srv.example`` and older ``user:crm~path`` /
+    ``user%40crm/path`` forms), the realm must stay on the actual registrar
+    target. Historical successful device traces in this deployment used
+    ``realm="sip.edge.example.net"`` together with an auth username carrying the
+    CRM identity; challenging such requests with the CRM domain prevents the
+    client from generating the auth retry at all.
+    """
+    from urllib.parse import unquote
+
+    request_target = _extract_realm_target(msg.get("uri", ""))
+    raw_user = unquote(_extract_user(to_uri))
+    if request_target and any(sep in raw_user for sep in ("+", ":", "@")):
+        return request_target
     if fallback_realm:
         return fallback_realm
-    request_target = _extract_realm_target(msg.get("uri", ""))
     if request_target:
         return request_target
     return _extract_host(to_uri)
@@ -1336,6 +1450,26 @@ def _register_challenge_key(msg: dict, addr: Tuple[str, int]) -> str:
             auth_h,
         ]
     )
+def _register_challenge_matches(
+    msg: dict,
+    addr: Tuple[str, int],
+    nonce: str,
+) -> bool:
+    if not nonce:
+        return False
+    call_id = _get_header(msg, "call-id")
+    cseq = _get_header(msg, "cseq")
+    for challenge in _register_challenges.values():
+        if challenge.nonce != nonce:
+            continue
+        if challenge.call_id != call_id:
+            continue
+        if challenge.cseq != cseq:
+            continue
+        if challenge.source_addr != addr:
+            continue
+        return True
+    return False
 
 
 def _build_register_challenge_response(
@@ -1347,25 +1481,44 @@ def _build_register_challenge_response(
     now = time.time()
     key = _register_challenge_key(msg, addr)
     cached = _register_challenges.get(key)
-    if cached and (now - cached[0]) < _REGISTER_CHALLENGE_TTL:
-        return cached[1]
+    if cached and (now - cached.created_at) < _REGISTER_CHALLENGE_TTL:
+        return cached.response
 
     nonce = _rand_hex(32)
     _nonces[nonce] = now
-    extra = _register_auth_challenge_headers(realm, nonce)
+    # Date header in RFC 3261 SIP-date format (RFC 1123). AVM FRITZ!Box
+    # firmwares are known to ignore 401 challenges without it.
+    date_header = "Date: " + time.strftime(
+        "%a, %d %b %Y %H:%M:%S GMT", time.gmtime(now)
+    ) + "\r\n"
+    extra = date_header + _register_auth_challenge_headers(realm, nonce)
+    contact_ip = _contact_ip_for_remote(addr[0])
     resp = _build_response(
         401,
         "Unauthorized",
         msg,
         extra_headers=extra,
         to_tag=_gen_tag(),
+        contact_uri=f"sip:{contact_ip}:{_sip_port}",
         include_contact=True,
-        include_allow=False,
+        include_allow=True,
         include_server=True,
         use_user_agent_header=True,
+        # RFC 3581 §4: the topmost Via MUST be echoed with populated
+        # rport/received when the request carries ``rport`` without a
+        # value. AVM FRITZ!Box firmwares silently drop 401s that violate
+        # this, so we can never preserve-Via for a register challenge.
         preserve_via=False,
     )
-    _register_challenges[key] = (now, resp)
+    _register_challenges[key] = _RegisterChallenge(
+        created_at=now,
+        response=resp,
+        nonce=nonce,
+        realm=realm,
+        call_id=_get_header(msg, "call-id"),
+        cseq=_get_header(msg, "cseq"),
+        source_addr=addr,
+    )
     return resp
 
 
@@ -1375,14 +1528,16 @@ def _split_sip_user_sep(sip_user: str) -> Tuple[str, str, str]:
     Supports two formats:
       user@example.com/app   (percent-encoded %40 is decoded first)
       user:example.com/app   (for SIP clients that reject @ in usernames)
+      user+example.com/app   (for SIP clients that reject @ and reserve :)
       user:example.com~app   (~ as / alternative for clients that reject /)
+      user+example.com~app   (~ as / alternative for clients that reject /)
 
     @ takes precedence so that %40-encoded users keep working.
     Returns (username, rest, separator) or ("", "", "") if no separator found.
     """
     from urllib.parse import unquote
     sip_user = unquote(sip_user)
-    for sep in ("@", ":"):
+    for sep in ("@", ":", "+"):
         if sep in sip_user:
             username, rest = sip_user.split(sep, 1)
             rest = rest.replace("~", "/")
@@ -1403,7 +1558,9 @@ def _realm_from_sip_user(sip_user: str) -> str:
 def _split_sip_user(sip_user: str) -> Tuple[str, str]:
     """Split SIP username into (crm_username, base_url).
 
-    Input:  user@example.com/app  (or user%40example.com/app or user:example.com~app)
+    Input:  user@example.com/app
+            (or user%40example.com/app or user:example.com~app or
+             user+example.com~app)
     Output: ("user", "https://example.com/app")
     """
     from urllib.parse import unquote
@@ -1439,6 +1596,17 @@ def _split_sip_user(sip_user: str) -> Tuple[str, str]:
             return (username, f"https://{rest}")
         return ("", "")
 
+    # Old restricted-client format with '+' as CRM separator:
+    #   user+example.com~app@proxy.host
+    if "+" in decoded:
+        username, rest = decoded.split("+", 1)
+        rest = rest.replace("~", "/")
+        if ("@" in rest) and ("/" in rest):
+            rest = rest.rsplit("@", 1)[0]
+        if username and rest:
+            return (username, f"https://{rest}")
+        return ("", "")
+
     # Decoded old format, with or without explicit proxy suffix:
     #   user@example.com/app
     #   user@example.com/app@proxy.host
@@ -1453,6 +1621,22 @@ def _split_sip_user(sip_user: str) -> Tuple[str, str]:
     return ("", "")
 
 
+def _crm_username_from_sip_identity(sip_user: str) -> str:
+    """Return the CRM username represented by a SIP identity.
+
+    Device-facing SIP identities may be canonical AORs (``user@crm.domain``)
+    or older embedded CRM forms (``user@example/app`` / ``user:example~app`` /
+    ``user+example~app``). CRM webhooks need the logical CRM username, not the
+    transport/AOR wrapper.
+    """
+    crm_user, _ = _split_sip_user(sip_user)
+    if crm_user:
+        return crm_user
+    if "@" in sip_user:
+        return sip_user.split("@", 1)[0]
+    return sip_user
+
+
 # Cache successful HA1 lookups so SIP re-REGISTERs (every ~60 s per
 # device) don't hit the CRM each time.  Short TTL — we re-verify with
 # CRM periodically so password changes propagate.
@@ -1465,17 +1649,24 @@ def _crm_login(
 ) -> Optional[dict]:
     """Call CRM login endpoint to get HA1 for digest verification.
 
-    GET {base_url}/Telephone/SpeechServer/login?username={user}&realm={realm}&sip_user={full_sip_user}
+    GET {subscriber.login_url}?username={user}&realm={realm}&sip_user={full_sip_user}
     Authorization: Bearer {bearer_token}
     Response: {"ha1": "md5hash", "user_id": 123}
+
+    The CRM provisions ``login_url`` as an absolute URL when it registers as a
+    subscriber via ``PUT /api/subscribe/<id>``. The speech server has no
+    knowledge of CRM-specific endpoint conventions — that is the CRM's job.
 
     Caches successful results for 5 min so frequent re-REGISTERs don't
     stall on CRM latency.
     """
-    base_url = subscriber.get("base_url", "").rstrip("/")
+    url = subscriber.get("login_url", "")
     token = subscriber.get("bearer_token", "")
-    if not base_url or not token:
-        _LOGGER.warning("CRM login: subscriber missing base_url or token")
+    if not url or not token:
+        _LOGGER.warning(
+            "CRM login: subscriber missing login_url or bearer_token "
+            "(subscriber must be (re-)registered via PUT /api/subscribe/<id>)"
+        )
         return None
 
     cache_key = f"{subscriber.get('id','')}|{username}|{realm}|{full_sip_user}"
@@ -1483,7 +1674,6 @@ def _crm_login(
     if cached and (time.time() - cached[0]) < _HA1_TTL:
         return cached[1]
 
-    url = f"{base_url}/Telephone/SpeechServer/login"
     params = {
         "username": username,
         "realm": realm,
@@ -2004,19 +2194,21 @@ def _handle_registered_client_invite(
     _trunk_dialogs[call_id]["rtp_session"] = rtp
     _trunk_dialogs[call_id]["leg_id"] = leg.leg_id
 
+    crm_username = _crm_username_from_sip_identity(source_user) or source_user
     dispatcher.fire_subscriber_event(subscriber, "device_dial", {
         "callId": leg.leg_id,
-        "caller": source_user,
+        "caller": crm_username,
         "callee": target_user,
         "number": target_user,
         "leg_id": leg.leg_id,
-        "sip_user": source_user,
+        "sip_user": crm_username,
         "user_id": source_reg.user_id,
     })
 
     threading.Thread(
         target=sip_listener._wait_for_bridge,
         args=(leg, None),
+        kwargs={"ring_timeout": -1},
         daemon=True,
         name=f"dial-bridge-{leg.leg_id}",
     ).start()
@@ -2180,14 +2372,19 @@ def _cleanup_loop() -> None:
                 if not reg_map:
                     _registrations.pop(sip_user, None)
 
-        # Expire nonces older than 5 minutes
-        stale = [n for n, t in _nonces.items() if now - t > 300]
+        # REGISTER nonce state stays in RAM on purpose. We only keep a bounded
+        # reuse window for interoperability; restarts are not meant to reload
+        # persisted nonce state.
+        stale = [
+            n for n, t in _nonces.items()
+            if now - t > _REGISTER_NONCE_REUSE_TTL
+        ]
         for n in stale:
             del _nonces[n]
 
         stale_challenges = [
-            key for key, (ts, _) in _register_challenges.items()
-            if now - ts > _REGISTER_CHALLENGE_TTL
+            key for key, challenge in _register_challenges.items()
+            if now - challenge.created_at > _REGISTER_CHALLENGE_TTL
         ]
         for key in stale_challenges:
             del _register_challenges[key]
@@ -2213,7 +2410,7 @@ def is_running() -> bool:
 
 def init(sip_port: int) -> None:
     """Start the SIP stack on the given UDP port."""
-    global _sock, _local_ip, _sip_port, _recv_thread, _running
+    global _sock, _local_ip, _public_ip, _sip_port, _recv_thread, _running
 
     if _running:
         _LOGGER.warning("SIP stack already running")
@@ -2231,6 +2428,13 @@ def init(sip_port: int) -> None:
         _local_ip = _get_local_ip("8.8.8.8", 53)
     except Exception:
         _local_ip = "127.0.0.1"
+
+    # Public host advertised in Contact for non-LAN peers (e.g. FritzBox over
+    # WAN). Without this we fall back to the LAN IP, which is unreachable for
+    # an internet-side client and breaks AVM REGISTER auth retries.
+    env_public = os.environ.get("SIP_PUBLIC_HOST", "").strip()
+    if env_public:
+        _public_ip = env_public
 
     _running = True
 

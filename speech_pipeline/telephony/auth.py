@@ -103,8 +103,9 @@ def put_account(account_id: str, data: dict) -> dict:
     acct = {
         "id": account_id,
         "token": token,
-        "base_url": data.get("base_url"),    # CRM base URL for heartbeat ping
-        "pbx": data.get("pbx"),              # None = any PBX allowed
+        "base_url": data.get("base_url"),         # informational, e.g. for UIs
+        "heartbeat_url": data.get("heartbeat_url"),  # absolute CRM URL
+        "pbx": data.get("pbx"),                   # None = any PBX allowed
         "max_concurrent_calls": data.get("max_concurrent_calls", 0),
         "features": data.get("features", []),
     }
@@ -121,22 +122,31 @@ def put_account(account_id: str, data: dict) -> dict:
     #
     # This side effect is therefore deliberate orchestration, not accidental
     # coupling hidden in the API handler.
-    base_url = acct.get("base_url")
-    if base_url:
+    heartbeat_url = acct.get("heartbeat_url")
+    if heartbeat_url:
         import threading
         threading.Thread(
             target=_ping_crm_heartbeat,
-            args=(base_url, token),
+            args=(heartbeat_url, token),
             daemon=True,
         ).start()
+    else:
+        _LOGGER.info(
+            "Account %s registered without heartbeat_url — skipping boot ping",
+            account_id,
+        )
 
     return acct
 
 
-def _ping_crm_heartbeat(base_url: str, token: str) -> None:
-    """Tell the CRM to register its subscriber hooks at the speech server."""
+def _ping_crm_heartbeat(url: str, token: str) -> None:
+    """Tell the CRM to register its subscriber hooks at the speech server.
+
+    ``url`` is the absolute CRM heartbeat URL provisioned via
+    ``PUT /api/accounts/<id>``. The speech server does not infer or
+    construct CRM endpoints itself.
+    """
     import requests as http_requests
-    url = base_url.rstrip("/") + "/Telephone/SpeechServer/heartbeat"
     try:
         resp = http_requests.get(url,
                                  headers={"Authorization": f"Bearer {token}"},

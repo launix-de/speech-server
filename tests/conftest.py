@@ -161,6 +161,7 @@ def account(client, admin):
                data=json.dumps({
                    "base_url": "https://example.com/crm",
                    "bearer_token": "sub-token-xyz",
+                   "login_url": "https://example.com/crm/Telephone/SpeechServer/login",
                }),
                headers=headers)
     return headers
@@ -181,6 +182,7 @@ def account2(client, admin):
                data=json.dumps({
                    "base_url": "https://other.example.com/crm",
                    "bearer_token": "sub2-token",
+                   "login_url": "https://other.example.com/crm/Telephone/SpeechServer/login",
                }),
                headers=headers)
     return headers

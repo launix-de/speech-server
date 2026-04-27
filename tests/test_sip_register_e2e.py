@@ -58,7 +58,7 @@ def _avm_register_message(
     auth_username: str,
     *,
     auth_header: str | None = None,
-    auth_header_name: str = "Proxy-Authorization",
+    auth_header_name: str = "Authorization",
     cseq: int = 586,
     expires: int = 1800,
 ) -> dict:
@@ -184,8 +184,8 @@ class TestSipRegisterWithFakeCrm:
             challenge = sent[-1][0]
             params = _challenge_params(challenge)
             assert params["realm"] == sip_domain
-            assert "qop" not in params
-            assert "opaque" not in params
+            assert params.get("qop") == "auth"
+            assert params.get("opaque")
 
             auth = sip_stack._build_authorization(
                 "Authorization",
@@ -218,11 +218,57 @@ class TestSipRegisterWithFakeCrm:
         assert subscriber is not None
         assert subscriber["id"] == SUBSCRIBER_ID
 
+    def test_authenticated_register_succeeds_for_legacy_host_path_target(
+            self, client, admin, account, monkeypatch):
+        token = account["Authorization"].split(None, 1)[1]
+        crm = FakeCrm(client, admin_headers=admin, account_token=token)
+        crm.BASE_URL = "https://example.net/app/crm-next"
+        crm.login_tokens["alice"] = "alice-login-token"
+        crm.login_user_ids["alice"] = 42
+        crm.register_as_subscriber(SUBSCRIBER_ID, "TestPBX")
+
+        sent: list[tuple[str, tuple[str, int]]] = []
+        monkeypatch.setattr(
+            sip_stack,
+            "_send",
+            lambda data, addr: sent.append((data, addr)),
+        )
+
+        with crm.active(monkeypatch):
+            legacy_sip_user = "alice@example.net/app/crm-next"
+            first = _register_message(legacy_sip_user)
+            sip_stack._handle_inbound_register(first, ("203.0.113.85", 5060))
+
+            challenge = sent[-1][0]
+            params = _challenge_params(challenge)
+            assert params["realm"] == "example.net/app/crm-next"
+
+            auth = sip_stack._build_authorization(
+                "Authorization",
+                "alice",
+                crm.login_tokens["alice"],
+                params,
+                "REGISTER",
+                "sip:example.net/app/crm-next",
+            )
+            second = _register_message(
+                legacy_sip_user,
+                auth_header=auth,
+                auth_header_name="Authorization",
+            )
+            sip_stack._handle_inbound_register(second, ("203.0.113.85", 5060))
+
+        assert "SIP/2.0 200 OK" in sent[-1][0]
+        regs = sip_stack.get_registrations("alice@crm-next.app.example.net")
+        assert len(regs) == 1
+        assert regs[0]["base_url"] == "https://example.net/app/crm-next"
+
     def test_normalize_old_proxy_style_sip_user_to_canonical_aor(
             self, deployed_crm):
         base = deployed_crm.BASE_URL.removeprefix("https://")
         old_encoded = f"alice%40{base}@sip-proxy.example.test"
         old_mangled = f"alice:{base.replace('/', '~')}@sip-proxy.example.test"
+        old_plus = f"alice+{base.replace('/', '~')}@sip-proxy.example.test"
         canonical = f"alice@{deployed_crm.sip_domain}"
 
         assert sip_stack._split_sip_user(old_encoded) == (
@@ -231,8 +277,12 @@ class TestSipRegisterWithFakeCrm:
         assert sip_stack._split_sip_user(old_mangled) == (
             "alice", deployed_crm.BASE_URL
         )
+        assert sip_stack._split_sip_user(old_plus) == (
+            "alice", deployed_crm.BASE_URL
+        )
         assert sip_stack._normalize_sip_user(old_encoded) == canonical
         assert sip_stack._normalize_sip_user(old_mangled) == canonical
+        assert sip_stack._normalize_sip_user(old_plus) == canonical
 
     def test_unauthenticated_register_is_rejected(self, deployed_crm, monkeypatch):
         sent: list[tuple[str, tuple[str, int]]] = []
@@ -252,8 +302,8 @@ class TestSipRegisterWithFakeCrm:
         assert "SIP/2.0 401 Unauthorized" in payload
         params = _challenge_params(payload)
         assert params["realm"] == deployed_crm.sip_domain
-        assert "qop" not in params
-        assert "opaque" not in params
+        assert params.get("qop") == "auth"
+        assert params.get("opaque")
         assert sip_stack.get_registrations(sip_user) == []
         assert deployed_crm.login_requests == []
 
@@ -314,9 +364,10 @@ class TestSipRegisterWithFakeCrm:
         monkeypatch.setattr(sip_stack, "_gen_tag", lambda: "tag-avm")
         monkeypatch.setattr(sip_stack, "_gen_branch", lambda: "z9hG4bK-avm-out")
 
-        sip_user = f"alice@{deployed_crm.sip_domain}"
+        auth_sip_user = f"alice@{deployed_crm.sip_domain}"
+        registered_aor = f"1@{deployed_crm.sip_domain}"
         with deployed_crm.active(monkeypatch):
-            first = _avm_register_message(auth_username=sip_user)
+            first = _avm_register_message(auth_username=auth_sip_user)
             sip_stack._handle_inbound_register(first, ("203.0.113.85", 5060))
 
             first_challenge = sent[-1][0]
@@ -325,7 +376,7 @@ class TestSipRegisterWithFakeCrm:
 
             stale_auth = (
                 "Digest "
-                f'username="{sip_user}", '
+                f'username="{auth_sip_user}", '
                 f'realm="{first_params["realm"]}", '
                 'nonce="stale-nonce", '
                 'uri="sip:sip-proxy.example.test", '
@@ -333,7 +384,7 @@ class TestSipRegisterWithFakeCrm:
                 "algorithm=MD5"
             )
             stale = _avm_register_message(
-                auth_username=sip_user,
+                auth_username=auth_sip_user,
                 auth_header=stale_auth,
             )
             sip_stack._handle_inbound_register(stale, ("203.0.113.85", 5060))
@@ -346,27 +397,28 @@ class TestSipRegisterWithFakeCrm:
 
             retry_auth = sip_stack._build_authorization(
                 "Authorization",
-                sip_user,
+                auth_sip_user,
                 deployed_crm.login_tokens["alice"],
                 retry_params,
                 "REGISTER",
                 "sip:sip-proxy.example.test",
             )
             retry = _avm_register_message(
-                auth_username=sip_user,
+                auth_username=auth_sip_user,
                 auth_header=retry_auth,
+                auth_header_name="Authorization",
             )
             sip_stack._handle_inbound_register(retry, ("203.0.113.85", 5060))
 
         assert "SIP/2.0 200 OK" in sent[-1][0]
-        regs = sip_stack.get_registrations(sip_user)
+        regs = sip_stack.get_registrations(registered_aor)
         assert len(regs) == 1
         reg = regs[0]
         assert reg["contact_uri"] == "sip:1@203.0.113.85;uniq=DEVICE1"
         assert reg["source_addr"] == ("203.0.113.85", 5060)
 
         before_invite = len(sent)
-        sip_stack.call_registered_user(sip_user)
+        sip_stack.call_registered_user(registered_aor)
         invite_payload, invite_addr = sent[-1]
         assert len(sent) == before_invite + 1
         assert invite_addr == ("203.0.113.85", 5060)
@@ -381,6 +433,7 @@ class TestSipRegisterWithFakeCrm:
 
         sent: list[tuple[str, tuple[str, int]]] = []
         events: list[tuple[dict, str, dict]] = []
+        bridge_wait: dict[str, object] = {}
 
         class _DummyRtpSession:
             def __init__(self, *args, **kwargs):
@@ -405,8 +458,19 @@ class TestSipRegisterWithFakeCrm:
                             lambda sub, key, payload: events.append(
                                 (sub, key, payload)
                             ) or [])
-        monkeypatch.setattr(sip_listener, "_wait_for_bridge",
-                            lambda *args, **kwargs: None)
+
+        class _DummyThread:
+            def __init__(self, *, target=None, args=(), kwargs=None, **_extras):
+                self._target = target
+                self._args = args
+                self._kwargs = kwargs or {}
+
+            def start(self):
+                bridge_wait["target"] = self._target
+                bridge_wait["args"] = self._args
+                bridge_wait["kwargs"] = self._kwargs
+
+        monkeypatch.setattr(sip_stack.threading, "Thread", _DummyThread)
 
         sip_user = f"alice@{deployed_crm.sip_domain}"
         with deployed_crm.active(monkeypatch):
@@ -447,14 +511,17 @@ class TestSipRegisterWithFakeCrm:
         sub, key, payload = events[0]
         assert sub["id"] == SUBSCRIBER_ID
         assert key == "device_dial"
+        assert payload["caller"] == "alice"
         assert payload["number"] == "+4930123456"
-        assert payload["sip_user"] == sip_user
+        assert payload["sip_user"] == "alice"
         assert any("SIP/2.0 183 Session Progress" in data for data, _ in sent), (
             "registered-client INVITE was not accepted with 183 Session Progress"
         )
         assert not any("SIP/2.0 404 Not Found" in data for data, _ in sent), (
             "server misclassified a registered client INVITE as an unregistered target"
         )
+        assert bridge_wait["target"] is sip_listener._wait_for_bridge
+        assert bridge_wait["kwargs"] == {"ring_timeout": -1}
 
         assert len(deployed_crm.login_requests) == 1
         login = deployed_crm.login_requests[0]
@@ -528,6 +595,7 @@ class TestSipRegisterWithFakeCrm:
         assert sub["id"] == SUBSCRIBER_ID
         assert key == "device_dial"
         assert payload["number"] == "+4930123456"
-        assert payload["sip_user"] == registered_user
+        assert payload["caller"] == "alice"
+        assert payload["sip_user"] == "alice"
         assert any("SIP/2.0 183 Session Progress" in data for data, _ in sent)
         assert not any("SIP/2.0 404 Not Found" in data for data, _ in sent)

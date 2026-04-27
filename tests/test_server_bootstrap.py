@@ -134,3 +134,127 @@ class TestCoreRoutes:
         )
         assert resp.status_code == 400
         assert b"must not contain" in resp.data
+
+
+class TestStartupCallbackResilience:
+    """Regression guard: a transient network error at boot must NOT leave
+    the server permanently unprovisioned.
+
+    A real incident: at a pm2 restart the host couldn't reach the
+    orchestrator ('Network is unreachable'), the fire-and-forget
+    callback logged a warning and gave up, and the server kept running
+    for hours with no PBX / no accounts / no subscribers. Every inbound
+    SIP REGISTER got 403 Forbidden because the subscriber lookup had
+    nothing to match against. The callback must retry with exponential
+    backoff so provisioning eventually completes once the network
+    recovers.
+    """
+
+    def test_connection_error_triggers_retry_until_success(self, monkeypatch):
+        import argparse
+        import threading
+        import time
+
+        pms = _load_main_module()
+
+        calls = {"n": 0}
+        done = threading.Event()
+
+        class _FakeResp:
+            status_code = 204
+
+        def fake_get(url, headers=None, timeout=None):
+            calls["n"] += 1
+            if calls["n"] < 3:
+                # First two attempts: simulate transient network fault
+                from requests import exceptions as rexc
+                raise rexc.ConnectionError("Network is unreachable")
+            done.set()
+            return _FakeResp()
+
+        import requests as _requests
+        monkeypatch.setattr(_requests, "get", fake_get)
+
+        args = argparse.Namespace(
+            host="127.0.0.1", port=0, model=None, voices_path="voices-piper",
+            scan_dir=None, cuda=False, sentence_silence=0.0,
+            soundpath="../voices/%s.wav",
+            media_folder=str(Path(__file__).resolve().parents[1]),
+            bearer="", whisper_model="base",
+            admin_token="test-admin-token",
+            startup_callback="https://orchestrator.example.test/startup",
+            startup_callback_token="cb-token",
+            # Fast backoff so the test finishes quickly
+            startup_callback_initial_delay=0.05,
+            startup_callback_max_delay=0.1,
+            startup_callback_max_attempts=10,
+            sip_port=0, debug=False,
+        )
+        pms.create_app(args)
+
+        assert done.wait(timeout=5.0), (
+            f"callback never succeeded after {calls['n']} attempts — "
+            f"retry loop is broken or gave up too early"
+        )
+        assert calls["n"] >= 3, (
+            f"expected at least 3 attempts (two ConnectionError + one OK), "
+            f"got {calls['n']}"
+        )
+
+    def test_gives_up_after_max_attempts(self, monkeypatch):
+        """Retry must be bounded — an endlessly-unreachable orchestrator
+        should not spin forever. After ``max_attempts`` it logs an error
+        and stops (the operator now has to either fix the network and
+        restart pm2, or configure a higher cap)."""
+        import argparse
+        import threading
+
+        pms = _load_main_module()
+
+        calls = {"n": 0}
+        gave_up = threading.Event()
+
+        def fake_get(url, headers=None, timeout=None):
+            calls["n"] += 1
+            from requests import exceptions as rexc
+            raise rexc.ConnectionError("still unreachable")
+
+        import requests as _requests
+        monkeypatch.setattr(_requests, "get", fake_get)
+
+        # Detect the "gave up" log line via a logging handler
+        import logging
+
+        class _SignalHandler(logging.Handler):
+            def emit(self, record):
+                if "gave up" in record.getMessage():
+                    gave_up.set()
+
+        handler = _SignalHandler()
+        logging.getLogger("piper-multi-server").addHandler(handler)
+
+        try:
+            args = argparse.Namespace(
+                host="127.0.0.1", port=0, model=None, voices_path="voices-piper",
+                scan_dir=None, cuda=False, sentence_silence=0.0,
+                soundpath="../voices/%s.wav",
+                media_folder=str(Path(__file__).resolve().parents[1]),
+                bearer="", whisper_model="base",
+                admin_token="test-admin-token",
+                startup_callback="https://orchestrator.example.test/startup",
+                startup_callback_token="cb-token",
+                startup_callback_initial_delay=0.01,
+                startup_callback_max_delay=0.02,
+                startup_callback_max_attempts=3,
+                sip_port=0, debug=False,
+            )
+            pms.create_app(args)
+
+            assert gave_up.wait(timeout=5.0), (
+                f"retry loop did not surrender after 3 attempts ({calls['n']} calls)"
+            )
+            assert calls["n"] == 3, (
+                f"expected exactly 3 attempts, got {calls['n']}"
+            )
+        finally:
+            logging.getLogger("piper-multi-server").removeHandler(handler)

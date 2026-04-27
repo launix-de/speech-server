@@ -99,6 +99,7 @@ def put(subscriber_id: str, account_id: str, data: dict) -> dict:
         "account_id": account_id,
         "base_url": data.get("base_url", ""),
         "bearer_token": data.get("bearer_token", ""),
+        "login_url": data.get("login_url", ""),
         "outbound_caller_id": data.get("outbound_caller_id", ""),
         "inbound_dids": data.get("inbound_dids", []),
         "events": data.get("events", {}),
@@ -202,6 +203,61 @@ def find_by_base_url(base_url: str) -> Optional[dict]:
     if not sid:
         return None
     return _subscribers.get(sid)
+
+
+def find_by_registration_target(target: str) -> Optional[dict]:
+    """Resolve a SIP registration target to the owning subscriber.
+
+    Supports both canonical SIP domains and legacy direct host/path forms.
+    Examples:
+      crm.example.test      -> sip_domain lookup
+      example.test/crm      -> normalized base_url lookup
+      example.test/crm      -> fallback to base_url_to_sip_domain(...)
+
+    The last step preserves compatibility for older SIP clients that still
+    register against a direct CRM host/path alias while the subscriber is
+    indexed under its canonical ``sip_domain``.
+    """
+    raw = (target or "").strip()
+    if not raw:
+        return None
+
+    found = find_by_sip_domain(raw)
+    if found:
+        return found
+
+    found = find_by_base_url(raw)
+    if found:
+        return found
+
+    if "/" not in raw:
+        return None
+
+    derived_domain = base_url_to_sip_domain(f"https://{raw}")
+    return find_by_sip_domain(derived_domain)
+
+
+def find_unique_subscriber() -> Optional[dict]:
+    """Return the only live subscriber when exactly one exists.
+
+    This is a bounded fallback for SIP clients that authenticate against the
+    transport registrar host (for example ``srv.example.test``) instead of the
+    tenant's logical SIP domain. It is only safe when there is exactly one
+    active subscriber; otherwise the transport host is ambiguous and must not
+    be guessed.
+    """
+    _purge()
+    result = []
+    now = time.time()
+    for entry in _subscribers.values():
+        if STALE_SECONDS:
+            age = now - entry["last_seen"]
+            if age > STALE_SECONDS:
+                continue
+        result.append(entry)
+        if len(result) > 1:
+            return None
+    return result[0] if result else None
 
 
 def find_by_did(did: str) -> Optional[dict]:

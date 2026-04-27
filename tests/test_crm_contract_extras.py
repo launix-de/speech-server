@@ -62,6 +62,7 @@ class TestHeartbeatContract:
                           data=json.dumps({
                               "base_url": "https://crm.example.com/crm",
                               "bearer_token": "t",
+                              "login_url": "https://crm.example.com/crm/Telephone/SpeechServer/login",
                               "events": {
                                   "incoming": "POST /p?state=incoming",
                                   "call_ended": "POST /p?state=ended",

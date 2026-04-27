@@ -81,6 +81,7 @@ class FakeCrm:
             data=json.dumps({
                 "base_url": self.BASE_URL,
                 "bearer_token": self.account_token,
+                "login_url": self.BASE_URL + "/Telephone/SpeechServer/login",
                 "events": events,
             }),
             headers=self.account_headers,

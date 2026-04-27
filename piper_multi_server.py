@@ -166,19 +166,67 @@ def create_app(args: argparse.Namespace) -> Flask:
         # perspective it is intentionally generic: the callback target is the
         # admin-side orchestrator that will provision PBXs/accounts via the
         # API.  The speech server itself does not know LDS-specific logic.
+        #
+        # Resilience: a transient network error at boot (DNS not yet up,
+        # upstream firewall not yet open, etc.) used to leave the server
+        # permanently unprovisioned — no PBX, no accounts, no subscribers —
+        # so every SIP REGISTER got 403 Forbidden until someone restarted
+        # pm2 at the right time. We now retry with exponential backoff on
+        # connection errors until the provisioner responds (any HTTP status
+        # counts as "responded" — that's the provisioner's concern).
         startup_cb = getattr(args, 'startup_callback', None) or ''
         if startup_cb:
             startup_cb_token = getattr(args, 'startup_callback_token', None) or admin_token
+            startup_max_attempts = getattr(args, 'startup_callback_max_attempts', 0) or 0
+            startup_initial_delay = getattr(args, 'startup_callback_initial_delay', 0.0) or 1.0
+            startup_max_delay = getattr(args, 'startup_callback_max_delay', 0.0) or 300.0
+
             def _fire_startup_callback(url: str, token: str) -> None:
                 import requests
-                try:
-                    _LOGGER.info("Sending startup callback to %s", url)
-                    resp = requests.get(url, headers={
-                        "Authorization": f"Bearer {token}",
-                    }, timeout=30)
-                    _LOGGER.info("Startup callback response: %s", resp.status_code)
-                except Exception as e:
-                    _LOGGER.warning("Startup callback failed: %s", e)
+                import time as _time
+                attempt = 0
+                delay = startup_initial_delay
+                while True:
+                    attempt += 1
+                    try:
+                        _LOGGER.info(
+                            "Sending startup callback to %s (attempt %d)",
+                            url, attempt,
+                        )
+                        resp = requests.get(url, headers={
+                            "Authorization": f"Bearer {token}",
+                        }, timeout=30)
+                        _LOGGER.info(
+                            "Startup callback response: %s", resp.status_code,
+                        )
+                        return
+                    except requests.exceptions.ConnectionError as e:
+                        # Transient network issue: the box is up but the
+                        # orchestrator (or DNS/route to it) is not yet
+                        # reachable. Keep trying — the registrar is useless
+                        # without provisioning.
+                        if startup_max_attempts and attempt >= startup_max_attempts:
+                            _LOGGER.error(
+                                "Startup callback to %s gave up after %d "
+                                "attempts: %s", url, attempt, e,
+                            )
+                            return
+                        _LOGGER.warning(
+                            "Startup callback to %s failed (attempt %d, "
+                            "retrying in %.1fs): %s",
+                            url, attempt, delay, e,
+                        )
+                        _time.sleep(delay)
+                        delay = min(delay * 2, startup_max_delay)
+                    except Exception as e:
+                        # Non-connection errors (timeout, bad response,
+                        # etc.) are logged but not retried — they indicate
+                        # a server-side issue the orchestrator has to
+                        # resolve on its own.
+                        _LOGGER.warning(
+                            "Startup callback to %s failed: %s", url, e,
+                        )
+                        return
             # Fire after app is ready (in a thread to not block startup)
             threading.Thread(
                 target=_fire_startup_callback,

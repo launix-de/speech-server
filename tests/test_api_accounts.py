@@ -151,3 +151,81 @@ class TestAccountPBXAccess:
                    data=json.dumps({"token": "free-tok"}),
                    headers=admin)
         assert check_pbx_access("free-acct", "AnyPBX") is True
+
+
+class TestAccountHeartbeatUrl:
+    """The CRM provisions ``heartbeat_url`` (absolute) so the speech server
+    never has to construct CRM endpoint paths itself."""
+
+    def test_heartbeat_url_round_trips(self, client, admin):
+        client.put("/api/accounts/hb-acct",
+                   data=json.dumps({
+                       "token": "hb-tok",
+                       "base_url": "https://hb.example.com/crm",
+                       "heartbeat_url": "https://hb.example.com/crm/Telephone/SpeechServer/heartbeat",
+                   }),
+                   headers=admin)
+        resp = client.get("/api/accounts/hb-acct", headers=admin)
+        assert resp.get_json()["heartbeat_url"] == (
+            "https://hb.example.com/crm/Telephone/SpeechServer/heartbeat"
+        )
+
+    def test_heartbeat_url_triggers_get_request(self, client, admin, monkeypatch):
+        """Provisioning an account WITH ``heartbeat_url`` fires a GET to that
+        URL with a Bearer token. The speech server does not infer the path."""
+        import speech_pipeline.telephony.auth as auth_mod
+        captured: dict = {}
+
+        def fake_get(url, headers=None, timeout=None, **kw):
+            captured["url"] = url
+            captured["headers"] = headers
+            class _R:
+                status_code = 200
+            return _R()
+
+        # Patch the requests module that auth._ping_crm_heartbeat imports lazily.
+        import requests as http_requests
+        monkeypatch.setattr(http_requests, "get", fake_get)
+
+        client.put("/api/accounts/hb-fire",
+                   data=json.dumps({
+                       "token": "hb-fire-tok",
+                       "heartbeat_url": "https://crm.example.com/some/custom/heartbeat",
+                   }),
+                   headers=admin)
+
+        # The heartbeat ping runs on a background thread; give it a tick.
+        import time
+        for _ in range(50):
+            if captured.get("url"):
+                break
+            time.sleep(0.01)
+
+        assert captured.get("url") == "https://crm.example.com/some/custom/heartbeat"
+        assert captured["headers"]["Authorization"] == "Bearer hb-fire-tok"
+
+    def test_heartbeat_url_missing_skips_ping(self, client, admin, monkeypatch):
+        """Without ``heartbeat_url`` the speech server skips the boot ping —
+        no fallback path is constructed from base_url."""
+        called = {"hit": False}
+        import requests as http_requests
+        def fake_get(*a, **kw):
+            called["hit"] = True
+            class _R:
+                status_code = 200
+            return _R()
+        monkeypatch.setattr(http_requests, "get", fake_get)
+
+        client.put("/api/accounts/no-hb",
+                   data=json.dumps({
+                       "token": "no-hb-tok",
+                       "base_url": "https://no-hb.example.com/crm",
+                   }),
+                   headers=admin)
+
+        import time
+        time.sleep(0.05)
+        assert called["hit"] is False, (
+            "speech server reconstructed a heartbeat URL from base_url; "
+            "it must wait for the CRM to provision heartbeat_url explicitly"
+        )

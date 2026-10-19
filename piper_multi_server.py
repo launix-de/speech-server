@@ -17,7 +17,7 @@ Runtime dependencies (typical)
     # or
     pip install onnxruntime-gpu
 - Coqui TTS (for optional FreeVC voice conversion)
-    pip install TTS
+    pip install coqui-tts
 - PyTorch (required by Coqui TTS; choose the right build for your CUDA/CPU)
     # CPU example
     pip install torch --index-url https://download.pytorch.org/whl/cpu
@@ -67,14 +67,15 @@ import mimetypes, os
 from flask import Flask, Response, jsonify, request, stream_with_context
 from flask_sock import Sock
 
-# Ensure Piper sources are discoverable if installed from local sources
+# Prefer the installed Piper build; fall back to local sources if absent.
 import sys as _sys
+import importlib.util as _importlib_util
 from pathlib import Path as _Path
 _candidates = [
     _Path('/home/carli/sources/piper/src'),
     (_Path(__file__).resolve().parents[2] / 'sources' / 'piper' / 'src'),
 ]
-for _p in _candidates:
+for _p in _candidates if _importlib_util.find_spec('piper') is None else []:
     try:
         if _p.exists():
             _sys.path.insert(0, str(_p))

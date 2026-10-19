@@ -404,9 +404,9 @@ body { font-family: system-ui, sans-serif; display: flex;
 // Session is bound server-side to the nonce; the browser must not
 // receive or choose arbitrary pipeline DSL.
 var sessionId = __SESSION_ID__;
-var appBase = location.pathname.replace(/\/phone\/[^/?#]+$/, '');
+var appBase = location.pathname.replace(/\\/phone\\/[^/?#]+$/, '');
 var wsBase = location.origin.replace(/^http/, 'ws') + appBase;
-var nonce = location.pathname.match(/\/phone\/([^/?#]+)/);
+var nonce = location.pathname.match(/\\/phone\\/([^/?#]+)/);
 nonce = nonce ? nonce[1] : '';
 
 // Load codec.js relative to the current /tts app prefix.

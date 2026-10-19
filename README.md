@@ -33,10 +33,28 @@ curl -X POST -H "Authorization: Bearer TOKEN" \
 
 ## Installation
 
+Use a dedicated virtual environment so a system Python update cannot change
+the server's interpreter or hide its installed packages:
+
+```bash
+python3.14 -m venv .venv
+.venv/bin/python -m pip install --upgrade pip
+.venv/bin/python -m pip install -e ".[tts,stt,sip,server,test]"
+```
+
+Python 3.10 and newer are supported. On Python 3.13+, installation selects
+`audioop-lts`, the maintained continuation of the removed standard-library
+module, preserving codec and streaming resampler behavior. Optional FreeVC
+uses the maintained `coqui-tts` distribution through `.[vc]`; remove the
+legacy `TTS` distribution before installing it, since both provide the
+`TTS` import. Configure PM2 to invoke the
+virtual environment's interpreter by absolute path rather than `python3`
+from `PATH`. Do not copy `site-packages` between Python versions.
+
 ```bash
 pip install -e ".[tts,stt,server]"         # core + TTS + STT + HTTP server
 pip install -e ".[all]"                     # everything including VC and SIP
-pip install -e /path/to/piper              # Piper TTS from source
+pip install -e /path/to/piper              # optional custom Piper build
 ```
 
 System dependencies:
@@ -273,6 +291,16 @@ Syntax:
 originate:+491701234567{"ringing":"/cb/ring","answered":"/cb/ans","completed":"/cb/end"} -> call:call-123
 ```
 
+This form returns `leg_id` immediately. The client attaches the answered leg
+with a separate bridge pipeline. To bridge automatically on answer, use:
+
+```text
+originate:+491701234567{"completed":"/cb/end"} -> call:call-123 -> originate:+491701234567
+```
+
+Both forms return before SIP setup completes. SIP failures are reported
+through the configured leg callbacks.
+
 JSON params:
 - `ringing`
 - `answered`
@@ -390,6 +418,13 @@ tee:leg1_tap -> stt:de -> webhook:https://crm.example.com/stt
 
 #### `webhook:URL{...}`
 NDJSON webhook sink.
+
+Delivery runs asynchronously in order. The sink buffers up to 256 pending
+lines and drops new lines with a warning when full, keeping the audio path
+responsive. Orderly completion drains pending deliveries; cancellation
+discards them after any in-flight request finishes. Failed deliveries are
+logged without retrying. Python callers can configure `queue_maxsize` and
+`timeout` on `WebhookSink`; `run()` and `stream_pcm24k()` both consume upstream.
 
 Syntax:
 ```text

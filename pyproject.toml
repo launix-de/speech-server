@@ -7,21 +7,23 @@ name = "speech-pipeline"
 version = "0.1.0"
 description = "Composable stage-based speech pipeline — TTS, STT, voice conversion, SIP bridging"
 requires-python = ">=3.10"
-dependencies = ["numpy"]
+dependencies = [
+    "numpy",
+    "requests>=2.31",
+    "audioop-lts>=0.2.2; python_version >= '3.13'",
+]
 
 [project.optional-dependencies]
-tts = ["onnxruntime>=1.16"]
+tts = ["onnxruntime>=1.16", "piper-tts>=1.3"]
 stt = ["faster-whisper>=1.0"]
-vc  = ["TTS>=0.22", "torch>=2.1"]
-sip = ["pyVoIP>=1.6"]
+vc  = ["coqui-tts>=0.27.5", "torch>=2.2"]
+sip = ["pyVoIP>=1.6", "av>=14", "pylibsrtp>=0.10", "pyOpenSSL>=23.0"]
 server = ["Flask>=2.3", "flask-sock>=0.7"]
+test = ["pytest>=7.0"]
 all = ["speech-pipeline[tts,stt,vc,sip,server]"]
 
 [tool.setuptools.packages.find]
 include = ["speech_pipeline*"]
-
-[project.optional-dependencies.test]
-pytest = ["pytest>=7.0"]
 
 [project.scripts]
 speech-pipeline = "speech_pipeline.cli:main"

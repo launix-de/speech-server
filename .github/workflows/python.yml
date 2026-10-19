@@ -1,0 +1,49 @@
+name: Python compatibility
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  audio-and-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.10', '3.12', '3.14']
+    env:
+      OPENBLAS_NUM_THREADS: '1'
+      OMP_NUM_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install media tools
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - name: Install library and runtime dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install '.[tts,stt,sip,server,test]'
+          python -m pip check
+      - name: Check installed package outside the source tree
+        working-directory: /tmp
+        run: |
+          python -c 'import speech_pipeline, audioop, av, piper, onnxruntime, faster_whisper'
+          speech-pipeline --help
+      - name: Test audio, server bootstrap, and asynchronous call control
+        run: >-
+          python -m pytest -q
+          tests/test_pipeline.py
+          tests/test_sample_rate_converter.py
+          tests/test_codecs.py
+          tests/test_pyvoip_session.py
+          tests/test_dsl_actions.py
+          tests/test_dsl_validation.py
+          tests/test_server_bootstrap.py
+          tests/test_scoped_local_aliases.py
+          tests/test_whisper_stt_chunking.py
+          tests/test_webhook_sink_async.py
+          tests/test_webhooks_fire_and_forget.py

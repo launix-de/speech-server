@@ -158,6 +158,7 @@ class _Trunk:
     call_id_reg: str = ""
     cseq: int = 0
     _refresh_timer: Optional[threading.Timer] = None
+    _registered_until: float = 0.0
 
 
 # ---------------------------------------------------------------------------
@@ -744,8 +745,35 @@ def _send(data: str, addr: Tuple[str, int]) -> None:
 # ---------------------------------------------------------------------------
 
 
+def _schedule_trunk_register(trunk: _Trunk, delay: float) -> bool:
+    """Keep one refresh/retry timer per active trunk, including on packet loss."""
+    def refresh() -> None:
+        with _trunks_lock:
+            if trunk._refresh_timer is not timer:
+                return
+            trunk._refresh_timer = None
+        _send_register(trunk)
+
+    with _trunks_lock:
+        if not _running or _trunks.get(trunk.pbx_id) is not trunk:
+            return False
+        if trunk._refresh_timer:
+            trunk._refresh_timer.cancel()
+        timer = threading.Timer(delay, refresh)
+        timer.daemon = True
+        trunk._refresh_timer = timer
+        timer.start()
+    return True
+
+
 def _send_register(trunk: _Trunk, auth_header: str = "") -> None:
     """Send REGISTER to the PBX."""
+    # Arm recovery BEFORE sending: a lost UDP response or a transient DNS /
+    # network failure must not permanently stop registration renewal.
+    if not _schedule_trunk_register(trunk, 30.0):
+        return
+    if trunk._registered_until and time.monotonic() >= trunk._registered_until:
+        trunk.registered = False
     trunk.cseq += 1
     trunk.call_id_reg = trunk.call_id_reg or _gen_call_id()
     trunk.local_tag = trunk.local_tag or _gen_tag()
@@ -780,7 +808,6 @@ def _handle_register_response(trunk: _Trunk, msg: dict) -> None:
     status = msg["status"]
 
     if status == 200:
-        trunk.registered = True
         # Learn public IP from Via received= parameter (NAT traversal)
         global _public_ip
         via = _get_header(msg, "via")
@@ -795,16 +822,18 @@ def _handle_register_response(trunk: _Trunk, msg: dict) -> None:
                      trunk.pbx_id, trunk.server, trunk.port, trunk.username)
         # Schedule re-registration
         expires = 300
-        exp_header = _get_header(msg, "expires")
+        contact = _get_header(msg, "contact")
+        contact_expiry = re.search(r';\s*expires\s*=\s*"?(\d+)', contact, re.I)
+        exp_header = (contact_expiry.group(1) if contact_expiry
+                      else _get_header(msg, "expires"))
         if exp_header:
             try:
                 expires = int(exp_header)
             except ValueError:
                 pass
-        trunk._refresh_timer = threading.Timer(
-            max(expires - 30, 60), _send_register, args=(trunk,))
-        trunk._refresh_timer.daemon = True
-        trunk._refresh_timer.start()
+        trunk.registered = expires > 0
+        trunk._registered_until = time.monotonic() + max(0, expires)
+        _schedule_trunk_register(trunk, max(1.0, min(expires - 30, expires * 0.8)))
 
     elif status in (401, 407):
         # Authentication required
@@ -824,6 +853,8 @@ def _handle_register_response(trunk: _Trunk, msg: dict) -> None:
         _send_register(trunk, auth_val)
 
     else:
+        if status >= 400:
+            trunk.registered = False
         _LOGGER.warning("Trunk %s: REGISTER got %d %s",
                         trunk.pbx_id, status, msg.get("reason", ""))
 
@@ -934,10 +965,12 @@ def _handle_response(msg: dict, addr: Tuple[str, int]) -> None:
     if cseq_method == "REGISTER":
         # Find which trunk this belongs to
         with _trunks_lock:
-            for trunk in _trunks.values():
-                if trunk.call_id_reg == call_id:
-                    _handle_register_response(trunk, msg)
-                    return
+            trunk = next((t for t in _trunks.values()
+                          if t.call_id_reg == call_id), None)
+        # Response handling schedules timers and can send an auth retry;
+        # never do this while holding the registry lock.
+        if trunk is not None:
+            _handle_register_response(trunk, msg)
         return
 
     # Look up active call
@@ -2565,6 +2598,9 @@ def call(pbx_id: str, target: str, caller_id: str = "") -> SIPCall:
         raise ValueError(f"No trunk registered for PBX {pbx_id}")
     if not trunk.registered:
         raise RuntimeError(f"Trunk {pbx_id} not yet registered with PBX")
+    if trunk._registered_until and time.monotonic() >= trunk._registered_until:
+        trunk.registered = False
+        raise RuntimeError(f"Trunk {pbx_id} registration expired")
 
     rtp_port = _find_free_rtp_port()
     call_id = _gen_call_id()

@@ -44,6 +44,7 @@ jobs:
           tests/test_dsl_validation.py
           tests/test_server_bootstrap.py
           tests/test_scoped_local_aliases.py
+          tests/test_trunk_registration_recovery.py
           tests/test_whisper_stt_chunking.py
           tests/test_webhook_sink_async.py
           tests/test_webhooks_fire_and_forget.py

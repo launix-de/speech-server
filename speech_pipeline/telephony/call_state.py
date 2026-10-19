@@ -46,6 +46,7 @@ class Call:
         self.mixer = ConferenceMixer(name=self.call_id,
                                      sample_rate=MIXER_SAMPLE_RATE,
                                      frame_samples=960)  # 20ms@48kHz — aligns with RTP timing
+        self._mixer_reference = self.mixer.retain()
         # Auto-remove call from registry when mixer idles out
         self.mixer.on_idle_cancel = lambda _m: _auto_cleanup(self.call_id)
         self._participants: Dict[str, dict] = {}
@@ -92,6 +93,8 @@ class Call:
 
     def end(self) -> None:
         self.mixer.cancel()
+        self.mixer.close()
+        self._mixer_reference.release()
         with self._lock:
             self._participants.clear()
         self.status = "completed"
@@ -129,6 +132,7 @@ def _auto_cleanup(call_id: str) -> None:
     if not call:
         return
     call.status = "completed"
+    call._mixer_reference.release()
     # Hang up any leftover legs
     from . import leg as leg_mod
     for lg in list(leg_mod.list_legs()):

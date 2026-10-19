@@ -644,16 +644,67 @@ codec:session1 -> conference:call-xxx -> codec:session1
 |--------|------|-------------|
 | `GET` | `/healthz` | Liveness check |
 | `GET` | `/voices` | Available voices with metadata |
-| `GET/POST` | `/tts/say` | Synthesize speech (query params, returns WAV). Rate limit: 1/IP |
-| `POST` | `/tts/stream` | Streaming TTS (text body in, WAV out). Rate limit: 1/IP |
-| `WS` | `/ws/stt` | WebSocket STT. Rate limit: 1 concurrent/IP |
-| `WS` | `/ws/tts` | WebSocket TTS. Rate limit: 1 concurrent/IP |
 | `WS` | `/ws/pipe` | Generic DSL pipeline over WebSocket (requires auth) |
 | `WS` | `/ws/socket/<id>` | Fourier codec bidirectional audio (unguessable session ID) |
 
 ### Pipeline API
 
-All `/api/` endpoints require `Authorization: Bearer <token>`. Both admin tokens and account tokens are accepted. Account tokens can only access their own calls and subscribers.
+Control endpoints under `/api/` require `Authorization: Bearer <token>`. Both admin tokens and account tokens are accepted. Account tokens can only access their own calls and subscribers.
+
+#### Prepared HTTP audio
+
+The application server defines the network and authenticates its creation. Its
+browser receives only a temporary capability URL, containing a 256-bit secret:
+
+```sh
+curl -H 'Authorization: Bearer <account-token>' -H 'Content-Type: application/json' \
+  -d '{"dsl":"tts{\"text\":\"Hallo\",\"chunk_seconds\":10} -> vc{\"url\":\"carli.wav\"}","http":{"timeout":180,"buffered":true}}' \
+  https://speech.example/api/pipelines
+# 201 {"id":"...","audio_url":"/api/audio/<secret>","timeout":180}
+```
+
+Prefix `audio_url` with the configured public speech-server base URL, including
+any reverse-proxy prefix, and pass it to the audio player. No account token goes
+into the browser. HTTP output supports concrete `tts`, `play`, `vc`, `pitch`,
+`gain`, `delay`, `call` and `conference` stages; their order comes from the DSL.
+`tts.chunk_seconds` is optional (0.1–30 seconds); longer chunks suit FreeVC.
+`http.buffered: true` renders finite clips into a spooled buffer (2 MiB RAM,
+then disk) and writes their exact WAV length, without estimated silence. Without
+buffering, the sink streams immediately using an open-ended WAV header and no
+HTTP Content-Length.
+Voice conversion failures raise an error instead of silently returning the
+original voice.
+Relative media files must be below the operator's `--media-folder`.
+
+The URL is single-use. The final `ResponseWriter` owns the deadline, starting
+when connected, including endpoints never fetched. `http.timeout` defaults to
+180 seconds and must be positive and at most 600. Completion, disconnect or
+expiry closes the sink, removes the endpoint and registry entry, and releases
+upstream references. Cleanup follows HTTP delivery; browser playback may finish
+later from its own buffer. Cancellation of native inference is cooperative and
+finishes after the current native operation returns.
+
+Every `.pipe()` edge retains its upstream stage. Closing a consumer cascades
+only through nodes with no consumers or explicit owners. Queue-based shared
+mixers/conferences retain ownership using `reference = stage.retain()` and
+`reference.release()`; both release and close are idempotent. `downstreams`
+exposes all consumers and `reference_count` includes retained owners. Explicitly
+closing a producer closes its outputs. Audio fan-out still uses tee/mixer
+queues; ownership references do not duplicate audio.
+
+The unauthenticated synthesis routes `/`, `/tts/say`, `/tts/stream`, `/tts/ws`,
+`/ws/tts` and `/ws/stt` have been removed. `/voices`, `/healthz`, `/metrics` and
+example downloads require bearer authentication. `/ws/pipe` requires an account
+or admin token to build networks; webclient nonces cannot build arbitrary pipes.
+Pre-created `/ws/socket/<session-secret>` and `/phone/<nonce>` grant access only
+to their prepared session. Do not publish or log these secrets.
+
+Accounts may be provisioned by the admin API, or supplied at startup using
+`--accounts-file /private/accounts.json` with a private mapping such as
+`{"game":{"token":"<random-secret>","pbx":[]}}` (an empty PBX allowlist
+disables telephone access for that account). Keep this file outside Git;
+Hardlife's deployment uses `.speech-accounts.json`. Scrapers must send a bearer
+token to operational endpoints.
 
 #### Pipeline API — the single audio-routing endpoint
 
@@ -867,8 +918,6 @@ Browse all voices: https://github.com/rhasspy/piper/blob/master/VOICES.md
 
 ```apache
 ProxyPass /tts/ws/pipe ws://localhost:5000/ws/pipe
-ProxyPass /tts/ws/stt ws://localhost:5000/ws/stt
-ProxyPass /tts/ws/tts ws://localhost:5000/ws/tts
 ProxyPass /tts http://localhost:5000
 ```
 

@@ -65,14 +65,48 @@ class _Coupling:
         self.src_id: Optional[str] = None
         self.sink_id: Optional[str] = None
         self._lock = threading.Lock()
+        self._endpoints: set[Stage] = set()
+        self._reference = None
+
+    def retain(self, endpoint: Stage) -> None:
+        with self._lock:
+            if not self._endpoints and isinstance(self.mixer, Stage):
+                self._reference = self.mixer.retain()
+            self._endpoints.add(endpoint)
+
+    def release(self, endpoint: Stage) -> None:
+        with self._lock:
+            self._endpoints.discard(endpoint)
+            output = None
+            reference = None
+            if not any(isinstance(e, ConferenceSource) for e in self._endpoints):
+                output, self.out_queue = self.out_queue, None
+            if not self._endpoints:
+                reference, self._reference = self._reference, None
+                self.src_id = None
+                input_queue = self.in_queue
+            else:
+                input_queue = None
+        if output is not None:
+            self.mixer.remove_output(output)
+        if input_queue is not None:
+            if endpoint.cancelled:
+                self.mixer.remove_input(input_queue)
+            else:
+                try:
+                    input_queue.put_nowait(None)
+                except queue.Full:
+                    pass
+        if reference is not None:
+            reference.release()
 
     def activate(self) -> None:
         """Register with the mixer (idempotent)."""
         with self._lock:
-            if self.src_id is not None:
-                return
-            self.in_queue, self.src_id = self.mixer.add_input_with_id()
-            self.out_queue = self.mixer.add_output(mute_source=self.src_id)
+            if self.src_id is None:
+                self.in_queue, self.src_id = self.mixer.add_input_with_id()
+            if self.out_queue is None:
+                self.out_queue = self.mixer.add_output(mute_source=self.src_id)
 
 
 class ConferenceSink(Stage):
@@ -85,6 +119,7 @@ class ConferenceSink(Stage):
     def __init__(self, coupling: _Coupling) -> None:
         super().__init__()
         self.coupling = coupling
+        coupling.retain(self)
         self.input_format = AudioFormat(coupling.mixer.sample_rate, "s16le")
 
     def run(self) -> None:
@@ -108,8 +143,11 @@ class ConferenceSink(Stage):
             self.close()
 
     def _on_close(self) -> None:
-        # Already queued the EOF in run()'s finally — nothing else to do.
-        pass
+        try:
+            self.coupling.in_queue.put_nowait(None)
+        except queue.Full:
+            pass
+        self.coupling.release(self)
 
 
 class ConferenceSource(Stage):
@@ -121,21 +159,27 @@ class ConferenceSource(Stage):
     def __init__(self, coupling: _Coupling) -> None:
         super().__init__()
         self.coupling = coupling
+        coupling.retain(self)
         self.output_format = AudioFormat(coupling.mixer.sample_rate, "s16le")
 
     def stream_pcm24k(self) -> Iterator[bytes]:
         self.coupling.activate()
         q = self.coupling.out_queue
         assert q is not None
-        while not self.cancelled:
-            try:
-                frame = q.get(timeout=0.5)
-            except queue.Empty:
-                if self.coupling.mixer.cancelled:
+        try:
+            while not self.cancelled and not self.closed:
+                try:
+                    frame = q.get(timeout=0.5)
+                except queue.Empty:
+                    if self.coupling.mixer.cancelled:
+                        break
+                    continue
+                if frame is None:
                     break
-                continue
-            if frame is None:
-                break
-            yield frame
-        _LOGGER.info("ConferenceSource: stream ended")
-        self.close()
+                yield frame
+        finally:
+            _LOGGER.info("ConferenceSource: stream ended")
+            self.close()
+
+    def _on_close(self) -> None:
+        self.coupling.release(self)

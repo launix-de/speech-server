@@ -79,7 +79,7 @@ class TestBootstrapCompiles:
         assert main_app is not None
         # The app has at least the core routes wired.
         rules = {r.rule for r in main_app.url_map.iter_rules()}
-        for expected in ("/healthz", "/metrics", "/voices", "/tts/say", "/"):
+        for expected in ("/healthz", "/metrics", "/voices", "/api/audio/<token>"):
             assert expected in rules, f"missing route: {expected}"
 
 
@@ -87,18 +87,18 @@ class TestCoreRoutes:
     """Hit the routes the blueprint-only test fixture can't see."""
 
     def test_healthz(self, main_client):
-        resp = main_client.get("/healthz")
+        resp = main_client.get("/healthz", headers={"Authorization": "Bearer test-admin-token"})
         assert resp.status_code == 200
         assert resp.data.strip() == b"ok"
 
     def test_metrics_is_exposition_format(self, main_client):
-        resp = main_client.get("/metrics")
+        resp = main_client.get("/metrics", headers={"Authorization": "Bearer test-admin-token"})
         assert resp.status_code == 200
         assert "text/plain" in resp.headers.get("Content-Type", "")
         assert b"speech_calls_total" in resp.data
 
     def test_voices_returns_json(self, main_client):
-        resp = main_client.get("/voices")
+        resp = main_client.get("/voices", headers={"Authorization": "Bearer test-admin-token"})
         assert resp.status_code == 200
         assert resp.is_json
 
@@ -111,29 +111,14 @@ class TestCoreRoutes:
         resp = main_client.post("/inputstream")
         assert resp.status_code == 404
 
-    def test_root_sound_rejects_parent_traversal(self, main_client):
-        resp = main_client.post(
-            "/",
-            json={"sound": "../secret.wav"},
-        )
-        assert resp.status_code == 400
-        assert b"must not contain" in resp.data
+    @pytest.mark.parametrize('path', ['/', '/tts/say', '/tts/stream', '/tts/ws', '/ws/tts', '/ws/stt'])
+    def test_legacy_audio_routes_removed(self, main_client, path):
+        assert main_client.get(path).status_code == 404
+        assert main_client.post(path).status_code == 404
 
-    def test_root_sound_accepts_media_folder_file(self, main_client):
-        resp = main_client.post(
-            "/",
-            json={"sound": "examples/queue.mp3"},
-        )
-        assert resp.status_code == 200
-        assert len(resp.data) > 100
-
-    def test_root_vc_rejects_parent_traversal(self, main_client):
-        resp = main_client.post(
-            "/",
-            json={"sound": "examples/queue.mp3", "voice2": "../secret.wav"},
-        )
-        assert resp.status_code == 400
-        assert b"must not contain" in resp.data
+    @pytest.mark.parametrize('path', ['/healthz', '/metrics', '/voices', '/api/pipelines'])
+    def test_operational_and_control_routes_require_auth(self, main_client, path):
+        assert main_client.get(path).status_code == 401
 
 
 class TestStartupCallbackResilience:
@@ -258,3 +243,18 @@ class TestStartupCallbackResilience:
             )
         finally:
             logging.getLogger("piper-multi-server").removeHandler(handler)
+
+
+class TestPhoneCodecAuthentication:
+    def test_unknown_nonce_cannot_fetch_phone_codec(self, main_client):
+        assert main_client.get('/phone/unknown/codec.js').status_code == 403
+        assert main_client.get('/examples/codec.js').status_code == 401
+
+    def test_codec_uses_prepared_phone_nonce(self, main_client, monkeypatch):
+        from speech_pipeline.telephony import auth, webclient
+        monkeypatch.setattr(auth, 'check_nonce', lambda nonce: {'nonce': nonce} if nonce == 'valid-phone' else None)
+        monkeypatch.setattr(webclient, '_sessions', {'session': {'nonce': 'valid-phone'}})
+        response = main_client.get('/phone/valid-phone/codec.js')
+        assert response.status_code == 200
+        assert b'AudioCodec' in response.data
+        response.close()

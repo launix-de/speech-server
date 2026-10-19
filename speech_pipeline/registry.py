@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, Optional
@@ -33,10 +34,13 @@ def discover_voices(scan_dirs: Iterable[Path]) -> Dict[str, Path]:
 
 
 def load_voice_info(model_path: Path) -> VoiceInfo:
-    voice = PiperVoice.load(model_path)
-    cfg = voice.config
+    # Reading voice metadata must not construct another ONNX session and its
+    # thread pool. It is also used by /voices and language discovery.
+    from piper.config import PiperConfig
+    with Path(str(model_path) + ".json").open() as config_file:
+        cfg = PiperConfig.from_dict(json.load(config_file))
     return VoiceInfo(
-        model_id=model_path.name.rstrip(".onnx"),
+        model_id=model_path.stem,
         path=model_path,
         espeak_voice=cfg.espeak_voice,
         sample_rate=cfg.sample_rate,

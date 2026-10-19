@@ -188,9 +188,12 @@ def check_pbx_access(account_id: str, pbx_id: str) -> bool:
     acct = get_account(account_id)
     if not acct:
         return False
-    if not acct.get("pbx"):
+    pin = acct.get("pbx")
+    if pin is None or pin == "":
         return True  # no pin = any PBX
-    return acct["pbx"] == pbx_id
+    if isinstance(pin, list):
+        return pbx_id in pin
+    return pin == pbx_id
 
 
 def check_feature(account_id: str, feature: str) -> bool:

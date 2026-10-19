@@ -36,6 +36,12 @@ jobs:
       - name: Test audio, server bootstrap, and asynchronous call control
         run: >-
           python -m pytest -q
+          tests/test_mixer.py
+          tests/test_pipeline_api.py
+          tests/test_hardening.py
+          tests/test_http_audio_lifecycle.py
+          tests/test_hardlife_tts_compat.py
+          tests/test_sip_pipe_semantics.py
           tests/test_pipeline.py
           tests/test_sample_rate_converter.py
           tests/test_codecs.py

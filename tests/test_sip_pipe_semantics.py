@@ -34,6 +34,7 @@ from speech_pipeline.HangupSink import HangupSink
 from speech_pipeline.SIPSink import SIPSink
 from speech_pipeline.SIPSource import SIPSource
 from speech_pipeline.telephony import leg as leg_mod
+from speech_pipeline.telephony.id_scope import localize_for_account
 from speech_pipeline.telephony.pipe_executor import CallPipeExecutor
 
 
@@ -278,7 +279,8 @@ class TestWrapSipStructure:
         assert chains[0][0][0] == "sip_source"
         assert isinstance(chains[0][1][3], HangupSink)
 
-    def test_play_sip_terminal(self, leg_l):
+    def test_play_sip_terminal(self, leg_l, monkeypatch):
+        monkeypatch.setattr("speech_pipeline.media_refs.require_safe_url", lambda url: None)
         ex = CallPipeExecutor()
         resolved = self._resolve(ex, [
             ("play", "test-l", {"url": "http://example.com/a.wav"}),
@@ -288,7 +290,8 @@ class TestWrapSipStructure:
         assert len(chains) == 1
         assert chains[0][-1][0] == "sip_sink"
 
-    def test_middle_sip_splits_into_two_chains(self, leg_l):
+    def test_middle_sip_splits_into_two_chains(self, leg_l, monkeypatch):
+        monkeypatch.setattr("speech_pipeline.media_refs.require_safe_url", lambda url: None)
         ex = CallPipeExecutor()
         resolved = self._resolve(ex, [
             ("play", "test-l", {"url": "http://example.com/a.wav"}),
@@ -406,6 +409,7 @@ class TestCallCouplingSemantics:
         call = call_state.create_call("sub", "acc", "pbx")
         try:
             ex = CallPipeExecutor(call=call)
+            ex._account_id = None  # component test uses admin/global IDs
             resolved = [(t, i, p, ex._create_stage(t, i, p)) for t, i, p in
                         [("call", call.call_id, {}),
                          ("sip", "test-a", {}),
@@ -426,7 +430,7 @@ class TestCallCouplingSemantics:
         call = call_state.create_call("sub", "acc", "pbx")
         try:
             ex = CallPipeExecutor(call=call)
-            elems = [("call", call.call_id, {}),
+            elems = [("call", localize_for_account(call.call_id, call.account_id), {}),
                      ("sip", "x", {}),
                      ("call", "other", {})]
             with pytest.raises(ValueError, match="same call id"):
@@ -439,10 +443,10 @@ class TestCallCouplingSemantics:
         call = call_state.create_call("sub", "acc", "pbx")
         try:
             ex = CallPipeExecutor(call=call)
-            elems = [("call", call.call_id, {}),
+            elems = [("call", localize_for_account(call.call_id, call.account_id), {}),
                      ("sip", "x", {}),
-                     ("call", call.call_id, {}),
-                     ("call", call.call_id, {})]
+                     ("call", localize_for_account(call.call_id, call.account_id), {}),
+                     ("call", localize_for_account(call.call_id, call.account_id), {})]
             with pytest.raises(ValueError, match="At most two call"):
                 ex._validate_elements(elems)
         finally:

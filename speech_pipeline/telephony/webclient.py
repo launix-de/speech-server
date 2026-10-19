@@ -411,7 +411,7 @@ nonce = nonce ? nonce[1] : '';
 
 // Load codec.js relative to the current /tts app prefix.
 var s = document.createElement('script');
-s.src = appBase + '/examples/codec.js';
+s.src = appBase + '/phone/' + encodeURIComponent(nonce) + '/codec.js';
 s.onload = initPhone;
 s.onerror = function() { document.getElementById('status').textContent = 'Failed to load codec.js'; };
 document.head.appendChild(s);

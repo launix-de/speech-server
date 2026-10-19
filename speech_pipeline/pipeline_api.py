@@ -10,7 +10,7 @@ import logging
 import re
 from typing import Optional
 
-from flask import Blueprint, g, jsonify, request
+from flask import Blueprint, abort, g, jsonify, request
 
 from . import live_pipeline as registry
 from .telephony import auth
@@ -28,6 +28,14 @@ def init(admin_token: str) -> None:
 
 # Use telephony auth: admin token OR account token
 _require_auth = auth.require_account
+
+
+def _owned_pipeline(pid):
+    pipeline = registry.get(pid)
+    aid = _account_id()
+    if pipeline is not None and aid and pipeline.account_id != aid:
+        abort(404)
+    return pipeline
 
 
 # ---- Pipeline CRUD ----
@@ -49,7 +57,9 @@ def list_pipelines():
     """
     dsl = request.args.get("dsl", "").strip()
     if not dsl:
-        return jsonify([p.to_dict() for p in registry.list_all()])
+        aid = _account_id()
+        return jsonify([p.to_dict() for p in registry.list_all()
+                        if aid is None or p.account_id == aid])
 
     # DSL must be a single item (no pipes)
     if "->" in dsl or "|" in dsl:
@@ -132,7 +142,7 @@ def list_pipelines():
 @api.route("/pipelines/<pid>", methods=["GET"])
 @_require_auth
 def get_pipeline(pid: str):
-    p = registry.get(pid)
+    p = _owned_pipeline(pid)
     if not p:
         return ("Pipeline not found\n", 404)
     return jsonify(p.to_dict(detail=True))
@@ -242,6 +252,13 @@ def create_pipeline():
     if not dsl:
         return ("Missing 'dsl' in request body\n", 400)
 
+    if "http" in body:
+        err = _check_call_ownership(dsl)
+        if err:
+            return (err + "\n", 403)
+        from .http_audio import prepare_audio
+        return prepare_audio(dsl, body["http"], _account_id())
+
     # Render mode: synchronous execution, returns WAV
     if body.get("render"):
         return _render_pipeline(dsl)
@@ -308,6 +325,7 @@ def create_pipeline():
         )
 
     pipeline = registry.LivePipeline(dsl=dsl)
+    pipeline.account_id = _account_id()
 
     # Build synchronously.  Stages must be registered in the
     # executor's ``_stages`` dict before this response returns so that
@@ -345,97 +363,26 @@ def create_pipeline():
     return jsonify(body), 201
 
 
+@api.route("/audio/<token>", methods=["GET"])
+def consume_audio(token: str):
+    """Single-use capability URL; server credentials stay with the creator."""
+    if request.method != "GET":
+        return ("Use GET to consume audio\n", 405, {"Allow": "GET"})
+    from .http_audio import consume_audio
+    return consume_audio(token)
+
+
 def _render_pipeline(dsl: str):
-    """Render a pipeline synchronously and return audio as WAV."""
-    from .dsl_parser import parse_dsl
-
-    try:
-        elements = parse_dsl(dsl)
-    except ValueError as e:
-        return (f"DSL parse error: {e}\n", 400)
-
-    # Reject elements that require a live call
-    live_types = {"sip", "call", "conference", "webhook", "text_input"}
-    for typ, _, _ in elements:
-        if typ in live_types:
-            return (f"render does not support '{typ}' — use POST /api/pipelines instead\n", 400)
-
-    from .telephony.pipe_executor import CallPipeExecutor
-    from .telephony import _shared
-
-    executor = CallPipeExecutor(call=None, tts_registry=_shared.tts_registry)
-
-    try:
-        results = executor.add_pipes([dsl])
-    except Exception as e:
-        return (f"Build error: {e}\n", 400)
-
-    for r in results:
-        if not r.get("ok"):
-            return (f"Pipe error: {r.get('error', 'unknown')}\n", 400)
-
-    # The executor ran the pipeline — for offline TTS, the stages have
-    # already produced audio. But add_pipes runs asynchronously.
-    # For synchronous rendering, we need to build and drain manually.
-    import io
-    import struct
-    import wave
-
-    try:
-        resolved_elements = parse_dsl(dsl)
-        stages = []
-        for typ, elem_id, params in resolved_elements:
-            stages.append(executor._create_stage(typ, elem_id, params))
-
-        # Resolve streaming TTS
-        for i, stage in enumerate(stages):
-            if getattr(stage, '_streaming', False):
-                if i == 0:
-                    return ("Streaming tts requires upstream text source\n", 400)
-                upstream = stages[i - 1]
-                def _text_iter(src):
-                    for chunk in src.stream_pcm24k():
-                        yield chunk.decode("utf-8", errors="replace") if isinstance(chunk, bytes) else str(chunk)
-                from .StreamingTTSProducer import StreamingTTSProducer
-                stages[i] = StreamingTTSProducer(_text_iter(upstream), stage.voice, stage.syn)
-
-        # Chain stages via pipe()
-        from .StreamingTTSProducer import StreamingTTSProducer as _STTS
-        for i in range(len(stages) - 1):
-            if isinstance(stages[i + 1], _STTS):
-                continue  # StreamingTTS reads from its own iterator
-            stages[i].pipe(stages[i + 1])
-
-        # Drain the last stage
-        last = stages[-1]
-        pcm = b""
-        sample_rate = 22050  # default
-        if last.output_format and last.output_format.sample_rate > 0:
-            sample_rate = last.output_format.sample_rate
-        for chunk in last.stream_pcm24k():
-            pcm += chunk
-
-    except Exception as e:
-        return (f"Render error: {e}\n", 400)
-
-    if not pcm:
-        return ("Pipeline produced no audio\n", 422)
-
-    # Build WAV
-    buf = io.BytesIO()
-    w = wave.open(buf, "wb")
-    w.setnchannels(1)
-    w.setsampwidth(2)
-    w.setframerate(sample_rate)
-    w.writeframes(pcm)
-    w.close()
-
-    from flask import Response
-    return Response(
-        buf.getvalue(),
-        mimetype="audio/wav",
-        headers={"Content-Disposition": "attachment; filename=render.wav"},
-    )
+    """Use the same Stage-based HTTP sink for direct WAV rendering."""
+    error = _check_call_ownership(dsl)
+    if error:
+        return (error + "\n", 403)
+    from .http_audio import prepare_audio, consume_audio
+    response, status = prepare_audio(dsl, {"timeout": 180, "buffered": True}, _account_id())
+    if status != 201:
+        return response, status
+    token = response.get_json()["audio_url"].rsplit("/", 1)[1]
+    return consume_audio(token)
 
 
 @api.route("/pipelines/<pid>/input", methods=["POST"])
@@ -445,7 +392,7 @@ def pipeline_input(pid: str):
 
     Body: ``{"text": "Hello"}`` to feed text, ``{"eof": true}`` to end.
     """
-    p = registry.get(pid)
+    p = _owned_pipeline(pid)
     if not p:
         return ("Pipeline not found\n", 404)
 
@@ -553,7 +500,7 @@ def kill_stage_by_dsl():
 @api.route("/pipelines/<pid>", methods=["DELETE"])
 @_require_auth
 def delete_pipeline(pid: str):
-    p = registry.get(pid)
+    p = _owned_pipeline(pid)
     if not p:
         return ("Pipeline not found\n", 404)
     p.cancel()
@@ -566,7 +513,7 @@ def delete_pipeline(pid: str):
 @api.route("/pipelines/<pid>/stages", methods=["GET"])
 @_require_auth
 def list_stages(pid: str):
-    p = registry.get(pid)
+    p = _owned_pipeline(pid)
     if not p:
         return ("Pipeline not found\n", 404)
     stages = []
@@ -584,7 +531,7 @@ def list_stages(pid: str):
 @api.route("/pipelines/<pid>/stages/<sid>", methods=["GET"])
 @_require_auth
 def get_stage(pid: str, sid: str):
-    p = registry.get(pid)
+    p = _owned_pipeline(pid)
     if not p:
         return ("Pipeline not found\n", 404)
     stage = p.get_stage(sid)
@@ -613,7 +560,7 @@ def get_stage(pid: str, sid: str):
 @_require_auth
 def patch_stage(pid: str, sid: str):
     """Hot-update stage config.  Supported: GainStage (gain), DelayLine (delay_ms)."""
-    p = registry.get(pid)
+    p = _owned_pipeline(pid)
     if not p:
         return ("Pipeline not found\n", 404)
     stage = p.get_stage(sid)
@@ -650,7 +597,7 @@ def delete_stage(pid: str, sid: str):
     Only works for processor stages (have both upstream and downstream).
     The upstream is reconnected to the downstream directly.
     """
-    p = registry.get(pid)
+    p = _owned_pipeline(pid)
     if not p:
         return ("Pipeline not found\n", 404)
     stage = p.get_stage(sid)
@@ -658,12 +605,13 @@ def delete_stage(pid: str, sid: str):
         return ("Stage not found\n", 404)
     if not stage.upstream or not stage.downstream:
         return ("Cannot remove source or sink stage\n", 422)
+    if len(stage.downstreams) != 1:
+        return ("Cannot remove a shared branching stage\n", 422)
 
     # Reconnect: upstream.downstream = stage.downstream
     upstream = stage.upstream
     downstream = stage.downstream
-    upstream.downstream = downstream
-    downstream.upstream = upstream
+    upstream.pipe(downstream)
 
     # Update edges
     p.edges = [(f, t) for f, t in p.edges if f != sid and t != sid]
@@ -674,7 +622,7 @@ def delete_stage(pid: str, sid: str):
     p.stage_types.pop(sid, None)
     p.stage_configs.pop(sid, None)
 
-    stage.cancelled = True
+    stage.close()
     return ("", 204)
 
 
@@ -689,7 +637,7 @@ def replace_stage(pid: str, sid: str):
     Uses CellRunner for queue-boundary swapping if the stage is already
     wrapped, otherwise does a direct swap (brief interruption).
     """
-    p = registry.get(pid)
+    p = _owned_pipeline(pid)
     if not p:
         return ("Pipeline not found\n", 404)
     stage = p.get_stage(sid)
@@ -726,13 +674,15 @@ def replace_stage(pid: str, sid: str):
     if new_stage is None:
         return (f"Cannot build stage from '{element}'\n", 400)
 
-    # Wire the new stage in place of the old one
-    if stage.upstream:
-        new_stage.upstream = stage.upstream
-        stage.upstream.downstream = new_stage
-    if stage.downstream:
-        new_stage.downstream = stage.downstream
-        stage.downstream.upstream = new_stage
+    # Snapshot neighbors before rewiring: releasing the last consumer can
+    # close the old stage and clear its upstream/downstream references.
+    upstream = stage.upstream
+    downstreams = stage.downstreams
+    if upstream:
+        upstream.pipe(new_stage)
+    for downstream in downstreams:
+        new_stage.pipe(downstream)
+    stage.close()
 
     # Update pipeline registry
     del p.stages[sid]

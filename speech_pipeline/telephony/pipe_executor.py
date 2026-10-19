@@ -1021,7 +1021,7 @@ class CallPipeExecutor:
                 syn,
                 text,
                 sentence_silence=0.0,
-                chunk_seconds=_TTS_CHUNK_SECONDS,
+                chunk_seconds=max(0.1, min(30.0, float(params.get("chunk_seconds", _TTS_CHUNK_SECONDS)))),
             )
         else:
             # Streaming mode: will be wired to upstream text source.

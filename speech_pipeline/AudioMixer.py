@@ -55,6 +55,10 @@ class AudioMixer(Stage):
         self._has_inputs.set()
         return q
 
+    def _on_close(self) -> None:
+        self.cancel()
+        self._has_inputs.set()
+
     def remove_input(self, q: queue.Queue) -> None:
         """Remove an input by its queue reference.
 

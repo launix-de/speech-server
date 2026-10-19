@@ -46,6 +46,7 @@ class LivePipeline:
     def __init__(self, dsl: str = "") -> None:
         self.id: str = uuid4().hex[:12]
         self.dsl: str = dsl
+        self.account_id: Optional[str] = None
         self.stages: Dict[str, Stage] = {}       # stage.id -> Stage
         self.stage_types: Dict[str, str] = {}     # stage.id -> type string
         self.stage_configs: Dict[str, dict] = {}  # stage.id -> config dict
@@ -68,6 +69,9 @@ class LivePipeline:
 
     def cancel(self) -> None:
         self.state = "stopped"
+        sink = getattr(self, "_http_sink", None)
+        if sink is not None:
+            sink.cancel()
         if self.run:
             self.run.cancel()
 

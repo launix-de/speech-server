@@ -3,14 +3,20 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable, Iterator, Optional, Tuple
 import os
+from .base import AudioFormat, Stage
 
 
-class FileFetcher:
-    def __init__(self, src_ref: str, bearer: str = "", chunk_bytes: int = 64 * 1024) -> None:
+class FileFetcher(Stage):
+    output_format = AudioFormat(0, "binary")
+
+    def __init__(self, src_ref: str, bearer: str = "", chunk_bytes: int = 64 * 1024,
+                 timeout: float = 30.0) -> None:
+        super().__init__()
         self.src_ref = src_ref
         self.bearer = bearer
         self.chunk_bytes = int(max(4096, chunk_bytes))
         self._handle = None  # lazy-opened readable
+        self.timeout = float(timeout)
 
     @staticmethod
     def _classify(src: str) -> Tuple[str, str]:
@@ -120,7 +126,7 @@ class FileFetcher:
             req = _urllib.Request(value)
             if self.bearer:
                 req.add_header('Authorization', f'Bearer {self.bearer}')
-            self._handle = _urllib.urlopen(req)
+            self._handle = _urllib.urlopen(req, timeout=self.timeout)
         else:
             self._handle = open(Path(value), 'rb')
         return self._handle
@@ -130,14 +136,20 @@ class FileFetcher:
         return self._open().read(n)
 
     def stream(self) -> Iterator[bytes]:
-        h = self._open()
-        while True:
-            buf = h.read(self.chunk_bytes)
-            if not buf:
-                break
-            yield buf
+        yield from self.stream_pcm24k()
 
-    def close(self) -> None:
+    def stream_pcm24k(self) -> Iterator[bytes]:
+        h = self._open()
+        try:
+            while not self.cancelled and not self.closed:
+                buf = h.read(self.chunk_bytes)
+                if not buf:
+                    break
+                yield buf
+        finally:
+            self.close()
+
+    def _on_close(self) -> None:
         try:
             if self._handle is not None:
                 self._handle.close()

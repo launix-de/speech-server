@@ -113,8 +113,8 @@ class TestScopedIds:
 
 class TestMetrics:
 
-    def test_metrics_exposition_format(self, client):
-        resp = client.get("/metrics")
+    def test_metrics_exposition_format(self, client, admin):
+        resp = client.get("/metrics", headers=admin)
         assert resp.status_code == 200
         assert "text/plain" in resp.headers.get("Content-Type", "")
         body = resp.get_data(as_text=True)
@@ -128,11 +128,11 @@ class TestMetrics:
         ):
             assert needle in body, f"missing metric/header: {needle}"
 
-    def test_metrics_reflects_active_call(self, client, account):
+    def test_metrics_reflects_active_call(self, client, account, admin):
         from conftest import create_call
         call_id = create_call(client, account)
         try:
-            body = client.get("/metrics").get_data(as_text=True)
+            body = client.get("/metrics", headers=admin).get_data(as_text=True)
             # At least one active call — the exact number depends on other
             # tests running, so just assert the count is > 0 for active.
             active_line = [l for l in body.splitlines()
@@ -142,8 +142,5 @@ class TestMetrics:
         finally:
             client.delete(f"/api/calls/{call_id}", headers=account)
 
-    def test_metrics_unauth_accessible(self, client):
-        """Metrics must be scrapeable without bearer token
-        (Prometheus pulls from localhost)."""
-        resp = client.get("/metrics")
-        assert resp.status_code == 200
+    def test_metrics_requires_auth(self, client):
+        assert client.get('/metrics').status_code == 401

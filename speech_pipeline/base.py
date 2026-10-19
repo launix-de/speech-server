@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import logging
+import threading
 from dataclasses import dataclass
 from typing import Iterator, List, Optional
 from uuid import uuid4
 
 _LOGGER = logging.getLogger("stage")
+_GRAPH_LOCK = threading.RLock()
 
 
 @dataclass(frozen=True)
@@ -72,14 +74,86 @@ class Stage:
 
     def __init__(self) -> None:
         self.id: str = uuid4().hex[:8]
-        self.upstream: Optional[Stage] = None
-        self.downstream: Optional[Stage] = None
+        self._upstream: Optional[Stage] = None
+        self._consumers: dict[Stage, None] = {}
+        self._references = 0
+        self._close_callbacks = []
+        self._close_complete = False
         self.cancelled: bool = False
         self.closed: bool = False
 
-    def set_upstream(self, up: Stage) -> Stage:
-        self.upstream = up
-        up.downstream = self
+    @property
+    def upstream(self) -> Optional[Stage]:
+        return self._upstream
+
+    @upstream.setter
+    def upstream(self, up: Optional[Stage]) -> None:
+        self.set_upstream(up)
+
+    @property
+    def downstreams(self) -> tuple[Stage, ...]:
+        """Connected consumers, each holding one reference to this stage."""
+        with _GRAPH_LOCK:
+            return tuple(self._consumers)
+
+    @property
+    def downstream(self) -> Optional[Stage]:
+        """Compatibility view for existing runners of linear pipelines."""
+        with _GRAPH_LOCK:
+            return next(reversed(self._consumers), None)
+
+    @downstream.setter
+    def downstream(self, down: Optional[Stage]) -> None:
+        if down is not None:
+            down.set_upstream(self)
+        else:
+            current = self.downstream
+            if current is not None:
+                current.set_upstream(None)
+
+    @property
+    def reference_count(self) -> int:
+        with _GRAPH_LOCK:
+            return len(self._consumers) + self._references
+
+    def retain(self) -> StageReference:
+        """Own a shared stage across queue/mixer boundaries or outside a pipe.
+
+        Release the returned handle when that owner disappears. Data fan-out
+        still uses AudioTee or mixer queues; retaining does not duplicate audio.
+        """
+        with _GRAPH_LOCK:
+            if self.closed or self.cancelled:
+                raise RuntimeError("Cannot retain a finished stage")
+            self._references += 1
+        return StageReference(self)
+
+    def add_close_callback(self, callback) -> None:
+        """Release an external resource once this stage has closed."""
+        with _GRAPH_LOCK:
+            if not self._close_complete:
+                self._close_callbacks.append(callback)
+                return
+        callback()
+
+    def set_upstream(self, up: Optional[Stage]) -> Stage:
+        with _GRAPH_LOCK:
+            old = self._upstream
+            if old is up:
+                return self
+            if up is not None and (self.closed or self.cancelled):
+                raise RuntimeError("Cannot connect a finished stage")
+            if issubclass(type(up), Stage):
+                if up.closed or up.cancelled:
+                    raise RuntimeError("Cannot consume a finished stage")
+                up._consumers[self] = None
+            self._upstream = up
+            if issubclass(type(old), Stage):
+                old._consumers.pop(self, None)
+        # Establish the new edge before releasing the old one. This makes
+        # removing/replacing a processor safe even with a shared upstream.
+        if issubclass(type(old), Stage):
+            old._close_if_unused()
         return self
 
     def pipe(self, next_stage: Stage) -> Stage:
@@ -103,19 +177,28 @@ class Stage:
         return next_stage.set_upstream(self)
 
     def cancel(self) -> None:
-        if self.cancelled:
-            return
-        self.cancelled = True
+        with _GRAPH_LOCK:
+            if self.cancelled:
+                return
+            self.cancelled = True
+            up = self._upstream
+            consumers = tuple(self._consumers)
+            cancel_up = (up is not None and not issubclass(type(up), Stage)) or (
+                issubclass(type(up), Stage) and up._references == 0 and not any(
+                    child is not self and not child.cancelled and not child.closed
+                    for child in up._consumers
+                )
+            )
         try:
-            if self.upstream:
-                self.upstream.cancel()
+            if cancel_up:
+                up.cancel()
         except Exception:
             pass
-        try:
-            if self.downstream:
-                self.downstream.cancel()
-        except Exception:
-            pass
+        for child in consumers:
+            try:
+                child.cancel()
+            except Exception:
+                pass
 
     def close(self) -> None:
         """Orderly teardown — signal that upstream has completed.
@@ -130,25 +213,55 @@ class Stage:
           downstream (letting the drain cascade continue) and invokes
           the subclass hook ``_on_close()`` for resource release.
 
-        Idempotent.
+        Closing a consumer releases its upstream edge. Only an upstream with
+        no remaining consumers or retained owners is closed in turn. Explicitly
+        closing a producer still closes all its outputs. Idempotent.
         """
-        if self.closed:
-            return
-        self.closed = True
+        self._close(only_if_unused=False)
+
+    def _close_if_unused(self) -> None:
+        self._close(only_if_unused=True)
+
+    def _close(self, *, only_if_unused: bool) -> None:
+        with _GRAPH_LOCK:
+            if self.closed or (only_if_unused and self.reference_count):
+                return
+            self.closed = True
+            consumers = tuple(self._consumers)
         try:
             self._on_close()
         except Exception as e:
             _LOGGER.warning("Stage %s _on_close raised: %s", type(self).__name__, e)
-        # Propagate in BOTH directions — idempotent via ``closed`` flag.
-        # A downstream-initiated close (e.g. HangupSink) flows upstream;
-        # an upstream-initiated close (generator exhausted) flows down.
-        for neighbour in (self.upstream, self.downstream):
+        # Hooks run outside the graph lock: mixer hooks may acquire their own
+        # locks or join workers that also need to release graph references.
+        with _GRAPH_LOCK:
+            up = self._upstream
+            self._upstream = None
+            if issubclass(type(up), Stage):
+                up._consumers.pop(self, None)
+        try:
+            if issubclass(type(up), Stage):
+                up._close_if_unused()
+            elif up is not None:
+                up.close()
+        except Exception as e:
+            _LOGGER.warning("Stage %s upstream close raised: %s", type(self).__name__, e)
+        for neighbour in consumers:
             try:
                 if neighbour is not None and not neighbour.closed:
                     neighbour.close()
             except Exception as e:
                 _LOGGER.warning("Stage %s close propagation raised: %s",
                                 type(self).__name__, e)
+
+        with _GRAPH_LOCK:
+            self._close_complete = True
+            callbacks, self._close_callbacks = self._close_callbacks, []
+        for callback in callbacks:
+            try:
+                callback()
+            except Exception as e:
+                _LOGGER.warning("Stage %s close callback raised: %s", type(self).__name__, e)
 
     def _on_close(self) -> None:
         """Subclass hook: release resources tied to this stage.
@@ -162,3 +275,19 @@ class Stage:
     def stream_pcm24k(self) -> Iterator[bytes]:
         if False:
             yield b""
+
+
+class StageReference:
+    """An explicit, idempotently releasable owner of a shared stage."""
+
+    def __init__(self, stage: Stage) -> None:
+        self._stage: Optional[Stage] = stage
+
+    def release(self) -> None:
+        with _GRAPH_LOCK:
+            stage = self._stage
+            if stage is None:
+                return
+            self._stage = None
+            stage._references -= 1
+        stage._close_if_unused()

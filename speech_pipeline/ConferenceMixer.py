@@ -106,6 +106,7 @@ class ConferenceMixer(Stage):
                                 self.name, src_id, e)
             finally:
                 entry.finished = True
+                sink.close()
                 # Don't set done yet — mixer timer will set it
                 # when buffer is drained (so audio is actually played)
 
@@ -187,6 +188,7 @@ class ConferenceMixer(Stage):
         if entry:
             if entry.sink:
                 entry.sink.cancel()
+                entry.sink.close()
             entry.buffer.clear()
             entry.finished = True
             entry.done.set()
@@ -198,7 +200,9 @@ class ConferenceMixer(Stage):
         with self._lock:
             entry = self._sources.pop(src_id, None)
         if entry:
-            entry.sink.cancel()
+            if entry.sink is not None:
+                entry.sink.cancel()
+                entry.sink.close()
             _LOGGER.info("ConferenceMixer '%s': -source %s",
                          self.name, src_id)
 
@@ -223,6 +227,7 @@ class ConferenceMixer(Stage):
 
         entry = _Sink(id=sink_id, stage=stage, queue=out_q,
                       source=src, mute_source=mute_source, thread=None)
+        src.add_close_callback(lambda: self.remove_sink(sink_id))
 
         with self._lock:
             self._sinks.append(entry)
@@ -252,18 +257,26 @@ class ConferenceMixer(Stage):
     def remove_sink(self, sink_id: str) -> None:
         """Disconnect a sink."""
         with self._lock:
-            for i, entry in enumerate(self._sinks):
-                if entry.id == sink_id:
-                    self._sinks.pop(i)
-                    if entry.source is not None:
-                        entry.source.cancel()
-                    try:
-                        entry.queue.put_nowait(None)
-                    except queue.Full:
-                        pass
-                    _LOGGER.info("ConferenceMixer '%s': -sink %s",
-                                 self.name, sink_id)
-                    return
+            entry = next((s for s in self._sinks if s.id == sink_id), None)
+            if entry is None:
+                return
+            self._sinks.remove(entry)
+        # Closing a source can cascade into an HTTP sink and back into mixer
+        # cleanup. Never invoke that cascade under the mixer registry lock.
+        if entry.source is not None:
+            entry.source.cancel()
+            entry.source.close()
+        try:
+            entry.queue.put_nowait(None)
+        except queue.Full:
+            pass
+        _LOGGER.info("ConferenceMixer '%s': -sink %s", self.name, sink_id)
+
+    def remove_output(self, output: queue.Queue) -> None:
+        with self._lock:
+            sink_id = next((s.id for s in self._sinks if s.queue is output), None)
+        if sink_id is not None:
+            self.remove_sink(sink_id)
 
     # ------------------------------------------------------------------
     # Stage interface
@@ -276,14 +289,17 @@ class ConferenceMixer(Stage):
         is set as a named mixer.  Automatically creates an output queue.
         """
         out_q = self.add_output()
-        while not self.cancelled:
-            try:
-                frame = out_q.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            if frame is None:
-                break
-            yield frame
+        try:
+            while not self.cancelled:
+                try:
+                    frame = out_q.get(timeout=0.5)
+                except queue.Empty:
+                    continue
+                if frame is None:
+                    break
+                yield frame
+        finally:
+            self.remove_output(out_q)
 
     def run(self) -> None:
         """Main loop — blocks until cancelled."""
@@ -420,16 +436,17 @@ class ConferenceMixer(Stage):
         _LOGGER.info("ConferenceMixer '%s': done", self.name)
 
     def cancel(self) -> None:
-        self.cancelled = True
+        super().cancel()
         self._has_sources.set()
         with self._lock:
-            for src in self._sources.values():
-                if src.sink:
-                    src.sink.cancel()
-            for entry in self._sinks:
-                if entry.source:
-                    entry.source.cancel()
-        super().cancel()
+            stages = [src.sink for src in self._sources.values() if src.sink]
+            stages += [entry.source for entry in self._sinks if entry.source]
+        for stage in stages:
+            stage.cancel()
+            stage.close()
+
+    def _on_close(self) -> None:
+        self.cancel()
 
     # ------------------------------------------------------------------
     # Internal

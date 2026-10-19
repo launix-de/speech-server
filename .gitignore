@@ -13,3 +13,4 @@ build/
 todo.md
 .claude/
 run_server.sh
+.speech-accounts.json

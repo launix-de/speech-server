@@ -3,11 +3,27 @@ from __future__ import annotations
 import os
 from typing import Optional
 import threading
+import logging
 
-try:
-    from TTS.api import TTS as _CoquiTTS  # type: ignore
-except Exception as e:  # pragma: no cover
-    _CoquiTTS = None  # type: ignore
+_CoquiTTS = None
+_backend_import_attempted = False
+_backend_import_lock = threading.Lock()
+_LOGGER = logging.getLogger("freevc")
+
+
+def _load_backend():
+    """Import optional PyTorch/Coqui only when conversion is requested."""
+    global _CoquiTTS, _backend_import_attempted
+    with _backend_import_lock:
+        if not _backend_import_attempted:
+            _backend_import_attempted = True
+            try:
+                os.environ.setdefault("USE_TF", "0")
+                from TTS.api import TTS
+                _CoquiTTS = TTS
+            except ImportError:
+                _LOGGER.warning("FreeVC unavailable: install speech-pipeline[vc] for reference voices")
+        return _CoquiTTS
 
 
 _singleton_model = None
@@ -22,11 +38,12 @@ class FreeVCService:
         self._model = None
 
     def _init_to(self, device: str):
-        if _CoquiTTS is None:
+        backend = _load_backend()
+        if backend is None:
             raise RuntimeError("VC unavailable: TTS not installed")
         if device == "cpu":
             os.environ.setdefault("CUDA_VISIBLE_DEVICES", "-1")
-        t = _CoquiTTS(self.model_name, gpu=False)  # type: ignore
+        t = backend(self.model_name, gpu=False)
         try:
             t.to(device)
         except Exception:
@@ -68,4 +85,5 @@ def get_freevc_model() -> Optional[object]:
             _singleton_model = m
             return m
         except Exception:
+            _LOGGER.exception("FreeVC model initialization failed")
             return None

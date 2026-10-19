@@ -42,6 +42,7 @@ class ConferenceLeg(Stage):
         self.input_format = fmt
         self.output_format = fmt
         self._mixer = None
+        self._mixer_reference = None
         self._src_id: Optional[str] = None
         self._sink_id: Optional[str] = None
         self._out_q: Optional[queue.Queue] = None
@@ -51,6 +52,8 @@ class ConferenceLeg(Stage):
     def attach(self, mixer) -> None:
         """Attach to a ConferenceMixer.  Called by the DSL builder."""
         self._mixer = mixer
+        if isinstance(mixer, Stage):
+            self._mixer_reference = mixer.retain()
 
     def stream_pcm24k(self) -> Iterator[bytes]:
         if not self.upstream or not self._mixer:
@@ -85,16 +88,26 @@ class ConferenceLeg(Stage):
                                  self._src_id, frame_count)
                 yield frame
         finally:
+            self.close()
+
+    def _on_close(self) -> None:
+        try:
             if self._src_id:
                 self._mixer.kill_source(self._src_id)
+                self._src_id = None
             if self._sink_id:
                 self._mixer.remove_sink(self._sink_id)
+                self._sink_id = None
             _LOGGER.info("ConferenceLeg: detached (src=%s)", self._src_id)
             if self.on_detached:
                 try:
                     self.on_detached(self)
                 except Exception as e:
                     _LOGGER.warning("ConferenceLeg on_detached error: %s", e)
+        finally:
+            if self._mixer_reference is not None:
+                self._mixer_reference.release()
+                self._mixer_reference = None
 
     def cancel(self) -> None:
         super().cancel()

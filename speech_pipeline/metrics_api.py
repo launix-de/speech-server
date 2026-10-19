@@ -1,23 +1,24 @@
 """Operational endpoints: liveness + Prometheus metrics.
 
 Extracted into a blueprint so tests (and the main server) share one
-implementation.  Scrape the text exposition at ``/metrics`` without
-any authentication — assume the scraper lives on the private network
-(``prometheus.yml`` -> ``static_configs.targets``).
+implementation. Both endpoints require an account or admin bearer token.
 """
 from __future__ import annotations
 
 from flask import Blueprint
+from .telephony.auth import require_account
 
 api = Blueprint("metrics_api", __name__)
 
 
 @api.route("/healthz", methods=["GET"])
+@require_account
 def healthz():
     return ("ok", 200, {"Content-Type": "text/plain"})
 
 
 @api.route("/metrics", methods=["GET"])
+@require_account
 def metrics():
     from speech_pipeline.telephony import call_state as _cs
     from speech_pipeline.telephony import leg as _leg

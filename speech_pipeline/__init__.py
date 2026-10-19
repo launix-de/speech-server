@@ -1,4 +1,4 @@
-from .base import Stage, AudioFormat
+from .base import Stage, AudioFormat, StageReference
 from .EncodingConverter import EncodingConverter
 from .AudioReader import AudioReader
 from .TTSProducer import TTSProducer

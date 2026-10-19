@@ -32,13 +32,6 @@ class PitchAdjuster(Stage):
         self.f0_t: Optional[float] = None
         self.input_format = AudioFormat(24000, "s16le")
         self.output_format = AudioFormat(24000, "s16le")
-        try:
-            p = self._ensure_target_local()
-            if p:
-                sr_t, x_t = read_wav_all_samples(p)
-                self.f0_t = estimate_f0_avg(sr_t, x_t)
-        except Exception:
-            self.f0_t = None
 
     def _ensure_target_local(self) -> Optional[Path]:
         if isinstance(self.target_ref, Path):
@@ -117,78 +110,78 @@ class PitchAdjuster(Stage):
                 self.f0_t = estimate_f0_avg(sr_t, x_t)
             except Exception:
                 self.f0_t = None
-        for idx, pcm in enumerate(self.upstream.stream_pcm24k()):
-            if self.cancelled:
-                break
-            # decide pitch once on first chunk
-            if (not self.pitch_disable) and (self.applied_st is None):
-                if (self.pitch_override is not None) and abs(self.pitch_override) > 0.05:
-                    self.applied_st = float(self.pitch_override) * float(self.correction)
-                elif self.f0_t:
-                    # compute f0 of this chunk
-                    tmp = _tempfile.NamedTemporaryFile(prefix=f"pipe_pitch_src_{idx:04d}_", suffix=".wav", delete=False)
-                    p = Path(tmp.name)
-                    tmp.close()
-                    with _wave.open(str(p), "wb") as ww:
+        try:
+            for idx, pcm in enumerate(self.upstream.stream_pcm24k()):
+                if self.cancelled:
+                    break
+                # decide pitch once on first chunk
+                if (not self.pitch_disable) and (self.applied_st is None):
+                    if (self.pitch_override is not None) and abs(self.pitch_override) > 0.05:
+                        self.applied_st = float(self.pitch_override) * float(self.correction)
+                    elif self.f0_t:
+                        # compute f0 of this chunk
+                        tmp = _tempfile.NamedTemporaryFile(prefix=f"pipe_pitch_src_{idx:04d}_", suffix=".wav", delete=False)
+                        p = Path(tmp.name)
+                        tmp.close()
+                        with _wave.open(str(p), "wb") as ww:
+                            ww.setnchannels(1)
+                            ww.setsampwidth(2)
+                            ww.setframerate(24000)
+                            ww.writeframes(pcm)
+                        try:
+                            sr_v, x_v = read_wav_all_samples(p)
+                            f0_v = estimate_f0_avg(sr_v, x_v)
+                            if f0_v and f0_v > 0.0:
+                                st_raw = 12.0 * math.log2(float(self.f0_t) / float(f0_v))
+                                self.applied_st = float(st_raw) * float(self.correction)
+                        except Exception:
+                            pass
+                        finally:
+                            try:
+                                p.unlink()
+                            except Exception:
+                                pass
+                if (self.applied_st is not None) and abs(self.applied_st) > 0.1:
+                    # write chunk to wav, run ffmpeg pitch, return pcm
+                    tmpi = _tempfile.NamedTemporaryFile(prefix=f"pipe_pitch_in_{idx:04d}_", suffix=".wav", delete=False)
+                    pi = Path(tmpi.name)
+                    tmpi.close()
+                    with _wave.open(str(pi), "wb") as ww:
                         ww.setnchannels(1)
                         ww.setsampwidth(2)
                         ww.setframerate(24000)
                         ww.writeframes(pcm)
+                    tmpo = _tempfile.NamedTemporaryFile(prefix=f"pipe_pitch_out_{idx:04d}_", suffix=".wav", delete=False)
+                    po = Path(tmpo.name)
+                    tmpo.close()
+                    cmd = [
+                        "ffmpeg",
+                        "-y",
+                        "-loglevel",
+                        "error",
+                        "-i",
+                        str(pi),
+                        "-filter:a",
+                        f"rubberband=tempo=1.0:pitch={2.0 ** (self.applied_st / 12.0)}:formant=1",
+                        str(po),
+                    ]
                     try:
-                        sr_v, x_v = read_wav_all_samples(p)
-                        f0_v = estimate_f0_avg(sr_v, x_v)
-                        if f0_v and f0_v > 0.0:
-                            st_raw = 12.0 * math.log2(float(self.f0_t) / float(f0_v))
-                            self.applied_st = float(st_raw) * float(self.correction)
+                        _sp.check_call(cmd)
+                        with _wave.open(str(po), "rb") as wf:
+                            yield wf.readframes(wf.getnframes())
                     except Exception:
-                        pass
+                        # fallback: passthrough
+                        yield pcm
                     finally:
-                        try:
-                            p.unlink()
-                        except Exception:
-                            pass
-            if (self.applied_st is not None) and abs(self.applied_st) > 0.1:
-                # write chunk to wav, run ffmpeg pitch, return pcm
-                tmpi = _tempfile.NamedTemporaryFile(prefix=f"pipe_pitch_in_{idx:04d}_", suffix=".wav", delete=False)
-                pi = Path(tmpi.name)
-                tmpi.close()
-                with _wave.open(str(pi), "wb") as ww:
-                    ww.setnchannels(1)
-                    ww.setsampwidth(2)
-                    ww.setframerate(24000)
-                    ww.writeframes(pcm)
-                tmpo = _tempfile.NamedTemporaryFile(prefix=f"pipe_pitch_out_{idx:04d}_", suffix=".wav", delete=False)
-                po = Path(tmpo.name)
-                tmpo.close()
-                cmd = [
-                    "ffmpeg",
-                    "-y",
-                    "-loglevel",
-                    "error",
-                    "-i",
-                    str(pi),
-                    "-filter:a",
-                    f"rubberband=tempo=1.0:pitch={2.0 ** (self.applied_st / 12.0)}:formant=1",
-                    str(po),
-                ]
-                try:
-                    _sp.check_call(cmd)
-                    with _wave.open(str(po), "rb") as wf:
-                        yield wf.readframes(wf.getnframes())
-                except Exception:
-                    # fallback: passthrough
+                        for p in (pi, po):
+                            try:
+                                if p.exists():
+                                    p.unlink()
+                            except Exception:
+                                pass
+                else:
+                    # default: passthrough
                     yield pcm
-                finally:
-                    for p in (pi, po):
-                        try:
-                            if p.exists():
-                                p.unlink()
-                        except Exception:
-                            pass
-            else:
-                # default: passthrough
-                yield pcm
-        try:
-            target_cleanup()
-        except Exception:
-            pass
+        finally:
+            if target_cleanup is not None:
+                target_cleanup()

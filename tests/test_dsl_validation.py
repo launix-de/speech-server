@@ -10,6 +10,7 @@ def _make_executor(call_id="call-test123"):
     """Create a minimal CallPipeExecutor with a mock call."""
     call = type("MockCall", (), {
         "call_id": call_id,
+        "account_id": None,
         "mixer": type("MockMixer", (), {"sample_rate": 48000})(),
     })()
     return CallPipeExecutor(call)

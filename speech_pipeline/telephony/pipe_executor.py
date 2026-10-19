@@ -244,11 +244,21 @@ class CallPipeExecutor:
         self._sessions[f"_prealloc_leg:{number}"] = leg
         return leg.leg_id
 
-    def _execute_async_originate(self, originate_elem, call_elem):
-        """Async originate: fire-and-forget + auto-bridge on answer.
+    def _execute_async_originate(self, originate_elem, call_elem,
+                                  *, auto_bridge: bool = False):
+        """Async originate: fire-and-forget + optional auto-bridge on answer.
 
-        DSL: originate:NUM{"answered":"/cb", ...} -> call:CALL_ID
-        The CRM receives callbacks and bridges via a second pipeline.
+        DSL forms accepted:
+          ``originate:NUM{"answered":"/cb", ...} -> call:CALL_ID``
+              No auto-bridge — the CRM receives the ``answered`` callback
+              and is responsible for posting the bridge pipeline.
+          ``originate:NUM{...} -> call:CALL_ID -> originate:NUM`` (auto_bridge)
+              Bidirectional bridge: when the leg answers, this executor
+              wires ``sip:LEG -> call:CALL_ID -> sip:LEG`` automatically
+              so the CRM does not have to issue a follow-up POST.
+
+        In both forms, the HTTP response returns immediately with
+        ``leg_id``; nothing waits for the SIP answer.
         """
         typ, number, params = originate_elem
         _, call_id, _ = call_elem
@@ -278,19 +288,72 @@ class CallPipeExecutor:
             leg.call_id = call.call_id
             leg.caller_id = params.get("caller_id", "")
 
-        # Return leg_id via a special callback for the CRM to track
-        # Alternative: include leg_id in the 'ringing' callback payload.
-        # For now, the CRM gets leg_id in the callback body (leg_id field).
-
         threading.Thread(
             target=leg_mod.originate_only,
             args=(leg, pbx_entry),
             daemon=True,
             name=f"orig-{leg.leg_id}",
         ).start()
+        if auto_bridge:
+            threading.Thread(
+                target=self._bridge_after_answer,
+                args=(leg, call),
+                daemon=True,
+                name=f"bridge-{leg.leg_id}",
+            ).start()
         # Expose leg_id to ``add_pipes`` / HTTP response.
         self._last_originated_leg_id = leg.leg_id
         return True
+
+    def _bridge_after_answer(self, leg, call) -> None:
+        """Wire the bidirectional bridge once the originated leg is up.
+
+        Polls ``leg.status`` instead of subscribing to a new event so we
+        don't have to teach ``originate_only`` about callbacks back into
+        the executor — the leg state machine is already authoritative.
+        """
+        from . import call_state, leg as leg_mod
+        from .id_scope import localize_for_account
+        call_id = call.call_id
+        end_states = ("failed", "completed", "no-answer", "busy", "canceled")
+        ready_states = ("answered", "in-progress")
+        deadline = time.monotonic() + 120
+        while time.monotonic() < deadline:
+            if (call_state.get_call(call_id) is not call
+                    or leg_mod.get_leg(leg.leg_id) is not leg):
+                return
+            if leg.status in ready_states:
+                break
+            if leg.status in end_states:
+                _LOGGER.info(
+                    "Auto-bridge skipped: leg %s ended with status=%s",
+                    leg.leg_id, leg.status,
+                )
+                return
+            time.sleep(0.1)
+        else:
+            _LOGGER.warning(
+                "Auto-bridge timeout for leg %s (status=%s)",
+                leg.leg_id, leg.status,
+            )
+            return
+
+        # The DSL resolves account-local IDs; registry lookups above use
+        # canonical IDs. Avoid add_pipes here: its response metadata belongs
+        # to the originating HTTP request and must not be reset by this worker.
+        leg_id = localize_for_account(leg.leg_id, self._account_id)
+        local_call_id = localize_for_account(call_id, self._account_id)
+        bridge_dsl = f"sip:{leg_id} -> call:{local_call_id} -> sip:{leg_id}"
+        try:
+            self._execute_pipe(parse_dsl(bridge_dsl))
+        except Exception as e:
+            _LOGGER.warning(
+                "Auto-bridge build failed for leg %s: %s", leg.leg_id, e,
+            )
+            return
+        _LOGGER.info(
+            "Auto-bridged leg %s into call %s", leg.leg_id, call_id,
+        )
 
     def _execute_action_webclient(self, typ, elem_id, params) -> bool:
         if typ == "webclient":
@@ -371,6 +434,22 @@ class CallPipeExecutor:
                 and elements[0][0] == "originate"
                 and elements[1][0] in ("call", "conference")):
             self._execute_async_originate(elements[0], elements[1])
+            return
+
+        # Async bidirectional bridge: `originate:NUM{cb} -> call:CALL ->
+        # originate:NUM` (3 elements, same NUM on both ends).  The Flask
+        # request must NOT block waiting for the SIP answer — webhooks
+        # back to the CRM are fire-and-forget, and so is this build.  We
+        # pre-create the leg, fire originate in the background, and wire
+        # the bidirectional bridge automatically once the leg answers.
+        if (len(elements) == 3
+                and elements[0][0] == "originate"
+                and elements[1][0] in ("call", "conference")
+                and elements[2][0] == "originate"
+                and elements[0][1] == elements[2][1]):
+            self._execute_async_originate(
+                elements[0], elements[1], auto_bridge=True,
+            )
             return
 
         # Phase 1: fill in missing IDs (sip without ID = first sip predecessor)

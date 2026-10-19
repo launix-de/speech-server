@@ -14,6 +14,7 @@ from .WhisperSTT import WhisperTranscriber
 from .WebSocketReader import WebSocketReader
 from .WebSocketWriter import WebSocketWriter
 from .NdjsonToText import NdjsonToText
+from .WebhookSink import WebhookSink
 from .CLIReader import CLIReader
 from .CLIWriter import CLIWriter
 from .PipelineBuilder import PipelineBuilder

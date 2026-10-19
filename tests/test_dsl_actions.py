@@ -9,8 +9,19 @@ import time
 
 import pytest
 
-from conftest import SUBSCRIBER_ID, create_call
+from conftest import ACCOUNT_ID, SUBSCRIBER_ID, create_call
+from speech_pipeline.telephony.id_scope import expand_for_account, localize_for_account
 from speech_pipeline.telephony import call_state, leg as leg_mod
+
+
+def _make_account_rtp_leg(**kwargs):
+    """Register the RTP test leg under its canonical account-scoped ID."""
+    from test_crm_e2e import _make_rtp_leg
+    leg, phone, session = _make_rtp_leg(**kwargs)
+    leg_mod._legs.pop(leg.leg_id)
+    leg.leg_id = expand_for_account(leg.leg_id, ACCOUNT_ID)
+    leg_mod._legs[leg.leg_id] = leg
+    return leg, phone, session
 
 
 # ---------------------------------------------------------------------------
@@ -34,7 +45,7 @@ class TestKillViaDelete:
     def test_kill_existing_stage(self, client, account):
         """DELETE removes a play stage."""
         call_id = create_call(client, account)
-        call = call_state.get_call(call_id)
+        call = call_state.get_call(expand_for_account(call_id, ACCOUNT_ID))
 
         # Create a play stage
         resp = client.post("/api/pipelines",
@@ -72,20 +83,20 @@ class TestKillViaDelete:
         """DELETE bridge:LEG_ID — detaches a leg from conference."""
         call_id = create_call(client, account)
 
-        from test_crm_e2e import _make_rtp_leg, _cleanup_leg
+        from test_crm_e2e import _cleanup_leg
         from speech_pipeline.rtp_codec import PCMU
-        leg, phone_rtp, _ = _make_rtp_leg(codec=PCMU)
+        leg, phone_rtp, _ = _make_account_rtp_leg(codec=PCMU)
 
         client.post("/api/pipelines",
                     data=json.dumps({
-                        "dsl": f"sip:{leg.leg_id} -> call:{call_id} -> sip:{leg.leg_id}"
+                        "dsl": f"sip:{localize_for_account(leg.leg_id, ACCOUNT_ID)} -> call:{call_id} -> sip:{localize_for_account(leg.leg_id, ACCOUNT_ID)}"
                     }),
                     headers=account)
         time.sleep(0.3)
 
         # Kill the bridge via DELETE
         resp = client.delete("/api/pipelines",
-                             data=json.dumps({"dsl": f"bridge:{leg.leg_id}"}),
+                             data=json.dumps({"dsl": f"bridge:{localize_for_account(leg.leg_id, ACCOUNT_ID)}"}),
                              headers=account)
         assert resp.status_code == 204
 
@@ -194,7 +205,7 @@ class TestGetByDSL:
         from conftest import SUBSCRIBER2_ID
         call_id = create_call(client, account2, SUBSCRIBER2_ID)
         resp = client.get(f"/api/pipelines?dsl=call:{call_id}", headers=account)
-        assert resp.status_code == 403
+        assert resp.status_code == 404  # account-local IDs hide other accounts
         client.delete(f"/api/calls/{call_id}", headers=account2)
 
     def test_get_stage(self, client, account):
@@ -222,14 +233,14 @@ class TestGetByDSL:
 
     def test_get_leg(self, client, account):
         """?dsl=sip:LEG_ID returns leg details."""
-        from test_crm_e2e import _make_rtp_leg, _cleanup_leg
+        from test_crm_e2e import _cleanup_leg
         from speech_pipeline.rtp_codec import PCMU
-        leg, phone_rtp, _ = _make_rtp_leg(codec=PCMU)
+        leg, phone_rtp, _ = _make_account_rtp_leg(codec=PCMU)
 
-        resp = client.get(f"/api/pipelines?dsl=sip:{leg.leg_id}", headers=account)
+        resp = client.get(f"/api/pipelines?dsl=sip:{localize_for_account(leg.leg_id, ACCOUNT_ID)}", headers=account)
         assert resp.status_code == 200
         data = resp.get_json()
-        assert data["leg_id"] == leg.leg_id
+        assert data["leg_id"] == localize_for_account(leg.leg_id, ACCOUNT_ID)
 
         _cleanup_leg(leg, phone_rtp)
 
@@ -249,13 +260,13 @@ class TestGetByDSL:
         call_id = create_call(client, account)
 
         # Create a bridge with tee
-        from test_crm_e2e import _make_rtp_leg, _cleanup_leg
+        from test_crm_e2e import _cleanup_leg
         from speech_pipeline.rtp_codec import PCMU
-        leg, phone_rtp, _ = _make_rtp_leg(codec=PCMU)
+        leg, phone_rtp, _ = _make_account_rtp_leg(codec=PCMU)
 
         client.post("/api/pipelines",
                     data=json.dumps({
-                        "dsl": f"sip:{leg.leg_id} -> tee:test_tee -> call:{call_id} -> sip:{leg.leg_id}"
+                        "dsl": f"sip:{localize_for_account(leg.leg_id, ACCOUNT_ID)} -> tee:test_tee -> call:{call_id} -> sip:{localize_for_account(leg.leg_id, ACCOUNT_ID)}"
                     }),
                     headers=account)
 
@@ -290,12 +301,12 @@ class TestAnswerAction:
     def test_answer_existing_leg(self, client, account):
         """answer: on an existing leg succeeds."""
         # Create a fake inbound leg
-        from test_crm_e2e import _make_rtp_leg, _cleanup_leg
+        from test_crm_e2e import _cleanup_leg
         from speech_pipeline.rtp_codec import PCMU
-        leg, phone_rtp, _ = _make_rtp_leg(codec=PCMU, number="+4989123456")
+        leg, phone_rtp, _ = _make_account_rtp_leg(codec=PCMU, number="+4989123456")
 
         resp = client.post("/api/pipelines",
-                           data=json.dumps({"dsl": f"answer:{leg.leg_id}"}),
+                           data=json.dumps({"dsl": f"answer:{localize_for_account(leg.leg_id, ACCOUNT_ID)}"}),
                            headers=account)
         assert resp.status_code == 201
 
@@ -348,8 +359,8 @@ class TestOriginateElement:
         assert resp.status_code == 400
         client.delete(f"/api/calls/{call_id}", headers=account)
 
-    def test_originate_no_pbx_fails(self, client, account):
-        """originate fails if PBX has no SIP proxy configured."""
+    def test_originate_sip_failure_is_asynchronous(self, client, account):
+        """SIP setup failure is asynchronous, like the two-element form."""
         call_id = create_call(client, account)
         # TestPBX has empty sip_proxy — originate will fail
         resp = client.post("/api/pipelines",
@@ -357,8 +368,9 @@ class TestOriginateElement:
                                "dsl": f'originate:+4917099999{{"answered":"/cb"}} -> call:{call_id} -> originate:+4917099999'
                            }),
                            headers=account)
-        # Should fail because PBX has no SIP stack or proxy
-        assert resp.status_code == 400
+        # The request creates a leg; originate_only reports SIP failure later.
+        assert resp.status_code == 201
+        assert resp.get_json()["leg_id"]
         client.delete(f"/api/calls/{call_id}", headers=account)
 
     def test_async_originate_pattern(self, client, account):
@@ -375,6 +387,102 @@ class TestOriginateElement:
         # because the originate thread runs async
         assert resp.status_code in (201, 400)  # 400 if PBX misconfigured
         client.delete(f"/api/calls/{call_id}", headers=account)
+
+    @pytest.mark.parametrize("call_type", ["call", "conference"])
+    def test_bidirectional_originate_does_not_block(self, client, account, monkeypatch, call_type):
+        """Return the leg ID while ringing, then bridge with account-local IDs."""
+        from speech_pipeline.telephony.id_scope import expand_for_account
+        from conftest import ACCOUNT_ID
+
+        call_id = create_call(client, account)
+        call = call_state.get_call(expand_for_account(call_id, ACCOUNT_ID))
+        from speech_pipeline.telephony._shared import ensure_pipe_executor
+        executor = ensure_pipe_executor(call)
+        slow_started, release, originated, bridged = (threading.Event() for _ in range(4))
+        actual_execute = executor._execute_pipe
+        bridges = []
+        threads = []
+        actual_bridge = executor._bridge_after_answer
+
+        def bridge(leg, target_call):
+            threads.append(threading.current_thread())
+            actual_bridge(leg, target_call)
+
+        def execute(elements):
+            if elements[0][0] == "sip":
+                bridges.append(elements)
+                bridged.set()
+                return
+            return actual_execute(elements)
+
+        def originate(leg, pbx_entry):
+            threads.append(threading.current_thread())
+            slow_started.set()
+            try:
+                if release.wait(5) and leg.status == "ringing":
+                    leg.status = "answered"
+            finally:
+                originated.set()
+
+        monkeypatch.setattr(leg_mod, "originate_only", originate)
+        monkeypatch.setattr(executor, "_bridge_after_answer", bridge)
+        monkeypatch.setattr(executor, "_execute_pipe", execute)
+        try:
+            t0 = time.monotonic()
+            resp = client.post("/api/pipelines", json={"dsl": (
+                f'originate:+4917099999{{"answered":"/cb/ans"}}'
+                f' -> {call_type}:{call_id} -> originate:+4917099999'
+            )}, headers=account)
+            elapsed = time.monotonic() - t0
+            assert resp.status_code == 201, resp.data
+            leg_id = resp.get_json()["leg_id"]
+            assert elapsed < 1, f"pipeline blocked for {elapsed:.2f}s"
+            assert slow_started.wait(1)
+            assert not bridged.is_set(), "bridge built before answer"
+            release.set()
+            assert originated.wait(1)
+            assert bridged.wait(2), "answered leg was never bridged"
+            assert bridges == [[("sip", leg_id, {}), ("call", call_id, {}),
+                                ("sip", leg_id, {})]]
+            assert executor._last_originated_leg_id == expand_for_account(leg_id, ACCOUNT_ID)
+        finally:
+            release.set()
+            client.delete(f"/api/calls/{call_id}", headers=account)
+            for thread in threads:
+                thread.join(2)
+                assert not thread.is_alive()
+
+    @pytest.mark.parametrize("end", ["call-deleted", "leg-deleted", "failed", "completed", "busy"])
+    def test_auto_bridge_skips_ended_resources(self, client, account, monkeypatch, end):
+        from speech_pipeline.telephony.id_scope import expand_for_account
+        from speech_pipeline.telephony._shared import ensure_pipe_executor
+        from conftest import ACCOUNT_ID
+        from unittest.mock import Mock
+
+        call_id = create_call(client, account)
+        call = call_state.get_call(expand_for_account(call_id, ACCOUNT_ID))
+        executor = ensure_pipe_executor(call)
+        leg = leg_mod.create_leg("outbound", "+49", call.pbx_id, call.subscriber_id)
+        leg.call_id = call.call_id
+        execute = Mock()
+        monkeypatch.setattr(executor, "_execute_pipe", execute)
+
+        # Simulate teardown while the bridge worker is waiting for answer.
+        def end_while_ringing(_):
+            if end == "call-deleted":
+                call_state.delete_call(call.call_id)
+            elif end == "leg-deleted":
+                leg_mod.delete_leg(leg.leg_id)
+            else:
+                leg.status = end
+
+        monkeypatch.setattr("speech_pipeline.telephony.pipe_executor.time.sleep", end_while_ringing)
+        try:
+            executor._bridge_after_answer(leg, call)
+            execute.assert_not_called()
+        finally:
+            leg_mod.delete_leg(leg.leg_id)
+            client.delete(f"/api/calls/{call_id}", headers=account)
 
     def test_originate_parses_correctly(self):
         """DSL parser handles originate with JSON callbacks."""
